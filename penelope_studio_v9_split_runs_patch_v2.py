@@ -28903,7 +28903,7 @@ class AnalysisTab(QWidget):
             item.setCheckState(Qt.CheckState.Checked if entry.get("checked_default", True) else Qt.CheckState.Unchecked)
             if entry["issues"]:
                 item.setToolTip("\n".join(entry["issues"]))
-                item.setForeground(QColor(P["warn"]))
+                item.setForeground(QColor(P["orange"]))
             else:
                 item.setToolTip("No compatibility mismatches detected.")
             item.setData(Qt.ItemDataRole.UserRole, idx)
@@ -29023,22 +29023,42 @@ class AnalysisTab(QWidget):
         return "continue"
 
     def _combine_body_rows_from_runs(self, runs, warnings):
-        n_total = sum(float(run["showers"]) for run in runs if run.get("showers"))
-        body_ids = sorted(set().union(*(set(run["bodies"].keys()) for run in runs)))
+        all_valid = [run for run in runs if run.get("showers")]
+        if not all_valid:
+            return []
+        n_body = sum(float(run["showers"]) for run in all_valid)
+        # Union of body IDs from result files and from the loaded .geo so that
+        # bodies with zero deposition (absent from all penmain-res.dat files) are
+        # still represented in the combined output.
+        res_body_ids = set().union(*(set(run["bodies"].keys()) for run in all_valid))
+        geo_body_ids = set((self._result_body_defs or {}).keys())
+        body_ids = sorted(res_body_ids | geo_body_ids)
         combined = []
         for body_id in body_ids:
-            items = [run for run in runs if body_id in run["bodies"] and run.get("showers")]
-            if not items:
-                continue
-            n_body = sum(float(run["showers"]) for run in items)
-            if n_body != n_total:
-                warnings.append(f"Body {body_id}: missing in one or more runs; combined with available showers only.")
-            e_comb = sum(float(run["showers"]) * float(run["bodies"][body_id]["edep"]) for run in items) / n_body
+            # Runs that reported this body; runs where it is absent are treated as
+            # edep=0, dedep=0 (a legitimate zero-deposition measurement).
+            present = [run for run in all_valid if body_id in run["bodies"]]
+            absent_count = len(all_valid) - len(present)
+            if absent_count and present:
+                warnings.append(
+                    f"Body {body_id}: not reported in {absent_count} run(s); "
+                    f"those runs treated as zero deposition."
+                )
+            # Absent runs contribute 0 to the edep weighted sum.
+            e_comb = (
+                sum(float(run["showers"]) * float(run["bodies"][body_id]["edep"]) for run in present) / n_body
+                if present else 0.0
+            )
             method = "second_moment_3sigma"
             u3_comb = None
-            if all(run["bodies"][body_id].get("dedep") not in (None, "") for run in items):
+            if not present:
+                # Every run had zero deposition for this body.
+                method = "zero_deposition"
+                u3_comb = 0.0
+            elif all(run["bodies"][body_id].get("dedep") not in (None, "") for run in present):
+                # Absent runs contribute q2_i=0 (e_i=0, s_i=0), so sum only over present.
                 q2 = 0.0
-                for run in items:
+                for run in present:
                     n_i = float(run["showers"])
                     e_i = float(run["bodies"][body_id]["edep"])
                     u3_i = float(run["bodies"][body_id]["dedep"])
@@ -29050,7 +29070,7 @@ class AnalysisTab(QWidget):
                 u3_comb = 3.0 * s_comb
             else:
                 vals = []
-                for run in items:
+                for run in present:
                     u3_i = run["bodies"][body_id].get("dedep")
                     if u3_i not in (None, ""):
                         vals.append((float(run["showers"]), float(u3_i)))
