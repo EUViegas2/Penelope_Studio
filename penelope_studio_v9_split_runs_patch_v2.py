@@ -70,7 +70,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QToolTip, QInputDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QProgressBar,
     QToolButton, QMenu, QCheckBox, QCompleter, QAbstractItemView, QStackedWidget,
-    QButtonGroup,
+    QButtonGroup, QSpinBox,
 )
 from PySide6.QtGui import (
     QSyntaxHighlighter, QTextCharFormat, QColor, QFont,
@@ -2565,6 +2565,8 @@ def _default_material_exe_path():
     here = Path(__file__).resolve().parent
     candidates.extend([
         here / "material.exe",
+        here / "template" / "material.exe",
+        here / "fortran" / "bin" / "material.exe",
         here / "pendbase" / "material.exe",
         Path(r"C:\Users\viega\Desktop\MEBiSEL\FMIII\PENELOPE2011\PENELOPE2011\pendbase\material.exe"),
     ])
@@ -2575,6 +2577,22 @@ def _default_material_exe_path():
         except OSError:
             pass
     return ""
+
+
+def _default_penmain_exe_path():
+    here = _project_root_path()
+    candidates = [
+        here / "penmain.exe",
+        here / "template" / "penmain.exe",
+        here / "fortran" / "bin" / "penmain.exe",
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                return str(path)
+        except OSError:
+            pass
+    return "penmain"
 
 
 def _project_root_path():
@@ -2606,6 +2624,9 @@ def _preferred_saved_gview_path(saved_value, exe_name):
     custom_path = str(_project_root_path() / "fortran" / "bin" / exe_name)
     if not saved:
         return default_path
+    saved_path = Path(saved)
+    if not (saved_path.exists() and saved_path.is_file()) and not shutil.which(saved):
+        return default_path
     if os.path.normcase(saved) == os.path.normcase(custom_path):
         return custom_path
     if os.path.normcase(default_path) != os.path.normcase(custom_path):
@@ -2617,6 +2638,22 @@ def _preferred_saved_gview_path(saved_value, exe_name):
         if os.path.normcase(saved) in simple_defaults:
             return custom_path
     return saved
+
+
+def _preferred_saved_runtime_path(saved_value, default_path):
+    saved = (saved_value or "").strip()
+    default_text = str(default_path or "").strip()
+    if not saved:
+        return default_text
+    try:
+        saved_path = Path(saved)
+        if saved_path.exists() and saved_path.is_file():
+            return str(saved_path)
+    except Exception:
+        pass
+    if shutil.which(saved):
+        return saved
+    return default_text or saved
 
 
 def _looks_like_unconfigured_runtime_path(path_text, runtime_key, exe_name=""):
@@ -16816,9 +16853,165 @@ class _ExternalProcAdapter:
     def start(self, *_): pass
 
 
+def _hidden_subprocess_kwargs():
+    if os.name != "nt":
+        return {}
+    kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kwargs
+
+
+def _scan_external_penmain_pids_snapshot(our_pids):
+    """Return list of dicts {pid, exe, cwd, cmdline} for running penmain processes not launched by us."""
+    our_pids = {int(pid) for pid in (our_pids or []) if int(pid or 0) > 0}
+    results = []
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where", "name='penmain.exe'",
+             "get", "ProcessId,ExecutablePath,CommandLine,WorkingSetSize", "/FORMAT:CSV"],
+            capture_output=True, text=True, timeout=10,
+            **_hidden_subprocess_kwargs(),
+        )
+        for line in out.stdout.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[-2].strip())
+            except (ValueError, IndexError):
+                continue
+            if pid in our_pids or pid == 0:
+                continue
+            exe = parts[-3].strip() if len(parts) >= 3 else ""
+            cmdline = parts[1].strip() if len(parts) >= 2 else ""
+            results.append({"pid": pid, "exe": exe, "cmdline": cmdline, "cwd": ""})
+    except Exception:
+        pass
+    if not results:
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq penmain.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
+                **_hidden_subprocess_kwargs(),
+            )
+            for line in out.stdout.splitlines():
+                line = line.strip().strip('"')
+                parts = [p.strip('"') for p in line.split('","')]
+                if not parts or parts[0].lower() != "penmain.exe":
+                    continue
+                try:
+                    pid = int(parts[1])
+                except (ValueError, IndexError):
+                    continue
+                if pid in our_pids or pid == 0:
+                    continue
+                results.append({"pid": pid, "exe": "penmain.exe", "cmdline": "", "cwd": ""})
+        except Exception:
+            pass
+    for entry in results:
+        try:
+            r = subprocess.run(
+                ["wmic", "process", "where", f"processid={entry['pid']}",
+                 "get", "ExecutablePath", "/FORMAT:CSV"],
+                capture_output=True, text=True, timeout=5,
+                **_hidden_subprocess_kwargs(),
+            )
+            for line in r.stdout.splitlines():
+                parts = line.strip().split(",")
+                if len(parts) >= 2:
+                    exe = parts[-1].strip()
+                    if exe and exe.lower() != "executablepath":
+                        entry["cwd"] = str(Path(exe).parent) if exe else ""
+                        break
+        except Exception:
+            pass
+    return results
+
+
+def _prepare_saved_sim_state_snapshot(state_path):
+    path = Path(state_path)
+    payload = {
+        "state_path": str(path),
+        "exists": path.exists(),
+        "invalid": False,
+        "empty": False,
+        "queue": [],
+        "alive_runs": [],
+        "finished_runs": [],
+        "saved_at": "unknown",
+        "parts": [],
+    }
+    if not path.exists():
+        return payload
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        payload["invalid"] = True
+        return payload
+    queue = [Path(p) for p in state.get("queue", []) if p]
+    queue = [p for p in queue if p.exists()]
+    runs = state.get("runs", [])
+    alive_runs = [r for r in runs if isinstance(r, dict) and r.get("status") == "running" and r.get("pid", 0) > 0]
+    finished_runs = [r for r in runs if isinstance(r, dict) and r.get("status") != "running"]
+    payload["queue"] = [str(p) for p in queue]
+    payload["alive_runs"] = alive_runs
+    payload["finished_runs"] = finished_runs
+    payload["saved_at"] = state.get("saved_at", "unknown")
+    if not queue and not alive_runs and not finished_runs:
+        payload["empty"] = True
+        return payload
+    parts = []
+    if queue:
+        parts.append(f"{len(queue)} queued run(s)")
+    if alive_runs:
+        parts.append(f"{len(alive_runs)} still-running process(es) by PID")
+    if finished_runs:
+        parts.append(f"{len(finished_runs)} finished run record(s)")
+    payload["parts"] = parts
+    payload["batch_total"] = int(state.get("batch_total", len(queue)) or 0)
+    return payload
+
+
+class ExternalSimScanWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, our_pids):
+        super().__init__()
+        self._our_pids = list(our_pids or [])
+
+    def run(self):
+        try:
+            self.finished.emit(_scan_external_penmain_pids_snapshot(self._our_pids))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class SimRestoreStateWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, state_path):
+        super().__init__()
+        self._state_path = str(state_path or "")
+
+    def run(self):
+        try:
+            self.finished.emit(_prepare_saved_sim_state_snapshot(self._state_path))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class SimulationTab(QWidget):
     IN_RUNTIME_KEYWORDS = {
         "TITLE", "SKPAR", "SENERG", "SPECTR", "SPOSIT", "SCONE",
+        "IPSFN", "IPSPLI", "WGTWIN", "EPMAX",
         "SRADI", "SPOLAR", "MFNAME", "MSIMPA", "GEOMFN", "DSMAX", "EABSB",
         "IFORCE", "NBE", "NBANGL", "IMPDET", "IDBODY", "IDKPAR", "IDPSF", "IDSPC", "IDFLNC",
         "ENDETC", "EDSPC", "EDBODY", "GRIDX", "GRIDY", "GRIDZ", "GRIDBN",
@@ -16826,6 +17019,7 @@ class SimulationTab(QWidget):
     }
     IN_SECTION_KEYWORDS = {
         "source": {"SKPAR", "SENERG", "SPECTR", "SPOSIT", "SCONE", "SRADI", "SPOLAR"},
+        "psf": {"IPSFN", "IPSPLI", "WGTWIN", "EPMAX"},
         "materials": {"MFNAME", "MSIMPA"},
         "geometry": {"GEOMFN", "DSMAX", "EABSB"},
         "forcing": {"IFORCE"},
@@ -16863,6 +17057,7 @@ class SimulationTab(QWidget):
         self._kill_all_pending = False
         self._launch_generation = 0
         self._source_energy_mode = ""
+        self._input_reference_overrides = {}
         self._spectr_source_path = ""
         self._spectr_prob_column = 6
         self._spectr_auto_sync_enabled = False
@@ -16872,6 +17067,10 @@ class SimulationTab(QWidget):
         self._spectr_database_path = ""
         self._spectr_database_label = ""
         self._normalizing_source_order = False
+        self._startup_external_scan_thread = None
+        self._startup_external_scan_worker = None
+        self._startup_restore_thread = None
+        self._startup_restore_worker = None
         self._geo_list_folder = None
         self._mat_list_folder = None
         self._instructions_root = None
@@ -16881,12 +17080,236 @@ class SimulationTab(QWidget):
             "penmain": "penmain",
             "material": "",
         }
+        self._startup_followups_scheduled = False
         self._build()
+        self._refresh_workspace_root_choices()
         self._ext_poll_timer = QTimer(self)
         self._ext_poll_timer.timeout.connect(self._poll_external_sims)
         self._ext_poll_timer.start(5000)  # check every 5 seconds
-        QTimer.singleShot(800, self._auto_link_external_sims_on_startup)
-        QTimer.singleShot(1200, self._offer_restore_sim_state)
+
+    def _scone_calculation_log_path(self, in_path=None):
+        target = Path(in_path) if in_path else (Path(self._in_path) if self._in_path else None)
+        if target:
+            return target.with_name(f"{target.stem}_scone_calculations.json")
+        root = self._instructions_root_path()
+        if root:
+            return Path(root) / "simulation_scone_calculations.json"
+        return Path.cwd() / "simulation_scone_calculations.json"
+
+    def _append_scone_calculation_log(self, entry, in_path=None):
+        path = self._scone_calculation_log_path(in_path)
+        payload = {
+            "schema": "penelope_studio_scone_calculations_v1",
+            "entries": [],
+        }
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+                elif isinstance(loaded, list):
+                    payload["entries"] = list(loaded)
+        except Exception:
+            payload = {
+                "schema": "penelope_studio_scone_calculations_v1",
+                "entries": [],
+            }
+        entries = payload.setdefault("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+            payload["entries"] = entries
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "project_root": self._project_root or "",
+            "in_path": str(in_path or self._in_path or ""),
+        }
+        if isinstance(entry, dict):
+            record.update(entry)
+        entries.append(record)
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self.console.log(f"[SIM] SCONE calculation logged: {path.name}\n", "info")
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not write SCONE calculation log: {exc}\n", "warn")
+
+    def schedule_startup_followups(self, link_delay_ms=1800, restore_delay_ms=2600):
+        if self._startup_followups_scheduled:
+            return
+        self._startup_followups_scheduled = True
+        QTimer.singleShot(max(0, int(link_delay_ms or 0)), self._auto_link_external_sims_on_startup)
+        QTimer.singleShot(max(0, int(restore_delay_ms or 0)), self._offer_restore_sim_state)
+
+    def _project_case_creation_log_path(self):
+        if not self._project_root:
+            return None
+        return Path(self._project_root) / "case_creation_log.json"
+
+    def _project_batch_case_creation_log_path(self):
+        if not self._project_root:
+            return None
+        return Path(self._project_root) / "batch_case_creation_log.json"
+
+    def _append_project_log_entry(self, path, schema, entry):
+        if not path:
+            return
+        payload = {
+            "schema": schema,
+            "entries": [],
+        }
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+                elif isinstance(loaded, list):
+                    payload["entries"] = list(loaded)
+        except Exception:
+            payload = {
+                "schema": schema,
+                "entries": [],
+            }
+        entries = payload.setdefault("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+            payload["entries"] = entries
+        entries.append(entry)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _project_relative_path_text(self, path):
+        if not path:
+            return ""
+        target = Path(path)
+        if not self._project_root:
+            return str(target)
+        try:
+            return str(target.resolve().relative_to(Path(self._project_root).resolve()))
+        except Exception:
+            return str(target)
+
+    def _serialize_case_variant_spec(self, spec):
+        if not isinstance(spec, dict):
+            return {}
+        data = {}
+        for key in ("case_name", "in_filename", "senerg_kev", "spectr_file"):
+            value = spec.get(key, "")
+            if str(value or "").strip():
+                data[key] = value
+        spectr_range = spec.get("spectr_range")
+        if spectr_range and len(spectr_range) == 2:
+            try:
+                data["spectr_range_kev"] = [float(spectr_range[0]), float(spectr_range[1])]
+            except Exception:
+                pass
+        sposit = spec.get("sposit")
+        if sposit:
+            data["sposit_cm"] = [str(v) for v in sposit]
+        scone = spec.get("scone")
+        if scone:
+            data["scone_deg"] = [str(v) for v in scone]
+        return data
+
+    def _case_creation_log_record(
+        self,
+        case_dir,
+        result,
+        geo_path,
+        workspace_geo_name,
+        group_rel="",
+        source_in_path=None,
+        spec=None,
+        batch_id="",
+    ):
+        title = ""
+        text = str((result or {}).get("workspace_text", "") or "")
+        match = re.search(r"^\s*TITLE\s+(.*)$", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            title = (match.group(1) or "").strip()
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "project_root": self._project_root or "",
+            "group_rel": str(group_rel or ""),
+            "case_folder": self._project_relative_path_text(case_dir),
+            "case_name": Path(case_dir).name,
+            "source_in_path": self._project_relative_path_text(source_in_path or self._in_path or ""),
+            "geo_source_path": self._project_relative_path_text(geo_path),
+            "geo_file": str(workspace_geo_name or ""),
+            "in_file": Path((result or {}).get("workspace_in_path", "")).name if (result or {}).get("workspace_in_path") else "",
+            "rep_files": list((result or {}).get("rep_names", []) or []),
+            "material_count": int((result or {}).get("mat_count", 0) or 0),
+            "missing_materials": list((result or {}).get("missing_mats", []) or []),
+            "executable_count": int((result or {}).get("exe_count", 0) or 0),
+            "title": title,
+            "created_in_batch": bool(spec),
+        }
+        if batch_id:
+            record["batch_id"] = str(batch_id)
+        variant = self._serialize_case_variant_spec(spec)
+        if variant:
+            record["variant"] = variant
+        return record
+
+    def _log_project_case_creation(
+        self,
+        case_dir,
+        result,
+        geo_path,
+        workspace_geo_name,
+        group_rel="",
+        source_in_path=None,
+        spec=None,
+        batch_id="",
+    ):
+        path = self._project_case_creation_log_path()
+        if not path:
+            return
+        record = self._case_creation_log_record(
+            case_dir,
+            result,
+            geo_path,
+            workspace_geo_name,
+            group_rel=group_rel,
+            source_in_path=source_in_path,
+            spec=spec,
+            batch_id=batch_id,
+        )
+        try:
+            self._append_project_log_entry(path, "penelope_studio_case_creation_log_v1", record)
+            self.console.log(f"[SIM] Project case log updated: {path.name}\n", "info")
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not update project case log: {exc}\n", "warn")
+
+    def _log_project_batch_creation(
+        self,
+        batch_id,
+        group_rel,
+        target_root,
+        batch_root,
+        source_in_path,
+        geo_path,
+        workspace_geo_name,
+        created_batch_records,
+    ):
+        path = self._project_batch_case_creation_log_path()
+        if not path:
+            return
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "project_root": self._project_root or "",
+            "batch_id": str(batch_id or ""),
+            "group_rel": str(group_rel or ""),
+            "target_root": self._project_relative_path_text(target_root),
+            "batch_root": self._project_relative_path_text(batch_root),
+            "source_in_path": self._project_relative_path_text(source_in_path or self._in_path or ""),
+            "geo_source_path": self._project_relative_path_text(geo_path),
+            "geo_file": str(workspace_geo_name or ""),
+            "case_count": len(created_batch_records or []),
+            "cases": list(created_batch_records or []),
+        }
+        try:
+            self._append_project_log_entry(path, "penelope_studio_batch_case_creation_log_v1", entry)
+            self.console.log(f"[SIM] Project batch case log updated: {path.name}\n", "info")
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not update batch case log: {exc}\n", "warn")
 
     #  Build 
 
@@ -17155,6 +17578,24 @@ class SimulationTab(QWidget):
         workspace_row.addWidget(split_runs_btn)
         workspace_row.addStretch()
         rl.addLayout(workspace_row)
+
+        workspace_switch_row = QHBoxLayout()
+        workspace_switch_row.setSpacing(6)
+        self.cmb_workspace_roots = QComboBox()
+        self.cmb_workspace_roots.setToolTip("Quickly switch the active Case Root used by batch tools and case scans.")
+        self.cmb_workspace_roots.setStyleSheet(combo_css())
+        workspace_switch_row.addWidget(self.cmb_workspace_roots, 1)
+        self.btn_use_workspace_root = QPushButton("Use Root")
+        self.btn_use_workspace_root.setToolTip("Set the selected root as the active Case Root.")
+        self.btn_use_workspace_root.setStyleSheet(btn_css(width=88))
+        self.btn_use_workspace_root.clicked.connect(self._apply_selected_workspace_root)
+        workspace_switch_row.addWidget(self.btn_use_workspace_root)
+        refresh_workspace_roots_btn = QPushButton("Refresh Roots")
+        refresh_workspace_roots_btn.setToolTip("Rescan known project and batch roots for quick switching.")
+        refresh_workspace_roots_btn.setStyleSheet(btn_css(width=104))
+        refresh_workspace_roots_btn.clicked.connect(self._refresh_workspace_root_choices)
+        workspace_switch_row.addWidget(refresh_workspace_roots_btn)
+        rl.addLayout(workspace_switch_row)
 
         rl.addWidget(self._separator_line())
 
@@ -17444,6 +17885,7 @@ class SimulationTab(QWidget):
             self.lbl_in_path.setText(os.path.basename(path))
             self.editor.document().setModified(False)
             self.console.log(f"[SIM] Opened: {path}\n", "info")
+            self._report_phase_space_input_status(path, text)
             self._set_workspace_root(opened_folder, log_label="Current case root")
             self._update_file_source_labels()
             self.status_message.emit(f"Input: {os.path.basename(path)}")
@@ -17490,6 +17932,8 @@ class SimulationTab(QWidget):
             title = (title or "").lower()
             if "source definition" in title:
                 return "source"
+            if "phase-space file" in title or "input phase-space" in title:
+                return "psf"
             if "material data" in title:
                 return "materials"
             if "geometry definition" in title:
@@ -17982,6 +18426,14 @@ class SimulationTab(QWidget):
         self._tree_item(sposit_root, "Value", ", ".join(source["sposit"]), "sposit")
         scone_root = self._tree_item(source_root, "SCONE", "", "scone")
         self._tree_item(scone_root, "Value", ", ".join(source["scone"]), "scone")
+
+        ipsfn_names = self._ipsfn_file_names(text)
+        if ipsfn_names:
+            psf_root = self._tree_item(None, ">>>>>>>> Input phase-space file (psf).", "", "psf")
+            for token in ipsfn_names:
+                resolved = self._resolve_input_reference_file("IPSFN", token, self._in_path, run_folder=self._run_folder) if self._in_path else None
+                label = f"{Path(token).name} ({'ready' if resolved else 'missing'})"
+                self._tree_item(psf_root, "IPSFN", label, "psf")
 
         material_root = self._tree_item(None, ">>>>>>>> Material data and simulation parameters.", "", "materials")
         material_list = self._tree_item(material_root, "Linked material list", "", "material_list")
@@ -19080,13 +19532,122 @@ class SimulationTab(QWidget):
     def _workspace_folder(self):
         return Path(self._workspace_root) if self._workspace_root else self._in_folder()
 
+    def _solo_run_folder_for_input(self, in_path):
+        return Path(in_path).parent / "solo_case"
+
     def _set_workspace_root(self, folder, log_label=None):
         folder = str(Path(folder))
         self._workspace_root = folder
         if hasattr(self, "lbl_workspace_root"):
             self.lbl_workspace_root.setText(f"Case Root: {folder}")
+        self._refresh_workspace_root_choices(preferred=folder)
         if log_label:
             self.console.log(f"[SIM] {log_label}: {folder}\n", "info")
+
+    def _project_case_root_folder(self):
+        if not self._project_root:
+            return None
+        folders = dict((self._project_meta or {}).get("folders") or {})
+        return Path(self._project_root) / folders.get("cases", PROJECT_DIR_CASES)
+
+    def _project_batch_root_candidates_from_log(self):
+        if not self._project_root:
+            return []
+        path = self._project_batch_case_creation_log_path()
+        if not path or not path.exists():
+            return []
+        candidates = []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            entries = payload.get("entries", []) if isinstance(payload, dict) else []
+        except Exception:
+            return []
+        root = Path(self._project_root)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            rel = str(entry.get("batch_root", "") or "").strip()
+            candidate = None
+            if rel:
+                candidate = root / rel
+            else:
+                cases = entry.get("cases", [])
+                if isinstance(cases, list) and cases:
+                    first = cases[0]
+                    if isinstance(first, dict):
+                        case_rel = str(first.get("case_folder", "") or "").strip()
+                        if case_rel:
+                            candidate = (root / case_rel).parent
+            if candidate and candidate.exists() and candidate.is_dir():
+                candidates.append(candidate)
+        return candidates
+
+    def _workspace_root_choice_label(self, folder):
+        path = Path(folder)
+        if self._project_root:
+            try:
+                rel = path.resolve().relative_to(Path(self._project_root).resolve()).as_posix()
+                if rel == (self._project_case_root_folder().resolve().relative_to(Path(self._project_root).resolve()).as_posix() if self._project_case_root_folder() else ""):
+                    return f"{rel}  (project cases)"
+                return rel
+            except Exception:
+                pass
+        return str(path)
+
+    def _workspace_root_choices(self):
+        items = []
+        seen = set()
+
+        def add(path):
+            if not path:
+                return
+            p = Path(path)
+            try:
+                key = str(p.resolve())
+            except Exception:
+                key = str(p)
+            if key in seen:
+                return
+            if not p.exists():
+                return
+            seen.add(key)
+            items.append(p)
+
+        current = Path(self._workspace_root) if self._workspace_root else self._workspace_folder()
+        add(current)
+        add(self._project_case_root_folder())
+        for candidate in self._project_batch_root_candidates_from_log():
+            add(candidate)
+        return items
+
+    def _refresh_workspace_root_choices(self, preferred=None):
+        combo = getattr(self, "cmb_workspace_roots", None)
+        if combo is None:
+            return
+        choices = self._workspace_root_choices()
+        current_data = str(preferred or combo.currentData() or self._workspace_root or self._workspace_folder())
+        combo.blockSignals(True)
+        combo.clear()
+        for path in choices:
+            combo.addItem(self._workspace_root_choice_label(path), str(path))
+        idx = combo.findData(current_data)
+        if idx < 0 and choices:
+            idx = 0
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        if hasattr(self, "btn_use_workspace_root"):
+            self.btn_use_workspace_root.setEnabled(combo.count() > 0)
+
+    def _apply_selected_workspace_root(self):
+        combo = getattr(self, "cmb_workspace_roots", None)
+        if combo is None:
+            return
+        folder = str(combo.currentData() or "").strip()
+        if not folder:
+            return
+        self._set_workspace_root(folder, log_label="Case root")
+        self._update_file_source_labels()
 
     def _choose_workspace_root(self):
         start = str(self._workspace_folder())
@@ -19442,6 +20003,69 @@ class SimulationTab(QWidget):
         text = text.strip(" ._")
         return text or fallback
 
+    def _case_variant_number_text(self, value):
+        try:
+            number = float(str(value or "0").strip().replace(",", "."))
+        except (TypeError, ValueError):
+            number = 0.0
+        if abs(number) < 5e-13:
+            number = 0.0
+        return f"{number:.2f}".rstrip("0").rstrip(".") or "0"
+
+    def _case_variant_source_tokens(self, spec):
+        tokens = []
+        if spec.get("senerg_kev") not in (None, ""):
+            tokens.append(f"SENERG-{self._case_variant_number_text(spec.get('senerg_kev'))}keV")
+        spectr_range = spec.get("spectr_range") or ()
+        if len(spectr_range) == 2:
+            tokens.append(
+                "SPECTR-"
+                + self._case_variant_number_text(spectr_range[0])
+                + "_"
+                + self._case_variant_number_text(spectr_range[1])
+                + "keV"
+            )
+        sposit = spec.get("sposit") or ()
+        if len(sposit) == 3:
+            tokens.append("SPOSIT-" + "_".join(self._case_variant_number_text(v) for v in sposit))
+        scone = spec.get("scone") or ()
+        if len(scone) == 3:
+            tokens.append("SCONE-" + "_".join(self._case_variant_number_text(v) for v in scone))
+        return tokens
+
+    def _case_variant_folder_name(self, base_name, spec):
+        parts = [self._workspace_safe_token(base_name, "case")]
+        for token in self._case_variant_source_tokens(spec):
+            safe = self._workspace_safe_token(token, "")
+            if safe:
+                parts.append(safe)
+        name = "_".join(part for part in parts if part)
+        return name or "case"
+
+    def _case_variant_title(self, base_name, spec):
+        parts = [self._workspace_safe_token(base_name, "case")]
+        parts.extend(self._case_variant_source_tokens(spec))
+        return "_".join(part for part in parts if part) or "case"
+
+    def _case_variant_in_filename(self, value, fallback_stem):
+        raw = self._workspace_safe_token(value, fallback_stem or "simulation")
+        if not raw.lower().endswith(".in"):
+            raw += ".in"
+        return raw
+
+    def _case_source_from_target(self, xa, ya, za, radius, beta, gamma, alpha):
+        beta_rad = math.radians(float(beta))
+        gamma_rad = math.radians(float(gamma))
+        xf = float(xa) + float(radius) * math.sin(beta_rad) * math.cos(gamma_rad)
+        yf = float(ya) + float(radius) * math.sin(beta_rad) * math.sin(gamma_rad)
+        zf = float(za) + float(radius) * math.cos(beta_rad)
+        theta = 180.0 - float(beta)
+        phi = (180.0 + float(gamma)) % 360.0
+        return (
+            [f"{xf:.8g}", f"{yf:.8g}", f"{zf:.8g}"],
+            [f"{theta:.8g}", f"{phi:.8g}", f"{float(alpha):.8g}"],
+        )
+
     def _particle_type_token_from_in_text(self, text):
         match = re.search(r"^\s*SKPAR\s+(\d+)", text or "", re.IGNORECASE | re.MULTILINE)
         particle = match.group(1) if match else ""
@@ -19708,11 +20332,27 @@ class SimulationTab(QWidget):
             f" border:1px solid {P['border']}; border-radius:3px; padding:4px 16px; }}"
             f"QPushButton:hover {{ background:{P['bg3']}; }}"
         )
+        btn_batch = buttons.addButton("Create Case Batch...", QDialogButtonBox.ButtonRole.ActionRole)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
+        btn_batch.clicked.connect(lambda: dlg.done(2))
         lay.addWidget(buttons)
 
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        result = dlg.exec()
+        if result == 2:
+            count, ok = QInputDialog.getInt(
+                self,
+                "Create Case Batch",
+                "How many cases do you want to create?",
+                3,
+                1,
+                100,
+                1,
+            )
+            if not ok:
+                return None
+            return {"mode": "batch", "count": int(count)}
+        if result != QDialog.DialogCode.Accepted:
             return None
         base_name = self._workspace_safe_token(e_name.text(), "")
         if not base_name:
@@ -19720,6 +20360,435 @@ class SimulationTab(QWidget):
             return None
         selected = _sanitize_project_case_field_list([chk._case_field_key for chk in token_checks if chk.isChecked()])
         return self._case_folder_name_from_input(base_name, selected, in_path, geo_path)
+
+    def _spectr_range_from_lines(self, lines):
+        energies = []
+        for line in list(lines or []):
+            match = re.match(r"^\s*SPECTR\s+([^\s\[]+)", str(line or ""), re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                ev = float(match.group(1))
+            except ValueError:
+                continue
+            energies.append(ev / 1000.0)
+        if not energies:
+            return ()
+        return (min(energies), max(energies))
+
+    def _batch_case_variants_dialog(self, in_path, geo_path, case_count=3):
+        defaults = self._current_source_defaults()
+        particle = str(defaults.get("particle", "2") or "2").strip() or "2"
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle("Create Batch Cases")
+        dlg.resize(1040, 700)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        intro = QLabel(
+            "Create multiple cases from the current .in using source-only variations. "
+            "Each row can override SENERG or SPECTR, SPOSIT, and SCONE. "
+            "The generated case folder name and TITLE append the active source tokens automatically."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(intro)
+
+        bulk_row = QHBoxLayout()
+        bulk_row.setContentsMargins(0, 0, 0, 0)
+        bulk_row.setSpacing(6)
+        bulk_row.addWidget(QLabel("All rows:"))
+        bulk_row.addWidget(QLabel("Select"))
+        btn_all_senerg_on = QPushButton("SENERG")
+        btn_all_spectr_on = QPushButton("SPECTR")
+        btn_all_sposit_on = QPushButton("SPOSIT")
+        btn_all_scone_on = QPushButton("SCONE")
+        for btn in (btn_all_senerg_on, btn_all_spectr_on, btn_all_sposit_on, btn_all_scone_on):
+            btn.setStyleSheet(btn_css(P["bg2"], 82))
+            bulk_row.addWidget(btn)
+        bulk_row.addSpacing(10)
+        bulk_row.addWidget(QLabel("Clear"))
+        btn_all_senerg_off = QPushButton("SENERG")
+        btn_all_spectr_off = QPushButton("SPECTR")
+        btn_all_sposit_off = QPushButton("SPOSIT")
+        btn_all_scone_off = QPushButton("SCONE")
+        for btn in (btn_all_senerg_off, btn_all_spectr_off, btn_all_sposit_off, btn_all_scone_off):
+            btn.setStyleSheet(btn_css(P["bg2"], 82))
+            bulk_row.addWidget(btn)
+        bulk_row.addStretch()
+        lay.addLayout(bulk_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ border:1px solid {P['border']}; background:{P['bg']}; }}"
+            f"QScrollBar:vertical {{ background:{P['bg2']}; width:10px; }}"
+            f"QScrollBar::handle:vertical {{ background:{P['border']}; border-radius:4px; }}"
+        )
+        content = QWidget()
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(4, 4, 4, 4)
+        content_lay.setSpacing(6)
+        rows = []
+
+        def apply_check_state(key, checked):
+            for row in rows:
+                widget = row.get(key)
+                if widget is not None:
+                    widget.setChecked(bool(checked))
+
+        def add_row(seed_index=None):
+            row_index = len(rows) + 1 if seed_index is None else int(seed_index)
+            box = QGroupBox(f"CASE {row_index}")
+            box.setStyleSheet(
+                f"QGroupBox {{ color:#3F7FC0; background:{P['bg']};"
+                f" border:1px solid {P['border']}; border-radius:4px; margin-top:8px; padding:6px; }}"
+                f"QGroupBox::title {{ subcontrol-origin: margin; left:10px; padding:0 3px;"
+                f" color:#3F7FC0; font-weight:bold; }}"
+            )
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(6, 6, 6, 6)
+            box_lay.setSpacing(4)
+
+            top_form = QGridLayout()
+            top_form.setHorizontalSpacing(6)
+            top_form.setVerticalSpacing(4)
+            hdr_case = QLabel(f"CASE {row_index}")
+            hdr_case.setStyleSheet(label_css("#3F7FC0", bold=True, size=10))
+            e_case = QLineEdit(f"{Path(in_path).stem}_case{row_index}")
+            e_case.setStyleSheet(entry_css())
+            e_in = QLineEdit(f"{Path(in_path).stem}_case{row_index}.in")
+            e_in.setStyleSheet(entry_css())
+            chk_senerg = QCheckBox("SENERG")
+            chk_spectr = QCheckBox("SPECTR")
+            chk_sposit = QCheckBox("SPOSIT")
+            chk_scone = QCheckBox("SCONE")
+            for chk in (chk_senerg, chk_spectr, chk_sposit, chk_scone):
+                chk.setStyleSheet(checkbox_css())
+            top_form.addWidget(hdr_case, 0, 0)
+            top_form.addWidget(chk_senerg, 0, 1)
+            top_form.addWidget(chk_spectr, 0, 2)
+            top_form.addWidget(chk_sposit, 0, 3)
+            top_form.addWidget(chk_scone, 0, 4)
+            top_form.addWidget(QLabel("Case Name:"), 1, 0)
+            top_form.addWidget(e_case, 1, 1, 1, 2)
+            top_form.addWidget(QLabel(".in filename:"), 1, 3)
+            top_form.addWidget(e_in, 1, 4)
+            box_lay.addLayout(top_form)
+
+            details = QWidget()
+            details_lay = QGridLayout(details)
+            details_lay.setContentsMargins(0, 0, 0, 0)
+            details_lay.setHorizontalSpacing(6)
+            details_lay.setVerticalSpacing(4)
+
+            e_senerg = QLineEdit("")
+            e_senerg.setStyleSheet(entry_css())
+            e_senerg.setPlaceholderText("keV")
+            e_senerg.setFixedWidth(96)
+            lbl_senerg = QLabel("SENERG (keV):")
+            details_lay.addWidget(lbl_senerg, 0, 0)
+            details_lay.addWidget(e_senerg, 0, 1)
+
+            spectr_path = QLineEdit("")
+            spectr_path.setStyleSheet(entry_css())
+            spectr_path.setPlaceholderText("Spectrum file (.dat/.txt)")
+            btn_spectr = QPushButton("Browse...")
+            btn_spectr.setStyleSheet(btn_css(P["bg2"], 82))
+            lbl_spectr_file = QLabel("SPECTR file:")
+            details_lay.addWidget(lbl_spectr_file, 0, 2)
+            details_lay.addWidget(spectr_path, 0, 3)
+            details_lay.addWidget(btn_spectr, 0, 4)
+
+            sposit_edits = []
+            lbl_sposit = QLabel("SPOSIT X/Y/Z:")
+            details_lay.addWidget(lbl_sposit, 1, 0)
+            for idx in range(3):
+                edit = QLineEdit(defaults["sposit"][idx] if row_index == 1 else "")
+                edit.setStyleSheet(entry_css())
+                edit.setFixedWidth(68)
+                details_lay.addWidget(edit, 1, 1 + idx)
+                sposit_edits.append(edit)
+            lbl_sposit_auto = QLabel("SPOSIT auto-calculated from target mode")
+            lbl_sposit_auto.setStyleSheet(label_css(P["fg2"], size=8))
+            lbl_sposit_auto.setVisible(False)
+            details_lay.addWidget(lbl_sposit_auto, 1, 4)
+
+            cmb_scone_mode = QComboBox()
+            cmb_scone_mode.addItems(["Angles", "Target + distance + beta/gamma"])
+            cmb_scone_mode.setStyleSheet(combo_css())
+            details_lay.addWidget(QLabel("SCONE mode:"), 2, 0)
+            details_lay.addWidget(cmb_scone_mode, 2, 1)
+
+            direct_widget = QWidget()
+            direct_lay = QHBoxLayout(direct_widget)
+            direct_lay.setContentsMargins(0, 0, 0, 0)
+            direct_lay.setSpacing(6)
+            scone_direct_edits = []
+            for idx, label in enumerate(("theta", "phi", "alpha")):
+                direct_lay.addWidget(QLabel(f"{label}:"))
+                edit = QLineEdit(defaults["scone"][idx] if row_index == 1 else "")
+                edit.setStyleSheet(entry_css())
+                edit.setFixedWidth(64)
+                direct_lay.addWidget(edit)
+                scone_direct_edits.append(edit)
+            direct_lay.addStretch()
+
+            target_widget = QWidget()
+            target_lay = QGridLayout(target_widget)
+            target_lay.setContentsMargins(0, 0, 0, 0)
+            target_lay.setHorizontalSpacing(5)
+            target_lay.setVerticalSpacing(4)
+            target_keys = ("XA", "YA", "ZA", "R", "beta", "gamma", "alpha")
+            target_labels = ("Target X", "Target Y", "Target Z", "Distance R", "beta", "gamma", "alpha")
+            target_edits = {}
+            for idx, (key, label) in enumerate(zip(target_keys, target_labels)):
+                target_lay.addWidget(QLabel(label + ":"), idx // 4, (idx % 4) * 2)
+                edit = QLineEdit("")
+                edit.setStyleSheet(entry_css())
+                edit.setFixedWidth(64)
+                target_lay.addWidget(edit, idx // 4, (idx % 4) * 2 + 1)
+                target_edits[key] = edit
+            scone_stack = QStackedWidget()
+            scone_stack.addWidget(direct_widget)
+            scone_stack.addWidget(target_widget)
+            details_lay.addWidget(scone_stack, 2, 2, 1, 3)
+
+            lbl_preview = QLabel("")
+            lbl_preview.setWordWrap(True)
+            lbl_preview.setStyleSheet(label_css(P["fg2"], size=9))
+            box_lay.addWidget(details)
+            box_lay.addWidget(lbl_preview)
+            content_lay.addWidget(box)
+
+            def choose_spectrum():
+                path, _ = QFileDialog.getOpenFileName(
+                    dlg,
+                    "Choose spectrum file",
+                    str(self._in_folder()),
+                    "Spectrum data (*.dat *.txt);;All files (*.*)",
+                )
+                if path:
+                    spectr_path.setText(path)
+
+            btn_spectr.clicked.connect(choose_spectrum)
+
+            def refresh_row():
+                direct_mode = cmb_scone_mode.currentIndex() == 0
+                target_mode = chk_scone.isChecked() and not direct_mode
+                scone_stack.setCurrentIndex(0 if direct_mode else 1)
+                scone_stack.setVisible(chk_scone.isChecked())
+                lbl_senerg.setVisible(chk_senerg.isChecked())
+                e_senerg.setVisible(chk_senerg.isChecked())
+                lbl_spectr_file.setVisible(chk_spectr.isChecked())
+                spectr_path.setVisible(chk_spectr.isChecked())
+                btn_spectr.setVisible(chk_spectr.isChecked())
+                lbl_sposit.setVisible(chk_sposit.isChecked() and not target_mode)
+                lbl_sposit_auto.setVisible(target_mode)
+                for edit in sposit_edits:
+                    edit.setVisible(chk_sposit.isChecked() and not target_mode)
+                spec = {}
+                if chk_senerg.isChecked():
+                    spec["senerg_kev"] = (e_senerg.text() or "").strip()
+                if chk_spectr.isChecked():
+                    try:
+                        if (spectr_path.text() or "").strip():
+                            lines = self._spectr_lines_from_file(spectr_path.text().strip(), prob_col=self._spectr_prob_col_for_particle(particle))
+                            spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                    except Exception:
+                        pass
+                if chk_sposit.isChecked():
+                    spec["sposit"] = [(edit.text() or "").strip() for edit in sposit_edits]
+                if chk_scone.isChecked():
+                    if cmb_scone_mode.currentIndex() == 0:
+                        spec["scone"] = [(edit.text() or "").strip() for edit in scone_direct_edits]
+                    else:
+                        try:
+                            xa = float((target_edits["XA"].text() or "").strip().replace(",", "."))
+                            ya = float((target_edits["YA"].text() or "").strip().replace(",", "."))
+                            za = float((target_edits["ZA"].text() or "").strip().replace(",", "."))
+                            radius = float((target_edits["R"].text() or "").strip().replace(",", "."))
+                            beta = float((target_edits["beta"].text() or "").strip().replace(",", "."))
+                            gamma = float((target_edits["gamma"].text() or "").strip().replace(",", "."))
+                            alpha = float((target_edits["alpha"].text() or "").strip().replace(",", "."))
+                            calc_sposit, calc_scone = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
+                            spec["sposit"] = calc_sposit
+                            spec["scone"] = calc_scone
+                        except ValueError:
+                            pass
+                preview = self._case_variant_folder_name(e_case.text(), spec)
+                lbl_preview.setText(f"Folder preview: {preview}")
+                scone_stack.updateGeometry()
+                box.updateGeometry()
+
+            for widget in [e_case, e_in, e_senerg, spectr_path, cmb_scone_mode, chk_senerg, chk_spectr, chk_sposit, chk_scone, *sposit_edits, *scone_direct_edits, *target_edits.values()]:
+                if isinstance(widget, QComboBox):
+                    widget.currentTextChanged.connect(refresh_row)
+                elif isinstance(widget, QCheckBox):
+                    widget.toggled.connect(refresh_row)
+                else:
+                    widget.textChanged.connect(refresh_row)
+            refresh_row()
+            rows.append({
+                "case_name": e_case,
+                "in_name": e_in,
+                "senerg": chk_senerg,
+                "senerg_edit": e_senerg,
+                "spectr": chk_spectr,
+                "spectr_path": spectr_path,
+                "sposit": chk_sposit,
+                "sposit_edits": sposit_edits,
+                "scone": chk_scone,
+                "scone_mode": cmb_scone_mode,
+                "scone_direct_edits": scone_direct_edits,
+                "scone_target_edits": target_edits,
+            })
+
+        def add_rows(count):
+            try:
+                count = int(count)
+            except Exception:
+                count = 0
+            for _ in range(max(0, count)):
+                add_row()
+
+        for idx in range(1, max(1, int(case_count)) + 1):
+            add_row(idx)
+        scroll.setWidget(content)
+        lay.addWidget(scroll, stretch=1)
+
+        btn_all_senerg_on.clicked.connect(lambda: apply_check_state("senerg", True))
+        btn_all_spectr_on.clicked.connect(lambda: apply_check_state("spectr", True))
+        btn_all_sposit_on.clicked.connect(lambda: apply_check_state("sposit", True))
+        btn_all_scone_on.clicked.connect(lambda: apply_check_state("scone", True))
+        btn_all_senerg_off.clicked.connect(lambda: apply_check_state("senerg", False))
+        btn_all_spectr_off.clicked.connect(lambda: apply_check_state("spectr", False))
+        btn_all_sposit_off.clicked.connect(lambda: apply_check_state("sposit", False))
+        btn_all_scone_off.clicked.connect(lambda: apply_check_state("scone", False))
+
+        add_row_bar = QHBoxLayout()
+        add_row_bar.setContentsMargins(0, 0, 0, 0)
+        add_row_bar.setSpacing(8)
+        btn_add_row = QPushButton("Add Case Row")
+        btn_add_row.setStyleSheet(btn_css(P["bg2"], 132))
+        btn_add_row.clicked.connect(lambda: add_row())
+        add_row_bar.addWidget(btn_add_row)
+        add_row_bar.addWidget(QLabel("Add many:"))
+        spn_add_rows = QSpinBox()
+        spn_add_rows.setRange(2, 50)
+        spn_add_rows.setValue(5)
+        spn_add_rows.setFixedWidth(72)
+        spn_add_rows.setStyleSheet(combo_css())
+        add_row_bar.addWidget(spn_add_rows)
+        btn_add_many = QPushButton("Add Rows")
+        btn_add_many.setStyleSheet(btn_css(P["bg2"], 102))
+        btn_add_many.clicked.connect(lambda: add_rows(spn_add_rows.value()))
+        add_row_bar.addWidget(btn_add_many)
+        add_row_bar.addStretch()
+        lay.addLayout(add_row_bar)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        specs = []
+        for idx, row in enumerate(rows, start=1):
+            case_name = self._workspace_safe_token(row["case_name"].text(), "")
+            if not case_name:
+                QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx} needs a Case Name.")
+                return None
+            in_filename = self._case_variant_in_filename(row["in_name"].text(), case_name)
+            spec = {"case_name": case_name, "in_filename": in_filename}
+            if row["senerg"].isChecked() and row["spectr"].isChecked():
+                QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: choose either SENERG or SPECTR, not both.")
+                return None
+            if row["senerg"].isChecked():
+                raw = (row["senerg_edit"].text() or "").strip()
+                if not raw:
+                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: enter the SENERG value in keV.")
+                    return None
+                spec["senerg_kev"] = raw
+            if row["spectr"].isChecked():
+                path = (row["spectr_path"].text() or "").strip()
+                if not path:
+                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: choose a SPECTR file.")
+                    return None
+                try:
+                    lines = self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
+                except Exception as exc:
+                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: invalid SPECTR file.\n\n{exc}")
+                    return None
+                spec["spectr_file"] = path
+                spec["spectr_lines"] = lines
+                spec["spectr_range"] = self._spectr_range_from_lines(lines)
+            if row["sposit"].isChecked():
+                values = [(edit.text() or "").strip() for edit in row["sposit_edits"]]
+                if not all(values):
+                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: fill all SPOSIT coordinates.")
+                    return None
+                spec["sposit"] = values
+            if row["scone"].isChecked():
+                if row["scone_mode"].currentIndex() == 0:
+                    values = [(edit.text() or "").strip() for edit in row["scone_direct_edits"]]
+                    if not all(values):
+                        QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: fill all SCONE angle values.")
+                        return None
+                    spec["scone"] = values
+                else:
+                    try:
+                        xa = float((row["scone_target_edits"]["XA"].text() or "").strip().replace(",", "."))
+                        ya = float((row["scone_target_edits"]["YA"].text() or "").strip().replace(",", "."))
+                        za = float((row["scone_target_edits"]["ZA"].text() or "").strip().replace(",", "."))
+                        radius = float((row["scone_target_edits"]["R"].text() or "").strip().replace(",", "."))
+                        beta = float((row["scone_target_edits"]["beta"].text() or "").strip().replace(",", "."))
+                        gamma = float((row["scone_target_edits"]["gamma"].text() or "").strip().replace(",", "."))
+                        alpha = float((row["scone_target_edits"]["alpha"].text() or "").strip().replace(",", "."))
+                    except ValueError:
+                        QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: use numeric values for target, distance, beta, gamma, and alpha.")
+                        return None
+                    sposit_vals, scone_vals = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
+                    spec["sposit"] = sposit_vals
+                    spec["scone"] = scone_vals
+                    self._append_scone_calculation_log(
+                        {
+                            "context": "batch_case_variants",
+                            "mode": "target_beta_gamma",
+                            "case_name": case_name,
+                            "in_filename": in_filename,
+                            "input": {
+                                "target": {"x": xa, "y": ya, "z": za},
+                                "distance_r": radius,
+                                "beta_deg": beta,
+                                "gamma_deg": gamma,
+                                "alpha_deg": alpha,
+                            },
+                            "output": {
+                                "sposit": {
+                                    "x": sposit_vals[0],
+                                    "y": sposit_vals[1],
+                                    "z": sposit_vals[2],
+                                },
+                                "scone": {
+                                    "theta_deg": scone_vals[0],
+                                    "phi_deg": scone_vals[1],
+                                    "alpha_deg": scone_vals[2],
+                                },
+                            },
+                        },
+                        in_path=in_path,
+                    )
+            specs.append(spec)
+        if not specs:
+            QMessageBox.warning(self, "Create Batch Cases", "No valid batch case rows were prepared.")
+            return None
+        return specs
 
     def _workspace_name_from_files(self, in_path, geo_path):
         if self._project_root:
@@ -19736,6 +20805,11 @@ class SimulationTab(QWidget):
             if not candidate.exists():
                 return candidate
         raise FileExistsError(f"Could not find an unused workspace name for {base_dir}")
+
+    def _batch_workspace_container_name(self, in_path):
+        stem = self._workspace_safe_token(Path(in_path).stem, "batch")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"batch_{stem}_{stamp}"
 
     def _geo_alias_for_penelope(self, geo_path):
         name = Path(geo_path).name
@@ -19991,78 +21065,230 @@ class SimulationTab(QWidget):
                 )
                 return
 
-        case_folder_name = self._case_creation_name_dialog(in_path, geo_path)
-        if not case_folder_name:
+        case_choice = self._case_creation_name_dialog(in_path, geo_path)
+        if not case_choice:
             return
-        case_dir = self._unique_workspace_dir(target_root / case_folder_name)
+        mat_sources = _mat_sources(geo_path, mat_folder)
         try:
-            case_dir.mkdir(parents=True, exist_ok=True)
-            if template_dir.exists() and template_dir.is_dir():
-                self._copy_workspace_tree(template_dir, case_dir)
+            required_refs = self._resolve_required_input_reference_sources(
+                in_path,
+                workspace_text,
+                interactive=True,
+                purpose="case",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Create Case", str(exc))
+            return
+        created_dirs = []
+        batch_log_records = []
+        batch_id = ""
+        try:
+            if isinstance(case_choice, dict) and case_choice.get("mode") == "batch":
+                batch_specs = self._batch_case_variants_dialog(in_path, geo_path, case_choice.get("count") or 3)
+                if not batch_specs:
+                    return
+                batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
+                batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(in_path))
+                batch_root.mkdir(parents=True, exist_ok=True)
+                for spec in batch_specs:
+                    folder_name = self._case_variant_folder_name(spec["case_name"], spec)
+                    case_dir = self._unique_workspace_dir(batch_root / folder_name)
+                    batch_text = self._apply_case_variant_source_overrides(workspace_text, spec)
+                    title_line = self._case_variant_title(spec["case_name"], spec)
+                    batch_text, _ = self._replace_or_insert_line_in_text(
+                        batch_text,
+                        "TITLE",
+                        f"TITLE  {title_line}",
+                        before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
+                    )
+                    result = self._write_case_workspace(
+                        case_dir,
+                        in_filename=spec["in_filename"],
+                        in_text=batch_text,
+                        geo_path=geo_path,
+                        workspace_geo_name=workspace_geo_name,
+                        template_dir=template_dir,
+                        mat_sources=mat_sources,
+                        required_refs=required_refs,
+                        effective_execs=effective_execs,
+                    )
+                    created_dirs.append((case_dir, result))
+                    self._log_project_case_creation(
+                        case_dir,
+                        result,
+                        geo_path,
+                        workspace_geo_name,
+                        group_rel=group_rel,
+                        source_in_path=in_path,
+                        spec=spec,
+                        batch_id=batch_id,
+                    )
+                    batch_log_records.append(
+                        self._case_creation_log_record(
+                            case_dir,
+                            result,
+                            geo_path,
+                            workspace_geo_name,
+                            group_rel=group_rel,
+                            source_in_path=in_path,
+                            spec=spec,
+                            batch_id=batch_id,
+                        )
+                    )
+                if created_dirs:
+                    last_dir, last_result = created_dirs[-1]
+                    self._in_path = str(last_result["workspace_in_path"])
+                    self._run_folder = last_dir
+                    self.editor.setPlainText(last_result["workspace_text"])
+                    self.lbl_in_path.setText(last_result["workspace_in_path"].name)
+                    self.console.log(
+                        f"[SIM] Batch cases created: {len(created_dirs)} folder(s) under {target_root}\n",
+                        "ok",
+                    )
+                    for case_dir, result in created_dirs:
+                        self.console.log(
+                            f"[SIM] Case created: {case_dir.name} "
+                            f"(.in, .geo, {result['rep_count']} .rep file(s), {result['ref_count']} IPSFN file(s), {result['mat_count']} .mat file(s), {result['exe_count']} executable(s))\n",
+                            "ok",
+                        )
+                        if result["rep_names"]:
+                            self.console.log(
+                                f"[SIM] Linked geometry report copied with case: {', '.join(result['rep_names'])}\n",
+                                "info",
+                            )
+                        if result["ref_names"]:
+                            self.console.log(
+                                f"[SIM] Linked IPSFN file copied with case: {', '.join(result['ref_names'])}\n",
+                                "info",
+                            )
+                        if result["missing_mats"]:
+                            self.console.log(
+                                "[SIM] Case material warning: missing MFNAME file(s): "
+                                + ", ".join(result["missing_mats"])
+                                + "\n",
+                                "warn",
+                            )
+                    self._log_project_batch_creation(
+                        batch_id,
+                        group_rel,
+                        target_root,
+                        batch_root,
+                        in_path,
+                        geo_path,
+                        workspace_geo_name,
+                        batch_log_records,
+                    )
+                    self._set_workspace_root(batch_root, log_label="Case root (created batch)")
+                    self.console.log(f"[SIM] Batch root ready: {batch_root}\n", "info")
+                    self.status_message.emit(f"Batch cases created: {len(created_dirs)}")
             else:
-                self.console.log(f"[SIM] Template folder not found, continuing without it: {template_dir}\n", "warn")
-            workspace_in_path = case_dir / in_path.name
-            workspace_text = self._apply_case_title(workspace_text, in_path.stem)
-            workspace_in_path.write_bytes(_encode_text_bytes(workspace_text))
-            self._safe_copy_file(geo_path, case_dir / workspace_geo_name, overwrite=True)
-            rep_count, rep_names = self._copy_linked_rep_to_folder(geo_path, case_dir, workspace_geo_name, overwrite=True)
-            mat_count = 0
-            mat_sources = _mat_sources(geo_path, mat_folder)
-            mfname_entries = self._mfname_material_names(workspace_text)
-            required_mats = {Path(name).name.lower() for name in mfname_entries}
-            copied_mats = set()
-            missing_mats = []
-            for name in mfname_entries:
-                mat = self._resolve_material_file(name, mat_sources)
-                target_name = Path(name).name
-                if not mat:
-                    missing_mats.append(target_name)
-                    continue
-                key = target_name.lower()
-                if key in copied_mats:
-                    continue
-                target = case_dir / target_name
-                if self._safe_copy_file(mat, target, overwrite=True) or target.exists():
-                    copied_mats.add(key)
-                    mat_count += 1
-            for mat in sorted(case_dir.glob("*.mat")):
-                if mat.name.lower() not in required_mats:
-                    try:
-                        mat.unlink()
-                    except OSError as exc:
-                        if getattr(exc, "winerror", None) == 32:
-                            self.console.log(f"[SIM] Could not remove locked unlinked material: {mat.name}\n", "warn")
-                        else:
-                            raise
-            exe_count = self._copy_linked_executables_to_case(case_dir, effective_execs)
-            self._in_path = str(workspace_in_path)
-            self._run_folder = case_dir
-            self.editor.setPlainText(workspace_text)
-            self.lbl_in_path.setText(workspace_in_path.name)
-            if missing_mats:
-                self.console.log(
-                    "[SIM] Case material warning: missing MFNAME file(s): "
-                    + ", ".join(missing_mats)
-                    + "\n",
-                    "warn",
+                case_dir = self._unique_workspace_dir(target_root / str(case_choice))
+                result = self._write_case_workspace(
+                    case_dir,
+                    in_filename=in_path.name,
+                    in_text=self._apply_case_title(workspace_text, in_path.stem),
+                    geo_path=geo_path,
+                    workspace_geo_name=workspace_geo_name,
+                    template_dir=template_dir,
+                    mat_sources=mat_sources,
+                    required_refs=required_refs,
+                    effective_execs=effective_execs,
                 )
+                self._in_path = str(result["workspace_in_path"])
+                self._run_folder = case_dir
+                self.editor.setPlainText(result["workspace_text"])
+                self.lbl_in_path.setText(result["workspace_in_path"].name)
+                self._log_project_case_creation(
+                    case_dir,
+                    result,
+                    geo_path,
+                    workspace_geo_name,
+                    group_rel=group_rel,
+                    source_in_path=in_path,
+                )
+                self.console.log(
+                    f"[SIM] Case created and linked: {case_dir} "
+                    f"(.in, .geo, {result['rep_count']} .rep file(s), {result['ref_count']} IPSFN file(s), {result['mat_count']} .mat file(s), {result['exe_count']} executable(s))\n",
+                    "ok",
+                )
+                if result["rep_names"]:
+                    self.console.log(
+                        f"[SIM] Linked geometry report copied with case: {', '.join(result['rep_names'])}\n",
+                        "info",
+                    )
+                if result["ref_names"]:
+                    self.console.log(
+                        f"[SIM] Linked IPSFN file copied with case: {', '.join(result['ref_names'])}\n",
+                        "info",
+                    )
+                if result["missing_mats"]:
+                    self.console.log(
+                        "[SIM] Case material warning: missing MFNAME file(s): "
+                        + ", ".join(result["missing_mats"])
+                        + "\n",
+                        "warn",
+                    )
+                self.status_message.emit(f"Case linked: {case_dir.name}")
+                created_dirs.append((case_dir, result))
         except Exception as e:
             QMessageBox.critical(self, "Create Case", str(e))
             return
-        self.console.log(
-            f"[SIM] Case created and linked: {case_dir} "
-            f"(.in, .geo, {rep_count} .rep file(s), {mat_count} .mat file(s), {exe_count} executable(s))\n",
-            "ok",
-        )
-        if rep_names:
-            self.console.log(
-                f"[SIM] Linked geometry report copied with case: {', '.join(rep_names)}\n",
-                "info",
-            )
-        self.status_message.emit(f"Case linked: {case_dir.name}")
-        if not self._project_root:
-            self._set_workspace_root(case_dir, log_label="Case root (auto-set from created case)")
+        if created_dirs and not self._project_root:
+            self._set_workspace_root(created_dirs[-1][0], log_label="Case root (auto-set from created case)")
             self._update_file_source_labels()
+
+    def _write_case_workspace(self, case_dir, in_filename, in_text, geo_path, workspace_geo_name, template_dir, mat_sources, required_refs, effective_execs):
+        case_dir = Path(case_dir)
+        case_dir.mkdir(parents=True, exist_ok=True)
+        if template_dir.exists() and template_dir.is_dir():
+            self._copy_workspace_tree(template_dir, case_dir)
+        else:
+            self.console.log(f"[SIM] Template folder not found, continuing without it: {template_dir}\n", "warn")
+        workspace_in_path = case_dir / in_filename
+        workspace_text = str(in_text or "")
+        workspace_in_path.write_bytes(_encode_text_bytes(workspace_text))
+        self._safe_copy_file(geo_path, case_dir / workspace_geo_name, overwrite=True)
+        rep_count, rep_names = self._copy_linked_rep_to_folder(geo_path, case_dir, workspace_geo_name, overwrite=True)
+        ref_names = self._copy_required_input_reference_sources(required_refs, case_dir, overwrite=True)
+        mat_count = 0
+        mfname_entries = self._mfname_material_names(workspace_text)
+        required_mats = {Path(name).name.lower() for name in mfname_entries}
+        copied_mats = set()
+        missing_mats = []
+        for name in mfname_entries:
+            mat = self._resolve_material_file(name, mat_sources)
+            target_name = Path(name).name
+            if not mat:
+                missing_mats.append(target_name)
+                continue
+            key = target_name.lower()
+            if key in copied_mats:
+                continue
+            target = case_dir / target_name
+            if self._safe_copy_file(mat, target, overwrite=True) or target.exists():
+                copied_mats.add(key)
+                mat_count += 1
+        for mat in sorted(case_dir.glob("*.mat")):
+            if mat.name.lower() not in required_mats:
+                try:
+                    mat.unlink()
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) == 32:
+                        self.console.log(f"[SIM] Could not remove locked unlinked material: {mat.name}\n", "warn")
+                    else:
+                        raise
+        exe_count = self._copy_linked_executables_to_case(case_dir, effective_execs)
+        return {
+            "workspace_in_path": workspace_in_path,
+            "workspace_text": workspace_text,
+            "rep_count": rep_count,
+            "rep_names": rep_names,
+            "ref_count": len(ref_names),
+            "ref_names": ref_names,
+            "mat_count": mat_count,
+            "missing_mats": missing_mats,
+            "exe_count": exe_count,
+        }
 
     def _geo_body_options(self):
         path = self._current_geom_path()
@@ -20974,6 +22200,31 @@ class SimulationTab(QWidget):
             cone_edits["theta"].setText(_fmt_calc_value(theta))
             cone_edits["phi"].setText(_fmt_calc_value(phi))
             cone_edits["alpha"].setText(_fmt_calc_value(alpha))
+            self._append_scone_calculation_log(
+                {
+                    "context": "particle_source_editor",
+                    "mode": "target_beta_gamma",
+                    "input": {
+                        "target": {"x": xa, "y": ya, "z": za},
+                        "distance_r": radius,
+                        "beta_deg": beta,
+                        "gamma_deg": gamma,
+                        "alpha_deg": alpha,
+                    },
+                    "output": {
+                        "sposit": {
+                            "x": _fmt_calc_value(xf),
+                            "y": _fmt_calc_value(yf),
+                            "z": _fmt_calc_value(zf),
+                        },
+                        "scone": {
+                            "theta_deg": _fmt_calc_value(theta),
+                            "phi_deg": _fmt_calc_value(phi),
+                            "alpha_deg": _fmt_calc_value(alpha),
+                        },
+                    },
+                }
+            )
 
         def load_target_values():
             path, _ = QFileDialog.getOpenFileName(
@@ -22212,6 +23463,53 @@ class SimulationTab(QWidget):
         lines.append(new_line)
         return "\n".join(lines), False
 
+    def _replace_energy_block_in_text(self, text, new_lines):
+        lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        filtered = [line for line in lines if not re.match(r"^\s*(SENERG|SPECTR)\b", line, re.IGNORECASE)]
+        insert_at = next((i + 1 for i, line in enumerate(filtered) if re.match(r"^\s*SKPAR\b", line, re.IGNORECASE)), None)
+        if insert_at is None:
+            insert_at = next(
+                (
+                    i for i, line in enumerate(filtered)
+                    if re.match(r"^\s*(SPOSIT|SCONE|END)\b", line, re.IGNORECASE)
+                ),
+                len(filtered),
+            )
+        filtered[insert_at:insert_at] = list(new_lines)
+        return "\n".join(filtered)
+
+    def _apply_case_variant_source_overrides(self, text, spec, particle=None):
+        updated = str(text or "")
+        senerg_kev = spec.get("senerg_kev")
+        spectr_lines = list(spec.get("spectr_lines") or [])
+        if senerg_kev not in (None, "") and spectr_lines:
+            raise ValueError("Choose either SENERG or SPECTR for a batch case row, not both.")
+        if senerg_kev not in (None, ""):
+            energy_ev = self._format_unit_energy(str(senerg_kev), "keV")
+            updated = self._replace_energy_block_in_text(
+                updated,
+                [f"SENERG {energy_ev:<16}    [Initial energy (monoenergetic sources only)]"],
+            )
+        elif spectr_lines:
+            updated = self._replace_energy_block_in_text(updated, spectr_lines)
+        sposit = list(spec.get("sposit") or [])
+        if len(sposit) == 3:
+            updated, _ = self._replace_or_insert_line_in_text(
+                updated,
+                "SPOSIT",
+                f"SPOSIT {sposit[0]} {sposit[1]} {sposit[2]}                    [Coordinates of the source]",
+                before_keywords=("SCONE", "END"),
+            )
+        scone = list(spec.get("scone") or [])
+        if len(scone) == 3:
+            updated, _ = self._replace_or_insert_line_in_text(
+                updated,
+                "SCONE",
+                f"SCONE  {scone[0]} {scone[1]} {scone[2]}                       [Conical beam; theta phi alpha in deg]",
+                before_keywords=("END",),
+            )
+        return updated
+
     def _replace_keyword_filename_token(self, text, keyword, filename_map):
         if not filename_map:
             return text
@@ -22329,6 +23627,138 @@ class SimulationTab(QWidget):
                     names.append(token)
         return names
 
+    def _ipsfn_file_names(self, text):
+        names = []
+        for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            match = re.match(r"^\s*IPSFN\s+([^\s\[]+)", line, re.IGNORECASE)
+            if match:
+                token = match.group(1).strip().strip('"')
+                if token:
+                    names.append(token)
+        return names
+
+    def _input_reference_override_key(self, keyword, token):
+        token_name = Path(str(token or "").strip().strip('"')).name.lower()
+        return f"{str(keyword or '').upper()}::{token_name}"
+
+    def _remember_input_reference_override(self, keyword, token, path):
+        try:
+            candidate = Path(path)
+        except Exception:
+            return
+        if candidate.exists() and candidate.is_file():
+            self._input_reference_overrides[self._input_reference_override_key(keyword, token)] = str(candidate)
+
+    def _input_reference_search_folders(self, in_path, run_folder=None):
+        folders = []
+        for candidate in (
+            Path(in_path).parent if in_path else None,
+            run_folder,
+            self._run_folder,
+            self._workspace_folder(),
+            self._geomfn_list_folder(),
+            self._material_list_folder(),
+        ):
+            if not candidate:
+                continue
+            try:
+                path = Path(candidate)
+            except Exception:
+                continue
+            if path not in folders:
+                folders.append(path)
+        return folders
+
+    def _resolve_input_reference_file(self, keyword, token, in_path, run_folder=None):
+        token = str(token or "").strip().strip('"')
+        if not token:
+            return None
+        override = self._input_reference_overrides.get(self._input_reference_override_key(keyword, token), "")
+        if override:
+            try:
+                override_path = Path(override)
+                if override_path.exists() and override_path.is_file():
+                    return override_path
+            except Exception:
+                pass
+        return self._resolve_referenced_file(token, self._input_reference_search_folders(in_path, run_folder=run_folder))
+
+    def _prompt_input_reference_file(self, keyword, token, in_path, *, purpose="run"):
+        start = str(Path(in_path).parent if in_path else self._workspace_folder())
+        title = f"Locate {str(keyword).upper()} file"
+        QMessageBox.information(
+            self,
+            title,
+            f"This input uses {str(keyword).upper()} = {Path(str(token or '')).name}.\n\n"
+            "PENELOPE expects that file to have been generated by a previous simulation.\n"
+            f"Choose the source file now so Studio can copy it into the {'case' if purpose == 'case' else 'run'} folder.",
+        )
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            start,
+            "Data files (*.dat *.psf *.spf);;All files (*.*)",
+        )
+        if not chosen:
+            return None
+        self._remember_input_reference_override(keyword, token, chosen)
+        return Path(chosen)
+
+    def _required_input_reference_specs(self, text):
+        specs = []
+        seen = set()
+        for token in self._ipsfn_file_names(text):
+            local_name = Path(str(token).strip().strip('"')).name
+            key = ("IPSFN", local_name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append({"keyword": "IPSFN", "token": token, "local_name": local_name})
+        return specs
+
+    def _resolve_required_input_reference_sources(self, in_path, text, *, interactive, purpose="run", run_folder=None):
+        refs = []
+        missing = []
+        for spec in self._required_input_reference_specs(text):
+            source = self._resolve_input_reference_file(spec["keyword"], spec["token"], in_path, run_folder=run_folder)
+            if source is None and interactive:
+                source = self._prompt_input_reference_file(spec["keyword"], spec["token"], in_path, purpose=purpose)
+            if source is None:
+                missing.append(spec["local_name"])
+                continue
+            self._remember_input_reference_override(spec["keyword"], spec["token"], source)
+            refs.append({**spec, "source_path": Path(source)})
+        if missing:
+            label = "case creation" if purpose == "case" else "runtime preflight"
+            raise FileNotFoundError(
+                f"Missing required IPSFN phase-space file(s) during {label}: " + ", ".join(missing)
+            )
+        return refs
+
+    def _copy_required_input_reference_sources(self, refs, dest_folder, overwrite=True):
+        copied = []
+        dest_folder = Path(dest_folder)
+        for ref in refs or []:
+            source = Path(ref["source_path"])
+            target = dest_folder / Path(ref["local_name"]).name
+            if self._safe_copy_file(source, target, overwrite=overwrite) or target.exists():
+                copied.append(target.name)
+        return copied
+
+    def _report_phase_space_input_status(self, in_path, text):
+        for ref in self._required_input_reference_specs(text):
+            resolved = self._resolve_input_reference_file(ref["keyword"], ref["token"], in_path, run_folder=None)
+            if resolved:
+                self.console.log(
+                    f"[SIM] IPSFN detected: {ref['local_name']} (ready: {resolved})\n",
+                    "info",
+                )
+            else:
+                self.console.log(
+                    f"[SIM] IPSFN detected: {ref['local_name']} (missing). Studio will ask for the source file before creating a case or running.\n",
+                    "warn",
+                )
+
     def _create_split_run_folders(self, options):
         in_path = Path(self._in_path)
         if not in_path.exists():
@@ -22384,6 +23814,7 @@ class SimulationTab(QWidget):
         search_folders = self._split_run_search_folders(in_path, geo_path)
         material_names = self._mfname_material_names(base_text)
         spectr_names = self._spectr_file_names(base_text) if options.get("copy_other") else []
+        ipsfn_names = self._ipsfn_file_names(base_text) if options.get("copy_other") else []
         mat_sources = list(search_folders)
 
         created_folders = []
@@ -22443,6 +23874,19 @@ class SimulationTab(QWidget):
                         warnings.append(f"{folder.name}: SPECTR/local referenced file not copied: {local_name}")
                 if not spectr_map and "SPECTR" in file_maps:
                     file_maps.pop("SPECTR", None)
+                ipsfn_map = file_maps.setdefault("IPSFN", {})
+                for name in ipsfn_names:
+                    src = self._resolve_input_reference_file("IPSFN", name, in_path, run_folder=folder)
+                    local_name = Path(name).name
+                    if src:
+                        self._safe_copy_file(src, folder / local_name, overwrite=True)
+                        ipsfn_map[name] = local_name
+                        ipsfn_map[Path(name).name] = local_name
+                        copied_files.append(local_name)
+                    else:
+                        warnings.append(f"{folder.name}: IPSFN file not copied: {local_name}")
+                if not ipsfn_map and "IPSFN" in file_maps:
+                    file_maps.pop("IPSFN", None)
 
             penmain_raw = self._global_executables.get("penmain", "") or self._sim_exe or ""
             penmain_resolved = self._resolve_case_executable_path(penmain_raw)
@@ -22706,7 +24150,7 @@ class SimulationTab(QWidget):
             )
 
         local_in_path = run_folder / in_path.name
-        copied_counts = {"in": 0, "geo": 0, "rep": 0, "mat": 0}
+        copied_counts = {"in": 0, "geo": 0, "rep": 0, "ref": 0, "mat": 0}
         if in_path.resolve() != local_in_path.resolve():
             local_in_path.write_bytes(_encode_text_bytes(source_text))
             copied_counts["in"] += 1
@@ -22747,6 +24191,14 @@ class SimulationTab(QWidget):
         else:
             missing_execs.append("penmain")
 
+        required_refs = self._resolve_required_input_reference_sources(
+            in_path,
+            source_text,
+            interactive=not batch,
+            purpose="run",
+            run_folder=run_folder,
+        )
+
         if batch:
             # Batch mode: auto-resolve without any blocking dialog.
             batch_copied_execs = []
@@ -22782,6 +24234,7 @@ class SimulationTab(QWidget):
                 copied_counts["geo"] += 1
             rep_count, _rep_names = self._copy_linked_rep_to_folder(geo_path, run_folder, Path(geo_name).name, overwrite=True)
             copied_counts["rep"] += rep_count
+            copied_counts["ref"] += len(self._copy_required_input_reference_sources(required_refs, run_folder, overwrite=True))
             still_missing = []
             for name in material_names:
                 target_name = Path(name).name
@@ -22824,6 +24277,7 @@ class SimulationTab(QWidget):
             copied_counts["geo"] += 1
         rep_count, _rep_names = self._copy_linked_rep_to_folder(geo_path, run_folder, Path(geo_name).name, overwrite=True)
         copied_counts["rep"] += rep_count
+        copied_counts["ref"] += len(self._copy_required_input_reference_sources(required_refs, run_folder, overwrite=True))
 
         still_missing = []
         for name in material_names:
@@ -23469,6 +24923,8 @@ class SimulationTab(QWidget):
             runtime_parts.append(f"{runtime_copy_counts['geo']} .geo refreshed")
         if runtime_copy_counts.get("rep", 0):
             runtime_parts.append(f"{runtime_copy_counts['rep']} .rep refreshed")
+        if runtime_copy_counts.get("ref", 0):
+            runtime_parts.append(f"{runtime_copy_counts['ref']} IPSFN file(s) refreshed")
         if runtime_copy_counts.get("mat", 0):
             runtime_parts.append(f"{runtime_copy_counts['mat']} .mat copied/updated")
         if copied_execs:
@@ -23526,6 +24982,16 @@ class SimulationTab(QWidget):
             self.console.log("[SIM] No .in file - save first.\n", "warn"); return
         in_path = Path(self._in_path)
         run_folder = Path(self._run_folder) if self._run_folder else in_path.parent
+        if not self._project_root:
+            try:
+                if run_folder.resolve() == in_path.parent.resolve():
+                    run_folder = self._solo_run_folder_for_input(in_path)
+                    self._run_folder = run_folder
+                    self._set_workspace_root(run_folder, log_label="Case root (solo_case)")
+                    self.console.log(f"[SIM] Solo run workspace prepared: {run_folder}\n", "info")
+            except Exception:
+                run_folder = self._solo_run_folder_for_input(in_path)
+                self._run_folder = run_folder
         self._prepare_runs_list_for_new_launch()
         self._start_sim_process(in_path, run_folder, batch=False)
 
@@ -23618,75 +25084,13 @@ class SimulationTab(QWidget):
     # ── External simulation linking ──────────────────────────────────────
 
     def _scan_external_penmain_pids(self):
-        """Return list of dicts {pid, exe, cwd, cmdline} for running penmain processes not launched by us."""
         our_pids = {
             int(run["proc"].processId())
             for run in self._sim_runs
             if not isinstance(run["proc"], _ExternalProcAdapter)
             and run["proc"].state() != QProcess.ProcessState.NotRunning
         }
-        results = []
-        try:
-            out = subprocess.run(
-                ["wmic", "process", "where", "name='penmain.exe'",
-                 "get", "ProcessId,ExecutablePath,CommandLine,WorkingSetSize", "/FORMAT:CSV"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in out.stdout.splitlines():
-                parts = line.strip().split(",")
-                if len(parts) < 3:
-                    continue
-                # CSV columns: Node, CommandLine, ExecutablePath, ProcessId, WorkingSetSize
-                try:
-                    pid = int(parts[-2].strip())
-                except (ValueError, IndexError):
-                    continue
-                if pid in our_pids or pid == 0:
-                    continue
-                exe = parts[-3].strip() if len(parts) >= 3 else ""
-                cmdline = parts[1].strip() if len(parts) >= 2 else ""
-                results.append({"pid": pid, "exe": exe, "cmdline": cmdline, "cwd": ""})
-        except Exception:
-            pass
-        if not results:
-            # Fallback: tasklist without working directory
-            try:
-                out = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq penmain.exe", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                for line in out.stdout.splitlines():
-                    line = line.strip().strip('"')
-                    parts = [p.strip('"') for p in line.split('","')]
-                    if not parts or parts[0].lower() != "penmain.exe":
-                        continue
-                    try:
-                        pid = int(parts[1])
-                    except (ValueError, IndexError):
-                        continue
-                    if pid in our_pids or pid == 0:
-                        continue
-                    results.append({"pid": pid, "exe": "penmain.exe", "cmdline": "", "cwd": ""})
-            except Exception:
-                pass
-        # Try to get working directory via wmic for each PID
-        for entry in results:
-            try:
-                r = subprocess.run(
-                    ["wmic", "process", "where", f"processid={entry['pid']}",
-                     "get", "ExecutablePath", "/FORMAT:CSV"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                for line in r.stdout.splitlines():
-                    parts = line.strip().split(",")
-                    if len(parts) >= 2:
-                        exe = parts[-1].strip()
-                        if exe and exe.lower() != "executablepath":
-                            entry["cwd"] = str(Path(exe).parent) if exe else ""
-                            break
-            except Exception:
-                pass
-        return results
+        return _scan_external_penmain_pids_snapshot(our_pids)
 
     def _link_external_simulations_dialog(self):
         """Scan for external penmain.exe processes and show a dialog to add them for tracking."""
@@ -23814,12 +25218,43 @@ class SimulationTab(QWidget):
                     self._update_sim_run_button()
                     self._save_sim_state()
 
-    def _auto_link_external_sims_on_startup(self):
-        found = self._scan_external_penmain_pids()
+    def _on_startup_external_scan_ready(self, found):
+        found = list(found or [])
+        self._startup_external_scan_worker = None
+        self._startup_external_scan_thread = None
         for info in found:
             self._link_external_sim(info["pid"], info.get("cwd", ""))
         if found:
             self.console.log(f"[SIM] Auto-linked {len(found)} external penmain process(es) found at startup.\n", "ok")
+
+    def _on_startup_external_scan_error(self, err):
+        self._startup_external_scan_worker = None
+        self._startup_external_scan_thread = None
+        if str(err or "").strip():
+            self.console.log(f"[SIM] Startup external-link scan warning: {err}\n", "warn")
+
+    def _auto_link_external_sims_on_startup(self):
+        if self._startup_external_scan_thread is not None:
+            return
+        our_pids = {
+            int(run["proc"].processId())
+            for run in self._sim_runs
+            if not isinstance(run["proc"], _ExternalProcAdapter)
+            and run["proc"].state() != QProcess.ProcessState.NotRunning
+        }
+        worker = ExternalSimScanWorker(our_pids)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_startup_external_scan_ready)
+        worker.error.connect(self._on_startup_external_scan_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._startup_external_scan_worker = worker
+        self._startup_external_scan_thread = thread
+        thread.start()
 
     # ── Run/Queue State Persistence ──────────────────────────────────────
 
@@ -23857,10 +25292,93 @@ class SimulationTab(QWidget):
         except Exception:
             pass  # state save is best-effort
 
+    def _on_startup_restore_state_ready(self, payload):
+        self._startup_restore_worker = None
+        self._startup_restore_thread = None
+        payload = dict(payload or {})
+        state_path = Path(payload.get("state_path", self._sim_state_path()))
+        if payload.get("invalid"):
+            return
+        if payload.get("empty"):
+            state_path.unlink(missing_ok=True)
+            return
+        if not payload.get("exists"):
+            return
+        queue = [Path(p) for p in payload.get("queue", []) if p]
+        alive_runs = list(payload.get("alive_runs", []) or [])
+        finished_runs = list(payload.get("finished_runs", []) or [])
+        saved_at = payload.get("saved_at", "unknown")
+        parts = list(payload.get("parts", []) or [])
+        if not queue and not alive_runs and not finished_runs:
+            state_path.unlink(missing_ok=True)
+            return
+        msg = (
+            f"Penelope Studio found a saved simulation state from {saved_at}:\n\n"
+            + "\n".join(f"  • {p}" for p in parts)
+            + "\n\nRestore? (Queue will be reloaded; running PIDs will be linked for tracking.)"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Restore simulation state")
+        box.setText(msg)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Discard)
+        box.button(QMessageBox.StandardButton.Discard).setText("Discard")
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        choice = box.exec()
+        if choice == QMessageBox.StandardButton.Discard:
+            state_path.unlink(missing_ok=True)
+            return
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        if queue:
+            self._batch_queue = list(queue)
+            self._batch_total = int(payload.get("batch_total", len(queue)) or len(queue))
+            self._update_batch_progress()
+            self.console.log(f"[SIM] Restored queue: {len(queue)} file(s).\n", "ok")
+        linked = 0
+        for r in alive_runs:
+            pid = r.get("pid", 0)
+            if pid <= 0:
+                continue
+            self._link_external_sim(pid, r.get("run_folder", ""))
+            linked += 1
+        if linked:
+            self.console.log(f"[SIM] Linked {linked} previously running process(es) by PID.\n", "ok")
+        for r in finished_runs:
+            path_str = r.get("path", "")
+            folder_str = r.get("run_folder", Path(path_str).parent if path_str else "")
+            nsim = r.get("nsim", "?")
+            geo = r.get("geo", "?")
+            label = f"recovered-finished | {Path(folder_str).name} | {Path(path_str).name} | N {nsim} | GEO {geo}"
+            item = QListWidgetItem(label)
+            item.setForeground(QColor(P["fg2"]))
+            item.setToolTip(str(folder_str))
+            self.sim_runs_list.addItem(item)
+        state_path.unlink(missing_ok=True)
+
+    def _on_startup_restore_state_error(self, err):
+        self._startup_restore_worker = None
+        self._startup_restore_thread = None
+        if str(err or "").strip():
+            self.console.log(f"[SIM] Startup restore-state warning: {err}\n", "warn")
+
     def _offer_restore_sim_state(self):
         state_path = self._sim_state_path()
-        if not state_path.exists():
+        if not state_path.exists() or self._startup_restore_thread is not None:
             return
+        worker = SimRestoreStateWorker(state_path)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_startup_restore_state_ready)
+        worker.error.connect(self._on_startup_restore_state_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._startup_restore_worker = worker
+        self._startup_restore_thread = thread
+        thread.start()
+        return
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except Exception:
@@ -29522,6 +31040,9 @@ class PenelopeStudio(QMainWindow):
         self._saved_geo_layout_mode = "render"
         self._migrated_legacy_settings = False
         self._reopen_last_project_on_startup = True
+        self._pending_startup_files = {"geo_file": geo_file, "in_file": in_file}
+        self._post_launch_startup_done = False
+        self._project_tree_refresh_pending = False
         self._startup_report("Loading saved settings", "Restoring executable paths, spectrum database, and recent project root.")
         self._load_app_settings()
 
@@ -29543,10 +31064,6 @@ class PenelopeStudio(QMainWindow):
         )
         if geo_file: self.geo_tab._open_geo(geo_file)
         if in_file:  self.sim_tab._open_in(in_file)
-        self._startup_report("Restoring project context", "Scanning the opened files and current folder for a project manifest.")
-        self._auto_load_project_context(geo_file=geo_file, in_file=in_file)
-        if self._migrated_legacy_settings:
-            QTimer.singleShot(0, self._save_app_settings)
 
     def _startup_report(self, title, detail=""):
         detail_text = str(detail or "")
@@ -29616,8 +31133,14 @@ class PenelopeStudio(QMainWindow):
 
         self._gview2d = _preferred_saved_gview_path(str(_value("executables/gview2d", self._gview2d) or self._gview2d), "gview2d.exe")
         self._gview3d = _preferred_saved_gview_path(str(_value("executables/gview3d", self._gview3d) or self._gview3d), "gview3d.exe")
-        self._penmain = str(_value("executables/penmain", self._penmain) or self._penmain)
-        self._material_exe = str(_value("executables/material", self._material_exe) or self._material_exe)
+        self._penmain = _preferred_saved_runtime_path(
+            _value("executables/penmain", self._penmain),
+            _default_penmain_exe_path(),
+        )
+        self._material_exe = _preferred_saved_runtime_path(
+            _value("executables/material", self._material_exe),
+            _default_material_exe_path(),
+        )
         self._spectrum_db = str(_value("paths/spectrum_db", self._spectrum_db) or self._spectrum_db)
         self._last_project_root = str(_value("app/project_root", self._last_project_root or "", allow_blank=False) or "") or None
         self._reopen_last_project_on_startup = _coerce_bool_setting(
@@ -29986,6 +31509,7 @@ class PenelopeStudio(QMainWindow):
     def _refresh_project_tree(self):
         if not hasattr(self, "project_tree"):
             return
+        self._project_tree_refresh_pending = False
         self.project_tree.clear()
         if not self._project_root:
             if hasattr(self, "lbl_project_root"):
@@ -30002,6 +31526,12 @@ class PenelopeStudio(QMainWindow):
         root_item.setExpanded(True)
         self._update_project_sidebar_empty_state()
 
+    def _schedule_project_tree_refresh(self, delay_ms=0):
+        if self._project_tree_refresh_pending:
+            return
+        self._project_tree_refresh_pending = True
+        QTimer.singleShot(max(0, int(delay_ms or 0)), self._refresh_project_tree)
+
     def _project_folder_for_suffix(self, suffix):
         suffix = str(suffix or "").lower()
         folders = dict((self._project_meta or {}).get("folders") or {})
@@ -30014,6 +31544,27 @@ class PenelopeStudio(QMainWindow):
         else:
             rel = folders.get("instructions", PROJECT_DIR_INSTRUCTIONS)
         return Path(self._project_root) / rel
+
+    def _safe_copy_file(self, src, dst, overwrite=False):
+        src = Path(src)
+        dst = Path(dst)
+        try:
+            if dst.exists():
+                try:
+                    if src.resolve() == dst.resolve():
+                        return False
+                except OSError:
+                    pass
+                if not overwrite:
+                    return False
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            return True
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 32 and dst.exists():
+                self._project_log(f"[PROJECT] Skipped locked file: {dst.name}\n", "warn")
+                return False
+            raise
 
     def _import_files_into_project(self):
         if not self._project_root:
@@ -30890,7 +32441,7 @@ class PenelopeStudio(QMainWindow):
         self.sim_tab.set_spectrum_database_path(self._spectrum_db)
         self.sim_tab.apply_project_context(root, self._project_meta)
         self.analysis_tab.apply_project_context(root, self._project_meta)
-        self._refresh_project_tree()
+        self._schedule_project_tree_refresh(120)
         self.setWindowTitle(f"PENELOPE Simulation Studio {APP_VERSION} - {project_name}")
         self.statusBar().showMessage(f"Project loaded: {project_name}")
 
@@ -30925,10 +32476,22 @@ class PenelopeStudio(QMainWindow):
         self._launch_screen = self._preferred_launch_screen()
         if self._launch_screen is not None:
             self.setGeometry(self._launch_screen.availableGeometry())
-        self.show()
-        QApplication.processEvents()
         self._apply_launch_screen_maximized()
-        QApplication.processEvents()
+
+    def run_post_launch_startup(self):
+        if self._post_launch_startup_done:
+            return
+        self._post_launch_startup_done = True
+        pending = dict(getattr(self, "_pending_startup_files", {}) or {})
+        geo_file = pending.get("geo_file")
+        in_file = pending.get("in_file")
+        self._startup_report("Restoring project context", "Scanning the opened files and current folder for a project manifest.")
+        self._auto_load_project_context(geo_file=geo_file, in_file=in_file)
+        if self._migrated_legacy_settings:
+            QTimer.singleShot(0, self._save_app_settings)
+        sim_tab = getattr(self, "sim_tab", None)
+        if sim_tab is not None:
+            sim_tab.schedule_startup_followups()
 
     def _open_project_dir(self, folder, allow_create_manifest=True, quiet=False):
         root = Path(folder)
@@ -31358,6 +32921,7 @@ if __name__ == "__main__":
     app.processEvents()
     splash.close()
     app.processEvents()
+    QTimer.singleShot(120, win.run_post_launch_startup)
     try:
         code = app.exec()
     finally:

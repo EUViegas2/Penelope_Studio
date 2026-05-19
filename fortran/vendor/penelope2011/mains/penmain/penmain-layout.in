@@ -1,0 +1,80 @@
+The order of lines must be kept unaltered.
+Lines marked with '*' can be repeated as many times as needed.
+Groups marked with '&' can be repeated, but the order of lines within
+each group must be preserved.
+
+....+....1....+....2....+....3....+....4....+....5....+....6....+....7..
+TITLE  Title of the job, up to 65 characters.
+       . (the dot prevents editors from removing trailing blanks)
+       >>>>>>>> Source definition.
+SKPAR  KPARP    [Primary particles: 1=electron, 2=photon, 3=positron]
+       KPARP=0 activates a user-defined SOURCE model.
+SENERG SE0              [Initial energy (monoenergetic sources only)]
+SPECTR Ei,Pi                 [E bin: lower-end and total probability] *
+SGPOL  SP1,SP2,SP3          [Stokes parameters for polarised photons]
+SPOSIT SX0,SY0,SZ0                        [Coordinates of the source]
+SBOX   SSX,SSY,SSZ                            [Source box dimensions]
+SBODY  KB                [Active source body; one line for each body] *
+SCONE  THETA,PHI,ALPHA                  [Conical beam; angles in deg]
+SPYRAM THETAL,THETAU,PHIL,PHIU      [Rectangular beam; angles in deg]
+       .
+       >>>>>>>> Input phase-space file (psf).
+IPSFN  psf-filename.ext         [Input psf name, up to 20 characters] *
+IPSPLI NSPLIT                                      [Splitting number]
+WGTWIN WGMIN,WGMAX         [Weight window, RR & spl of psf particles]
+EPMAX  EPMAX                 [Maximum energy of particles in the psf]
+       .
+       >>>>>>>> Material data and simulation parameters.
+                Up to MAXMAT materials; 2 lines for each material.
+MFNAME mat-filename.ext               [Material file, up to 20 chars] &*
+MSIMPA EABS(1:3),C1,C2,WCC,WCR              [EABS(1:3),C1,C2,WCC,WCR] &*
+       .
+       >>>>>>>> Geometry and local simulation parameters.
+GEOMFN geo-filename.ext               [Geometry file, up to 20 chars]
+DSMAX  KB,DSMAX(KB)              [KB, maximum step length in body KB] *
+EABSB  KB,EABSB(1:3,KB)   [KB, local absorption energies, EABSB(1:3)] *
+       .
+       >>>>>>>> Interaction forcing.
+IFORCE KB,KPAR,ICOL,FORCER,WLOW,WHIG  [KB,KPAR,ICOL,FORCER,WLOW,WHIG] *
+       .
+       >>>>>>>> Emerging particles. Energy and angular distributions.
+NBE    EL,EU,NBE                      [Energy window and no. of bins]
+NBANGL NBTH,NBPH          [Nos. of bins for the angles THETA and PHI]
+       .
+       >>>>>>>> Impact detectors (up to 25 different detectors).
+       IPSF=0; no psf is created.
+       IPSF=1; the psf is created (for only one detector).
+       IDCUT=0; tracking is discontinued at the detector entrance.
+       IDCUT=1; the detector does not affect the tracking.
+       IDCUT=2; the detector does not affect tracking, the energy
+                distribution of particle fluence (averaged over the
+                volume of the detector) is calculated.
+IMPDET EL,EU,NBE,IPSF,IDCUT      [E-window, no. of bins, IPSF, IDCUT] &
+IDSPC  spc-impdet-##.dat               [Spectrum file name, 20 chars] &
+IDPSF  psf-impdet-##.dat            [Phase-space file name, 20 chars] &
+IDFLNC fln-impdet-##.dat       [Fluence spectrum file name, 20 chars] &
+IDBODY KB                       [Active body; one line for each body] &*
+IDKPAR KPAR               [Kind of detected particles, one line each] &*
+       .
+       >>>>>>>> Energy-deposition detectors (up to 25).
+ENDETC EL,EU,NBE                   [Energy window and number of bins] &
+EDSPC  spc-enddet-##.dat        [Output spectrum file name, 20 chars] &
+EDBODY KB                       [Active body; one line for each body] &*
+       .
+       >>>>>>>> Dose distribution.
+GRIDX  XL,XU                 [X coordinates of the dose box vertices]
+GRIDY  YL,YU                 [Y coordinates of the dose box vertices]
+GRIDZ  ZL,ZU                 [Z coordinates of the dose box vertices]
+GRIDBN NDBX,NDBY,NDBZ                               [Numbers of bins]
+       .
+       >>>>>>>> Job properties.
+RESUME dump.dmp                [Resume from this dump file, 20 chars]
+DUMPTO dump.dmp                   [Generate this dump file, 20 chars]
+DUMPP  DUMPP                                 [Dumping period, in sec]
+       .
+RSEED  ISEED1,ISEED2           [Seeds of the random-number generator]
+NSIMSH DSHN                     [Desired number of simulated showers]
+TIME   TIMEA                       [Allotted simulation time, in sec]
+       .
+END                                  [Ends the reading of input data]
+....+....1....+....2....+....3....+....4....+....5....+....6....+....7..

@@ -1,0 +1,48 @@
+# Local IDE / environment
+.vs/
+.idea/
+env/
+.venv/
+venv/
+
+# Python cache / tooling
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local runtime / scratch / temporary folders
+logs/
+scratch/
+backups/
+checkpoints/
+reports/
+tmp*/
+_codex_sync_test_*/
+_project_test_root/
+_sim_reset_probe/
+
+# Generated geometry/editor recovery
+*_scone_calculations.json
+**/_studio_autosave/
+**/input change backups/
+
+# Generated simulation outputs
+*.dmp
+*.dump
+*.bak
+combined_analysis.json
+combined_analysis_summary.txt
+
+# Project and case-generated caches / logs
+**/analysis_body_volumes.json
+**/case_creation_log.json
+**/batch_case_creation_log.json
+**/gview2d_studio_log.txt
+**/gview3d_studio_log.txt
+
+# Historical local snapshots not needed in the repo
+old versions/
