@@ -1077,8 +1077,8 @@ def group_css():
         f"QLabel {{ color:{P['fg']}; }}"
     )
 
-def apply_global_tooltip_style():
-    tooltip_css = (
+def tooltip_css():
+    return (
         "QToolTip {"
         " background-color:#FFF8C5;"
         " color:#000000;"
@@ -1087,14 +1087,66 @@ def apply_global_tooltip_style():
         " opacity:255;"
         "}"
     )
+
+def apply_global_tooltip_style():
+    css = tooltip_css()
     app = QApplication.instance()
-    if app is not None and tooltip_css not in app.styleSheet():
+    if app is not None and css not in app.styleSheet():
         current = app.styleSheet() or ""
-        app.setStyleSheet((current + "\n" + tooltip_css).strip())
+        app.setStyleSheet((current + "\n" + css).strip())
     pal = QToolTip.palette()
     pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFF8C5"))
     pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#000000"))
     QToolTip.setPalette(pal)
+
+_GLOBAL_TOOLTIP_FILTER = None
+
+class UnifiedTooltipEventFilter(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.ToolTip:
+            return False
+        apply_global_tooltip_style()
+        text = ""
+        anchor = obj if isinstance(obj, QWidget) else None
+        local_pos = event.pos() if hasattr(event, "pos") else None
+        global_pos = event.globalPos() if hasattr(event, "globalPos") else QCursor.pos()
+        view = None
+        probe = obj
+        while probe is not None:
+            if isinstance(probe, QAbstractItemView):
+                view = probe
+                break
+            probe = probe.parent() if hasattr(probe, "parent") else None
+        if view is not None and local_pos is not None:
+            try:
+                view_pos = local_pos if obj is view.viewport() else view.viewport().mapFromGlobal(global_pos)
+                index = view.indexAt(view_pos)
+            except Exception:
+                index = QModelIndex()
+            if index.isValid():
+                data = index.data(Qt.ItemDataRole.ToolTipRole)
+                if data not in (None, ""):
+                    text = str(data)
+                    anchor = view.viewport()
+        if not text and isinstance(obj, QWidget):
+            tip = obj.toolTip()
+            if tip:
+                text = str(tip)
+                anchor = obj
+        if text:
+            QToolTip.showText(global_pos, text, anchor)
+            return True
+        QToolTip.hideText()
+        return False
+
+def install_global_tooltip_filter():
+    global _GLOBAL_TOOLTIP_FILTER
+    app = QApplication.instance()
+    if app is None:
+        return
+    if _GLOBAL_TOOLTIP_FILTER is None:
+        _GLOBAL_TOOLTIP_FILTER = UnifiedTooltipEventFilter(app)
+        app.installEventFilter(_GLOBAL_TOOLTIP_FILTER)
 
 
 def make_help_label(text, hint="", style=None, return_label=False):
@@ -31015,12 +31067,12 @@ class PenelopeStudio(QMainWindow):
         self._startup_progress = startup_progress
         self._startup_report("Preparing main window", "Applying the base window theme and shell.")
         apply_global_tooltip_style()
+        install_global_tooltip_filter()
         self.setWindowTitle(f"PENELOPE Simulation Studio {APP_VERSION}")
         self.resize(1400, 900)
         self.setStyleSheet(
             f"QMainWindow {{ background:{P['bg']}; }}"
-            f"QToolTip {{ background-color:#FFF8C5; color:#000000;"
-            f" border:1px solid #D29922; padding:5px; opacity:255; }}"
+            f"{tooltip_css()}"
         )
 
         # executable paths
