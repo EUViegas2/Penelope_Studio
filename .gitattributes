@@ -1,0 +1,26 @@
+* text=auto
+
+*.py text
+*.pyw text
+*.ps1 text
+*.md text
+*.txt text
+*.json text
+*.csv text
+*.geo text
+*.in text
+*.dat text
+*.mat text
+*.rep text
+
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.xlsx binary
+*.xlsm binary
