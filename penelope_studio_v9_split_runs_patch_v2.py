@@ -17623,6 +17623,23 @@ class SimulationTab(QWidget):
         create_workspace_btn.setStyleSheet(btn_css(width=136))
         create_workspace_btn.clicked.connect(self._create_case_workspace)
         workspace_row.addWidget(create_workspace_btn)
+        duplicate_case_btn = QToolButton()
+        duplicate_case_btn.setText("Duplicate")
+        duplicate_case_btn.setToolTip("Duplicate a previously created case or batch using the same case editor with optional changes.")
+        duplicate_case_btn.setStyleSheet(
+            f"QToolButton {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; padding:6px 12px; }}"
+            f"QToolButton:hover {{ background:{P['bg3']}; border-color:{P['accent']}; }}"
+        )
+        duplicate_case_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        duplicate_case_menu = QMenu(duplicate_case_btn)
+        duplicate_case_menu.setStyleSheet(
+            f"QMenu {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; }}"
+            f"QMenu::item:selected {{ background:{P['sel']}; }}"
+        )
+        duplicate_case_menu.addAction("Duplicate Case...", self._duplicate_case_workspace)
+        duplicate_case_menu.addAction("Duplicate Batch...", self._duplicate_batch_workspace)
+        duplicate_case_btn.setMenu(duplicate_case_menu)
+        workspace_row.addWidget(duplicate_case_btn)
         split_runs_btn = QPushButton("Split Runs...")
         split_runs_btn.setToolTip("Create independent CPU split-run folders with unique RSEED values and optional batch queueing. This is not GPU offload.")
         split_runs_btn.setStyleSheet(btn_css(width=118))
@@ -20428,22 +20445,289 @@ class SimulationTab(QWidget):
             return ()
         return (min(energies), max(energies))
 
-    def _batch_case_variants_dialog(self, in_path, geo_path, case_count=3):
-        defaults = self._current_source_defaults()
-        particle = str(defaults.get("particle", "2") or "2").strip() or "2"
+    def _source_defaults_from_text(
+        self,
+        text,
+        spectrum_path="",
+        spectrum_db_path="",
+        spectrum_db_label="",
+        spectrum_prob_col=None,
+    ):
+        defaults = {
+            "particle": "2",
+            "energy_type": "SENERG",
+            "energy_value": "130",
+            "energy_unit": "keV",
+            "spectrum_source_kind": "file",
+            "spectrum_path": spectrum_path or "",
+            "spectrum_db_path": spectrum_db_path or "",
+            "spectrum_db_label": spectrum_db_label or "",
+            "spectrum_prob_col": spectrum_prob_col or 6,
+            "spectrum_lines": [],
+            "sposit": ["0.0", "0.0", "0.0"],
+            "scone": ["0", "0", "0"],
+        }
+
+        match = re.search(r"^\s*SKPAR\s+(\S+)", text or "", re.IGNORECASE | re.MULTILINE)
+        if match and match.group(1) in {"1", "2", "3"}:
+            defaults["particle"] = match.group(1)
+
+        spectr_lines = [
+            line.strip()
+            for line in (text or "").splitlines()
+            if re.match(r"^\s*SPECTR\b", line, re.IGNORECASE)
+        ]
+        if spectr_lines:
+            defaults["energy_type"] = "SPECTR"
+            defaults["spectrum_lines"] = spectr_lines
+            defaults["spectrum_prob_col"] = self._spectr_prob_col_for_particle(defaults["particle"])
+        else:
+            match = re.search(r"^\s*SENERG\s+([^\s\[]+)", text or "", re.IGNORECASE | re.MULTILINE)
+            if match:
+                defaults["energy_type"] = "SENERG"
+                raw = match.group(1).strip()
+                lowered = raw.lower()
+                try:
+                    value = float(raw)
+                    if value >= 1e6:
+                        defaults["energy_value"] = f"{value / 1e6:g}"
+                        defaults["energy_unit"] = "MeV"
+                    else:
+                        defaults["energy_value"] = f"{value / 1e3:g}"
+                        defaults["energy_unit"] = "keV"
+                except ValueError:
+                    if lowered.endswith("e6"):
+                        defaults["energy_value"] = raw[:-2]
+                        defaults["energy_unit"] = "MeV"
+                    elif lowered.endswith("e3"):
+                        defaults["energy_value"] = raw[:-2]
+                        defaults["energy_unit"] = "keV"
+                    else:
+                        defaults["energy_value"] = raw
+                        defaults["energy_unit"] = "keV"
+
+        match = re.search(r"^\s*SPOSIT\s+([^\[]+)", text or "", re.IGNORECASE | re.MULTILINE)
+        if match:
+            vals = match.group(1).split()[:3]
+            if len(vals) == 3:
+                defaults["sposit"] = vals
+
+        match = re.search(r"^\s*SCONE\s+([^\[]+)", text or "", re.IGNORECASE | re.MULTILINE)
+        if match:
+            vals = match.group(1).split()[:3]
+            if len(vals) == 3:
+                defaults["scone"] = vals
+        return defaults
+
+    def _read_project_log_entries(self, path):
+        if not path or not Path(path).exists():
+            return []
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        entries = payload.get("entries", []) if isinstance(payload, dict) else []
+        return entries if isinstance(entries, list) else []
+
+    def _resolve_project_logged_path(self, raw_path):
+        if not raw_path:
+            return None
+        target = Path(str(raw_path))
+        if target.is_absolute():
+            return target
+        if self._project_root:
+            return Path(self._project_root) / target
+        return target
+
+    def _case_spec_from_in_text(self, case_name, in_filename, text, geo_override_path="", mat_folder=""):
+        defaults = self._source_defaults_from_text(text)
+        spec = {
+            "case_name": self._workspace_safe_token(case_name, "case"),
+            "in_filename": self._case_variant_in_filename(in_filename, case_name or "simulation"),
+            "geo_override_path": str(geo_override_path or ""),
+            "mat_folder": str(mat_folder or ""),
+        }
+        if defaults["energy_type"] == "SENERG":
+            spec["senerg_kev"] = defaults["energy_value"] if defaults["energy_unit"] == "keV" else str(float(defaults["energy_value"]) * 1000.0)
+        elif defaults["spectrum_lines"]:
+            spec["spectr_lines"] = list(defaults["spectrum_lines"])
+            spec["spectr_range"] = self._spectr_range_from_lines(defaults["spectrum_lines"])
+        if defaults["sposit"]:
+            spec["sposit"] = list(defaults["sposit"])
+        if defaults["scone"]:
+            spec["scone"] = list(defaults["scone"])
+        return spec
+
+    def _case_variant_spec_from_log_record(self, record):
+        if not isinstance(record, dict):
+            return None
+        variant = dict(record.get("variant") or {})
+        case_name = str(variant.get("case_name") or record.get("case_name") or "case").strip()
+        in_filename = str(variant.get("in_filename") or record.get("in_file") or f"{case_name}.in").strip()
+        case_dir = self._resolve_project_logged_path(record.get("case_folder"))
+        geo_source_path = self._resolve_project_logged_path(record.get("geo_source_path"))
+        geo_override_path = geo_source_path if geo_source_path and geo_source_path.exists() else None
+        mat_folder = case_dir if case_dir and case_dir.exists() and any(case_dir.glob("*.mat")) else None
+        if variant:
+            spec = {
+                "case_name": self._workspace_safe_token(case_name, "case"),
+                "in_filename": self._case_variant_in_filename(in_filename, case_name or "simulation"),
+                "geo_override_path": str(geo_override_path or ""),
+                "mat_folder": str(mat_folder or ""),
+            }
+            if str(variant.get("senerg_kev", "")).strip():
+                spec["senerg_kev"] = str(variant.get("senerg_kev")).strip()
+            if str(variant.get("spectr_file", "")).strip():
+                spec["spectr_file"] = str(variant.get("spectr_file")).strip()
+            spectr_range = variant.get("spectr_range_kev")
+            if isinstance(spectr_range, (list, tuple)) and len(spectr_range) == 2:
+                spec["spectr_range"] = tuple(spectr_range)
+            sposit = variant.get("sposit_cm")
+            if isinstance(sposit, (list, tuple)) and len(sposit) == 3:
+                spec["sposit"] = [str(v) for v in sposit]
+            scone = variant.get("scone_deg")
+            if isinstance(scone, (list, tuple)) and len(scone) == 3:
+                spec["scone"] = [str(v) for v in scone]
+            return spec
+        if not case_dir or not case_dir.exists():
+            return None
+        in_path = case_dir / in_filename
+        if not in_path.exists():
+            in_files = sorted(case_dir.glob("*.in"))
+            if not in_files:
+                return None
+            in_path = in_files[0]
+        try:
+            text = _decode_text_bytes(in_path.read_bytes())
+        except Exception:
+            return None
+        return self._case_spec_from_in_text(case_name, in_path.name, text, geo_override_path=geo_override_path or "", mat_folder=mat_folder or "")
+
+    def _select_logged_case_record_dialog(self):
+        if not self._project_root:
+            QMessageBox.information(self, "Duplicate Case", "Open a project first so Studio can read the case creation log.")
+            return None
+        entries = [
+            entry for entry in self._read_project_log_entries(self._project_case_creation_log_path())
+            if isinstance(entry, dict)
+        ]
+        if not entries:
+            QMessageBox.information(self, "Duplicate Case", "No project case creation log entries were found.")
+            return None
         dlg = QDialog(self)
         dlg.setModal(True)
-        dlg.setWindowTitle("Create Batch Cases")
-        dlg.resize(1040, 700)
+        dlg.setWindowTitle("Duplicate Case")
+        dlg.setMinimumWidth(760)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel("Choose a previously created case to use as the duplication source.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(hint)
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{P['sel']}; }}"
+        )
+        for entry in reversed(entries):
+            case_name = str(entry.get("case_name") or "?")
+            stamp = str(entry.get("timestamp") or "")
+            case_folder = str(entry.get("case_folder") or "")
+            detail = f"{case_name}  |  {stamp}  |  {case_folder}"
+            item = QListWidgetItem(detail)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(detail)
+            lst.addItem(item)
+        if lst.count():
+            lst.setCurrentRow(0)
+        lay.addWidget(lst)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not lst.currentItem():
+            return None
+        return lst.currentItem().data(Qt.ItemDataRole.UserRole)
+
+    def _select_logged_batch_entry_dialog(self):
+        if not self._project_root:
+            QMessageBox.information(self, "Duplicate Batch", "Open a project first so Studio can read the batch creation log.")
+            return None
+        entries = [
+            entry for entry in self._read_project_log_entries(self._project_batch_case_creation_log_path())
+            if isinstance(entry, dict)
+        ]
+        if not entries:
+            QMessageBox.information(self, "Duplicate Batch", "No project batch creation log entries were found.")
+            return None
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle("Duplicate Batch")
+        dlg.setMinimumWidth(820)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel("Choose a previously created batch to duplicate and edit.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(hint)
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{P['sel']}; }}"
+        )
+        for entry in reversed(entries):
+            batch_root = str(entry.get("batch_root") or "")
+            stamp = str(entry.get("timestamp") or "")
+            count = int(entry.get("case_count", 0) or 0)
+            detail = f"{Path(batch_root).name or batch_root}  |  {count} case(s)  |  {stamp}"
+            item = QListWidgetItem(detail)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(detail)
+            lst.addItem(item)
+        if lst.count():
+            lst.setCurrentRow(0)
+        lay.addWidget(lst)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not lst.currentItem():
+            return None
+        return lst.currentItem().data(Qt.ItemDataRole.UserRole)
+
+    def _batch_case_variants_dialog(
+        self,
+        in_path,
+        geo_path,
+        case_count=3,
+        seed_specs=None,
+        allow_resource_overrides=False,
+        dialog_title="Create Batch Cases",
+        intro_text=None,
+    ):
+        source_text = self._get_text()
+        defaults = self._source_defaults_from_text(source_text)
+        particle = str(defaults.get("particle", "2") or "2").strip() or "2"
+        seed_specs = [dict(spec or {}) for spec in list(seed_specs or [])]
+        if seed_specs:
+            case_count = max(1, len(seed_specs))
+        intro_text = intro_text or (
+            "Create multiple cases from the current .in using source variations. "
+            "Each row can override SENERG or SPECTR, SPOSIT, and SCONE. "
+            "Folder names and TITLE append the active source tokens automatically."
+        )
+
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle(dialog_title)
+        dlg.resize(1120, 740)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
-        intro = QLabel(
-            "Create multiple cases from the current .in using source-only variations. "
-            "Each row can override SENERG or SPECTR, SPOSIT, and SCONE. "
-            "The generated case folder name and TITLE append the active source tokens automatically."
-        )
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         intro.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(intro)
@@ -20482,8 +20766,13 @@ class SimulationTab(QWidget):
         content = QWidget()
         content_lay = QVBoxLayout(content)
         content_lay.setContentsMargins(4, 4, 4, 4)
-        content_lay.setSpacing(6)
+        content_lay.setSpacing(5)
         rows = []
+
+        def renumber_rows():
+            for idx, row in enumerate(rows, start=1):
+                row["box"].setTitle(f"CASE {idx}")
+                row["hdr_case"].setText(f"CASE {idx}")
 
         def apply_check_state(key, checked):
             for row in rows:
@@ -20491,99 +20780,260 @@ class SimulationTab(QWidget):
                 if widget is not None:
                     widget.setChecked(bool(checked))
 
-        def add_row(seed_index=None):
+        def propagate_line_value(source_edit, key):
+            value = source_edit.text()
+            for row in rows:
+                target = row.get(key)
+                if target is not None and target is not source_edit:
+                    target.setText(value)
+
+        def propagate_triplet(edits, key):
+            values = [(edit.text() or "").strip() for edit in edits]
+            for row in rows:
+                targets = row.get(key) or []
+                if targets and targets is not edits:
+                    for idx, value in enumerate(values):
+                        if idx < len(targets):
+                            targets[idx].setText(value)
+
+        def propagate_target_bundle(row):
+            values = {
+                "mode": row["scone_mode"].currentIndex(),
+                "vals": {k: (edit.text() or "").strip() for k, edit in row["scone_target_edits"].items()},
+            }
+            for target_row in rows:
+                if target_row is row:
+                    continue
+                target_row["scone_mode"].setCurrentIndex(values["mode"])
+                for key, value in values["vals"].items():
+                    target_row["scone_target_edits"][key].setText(value)
+
+        def propagate_scone_direct(edits):
+            values = [(edit.text() or "").strip() for edit in edits]
+            for row in rows:
+                targets = row.get("scone_direct_edits") or []
+                if targets and targets is not edits:
+                    for idx, value in enumerate(values):
+                        if idx < len(targets):
+                            targets[idx].setText(value)
+
+        def remove_row(row):
+            if len(rows) <= 1:
+                QMessageBox.information(dlg, dialog_title, "At least one case row must remain.")
+                return
+            rows.remove(row)
+            row["box"].setParent(None)
+            row["box"].deleteLater()
+            renumber_rows()
+
+        def refresh_row_preview(row):
+            chk_senerg = row["senerg"]
+            chk_spectr = row["spectr"]
+            chk_sposit = row["sposit"]
+            chk_scone = row["scone"]
+            e_senerg = row["senerg_edit"]
+            spectr_path = row["spectr_path"]
+            spectr_inline_lbl = row["spectr_inline_lbl"]
+            sposit_edits = row["sposit_edits"]
+            cmb_scone_mode = row["scone_mode"]
+            scone_direct_edits = row["scone_direct_edits"]
+            target_edits = row["scone_target_edits"]
+            direct_mode = cmb_scone_mode.currentIndex() == 0
+            target_mode = chk_scone.isChecked() and not direct_mode
+            row["scone_stack"].setCurrentIndex(0 if direct_mode else 1)
+            row["scone_stack"].setVisible(chk_scone.isChecked())
+            row["lbl_senerg"].setVisible(chk_senerg.isChecked())
+            e_senerg.setVisible(chk_senerg.isChecked())
+            row["btn_senerg_all"].setVisible(chk_senerg.isChecked())
+            row["lbl_spectr_file"].setVisible(chk_spectr.isChecked())
+            spectr_path.setVisible(chk_spectr.isChecked())
+            row["btn_spectr"].setVisible(chk_spectr.isChecked())
+            row["btn_spectr_all"].setVisible(chk_spectr.isChecked())
+            spectr_inline_lbl.setVisible(chk_spectr.isChecked() and bool(row.get("spectr_seed_lines")) and not (spectr_path.text() or "").strip())
+            row["lbl_sposit"].setVisible(chk_sposit.isChecked() and not target_mode)
+            row["lbl_sposit_auto"].setVisible(target_mode)
+            row["btn_sposit_all"].setVisible(chk_sposit.isChecked())
+            for edit in sposit_edits:
+                edit.setVisible(chk_sposit.isChecked() and not target_mode)
+            row["btn_scone_all"].setVisible(chk_scone.isChecked())
+            row["direct_wrapper"].setVisible(chk_scone.isChecked() and direct_mode)
+            row["target_wrapper"].setVisible(chk_scone.isChecked() and not direct_mode)
+            if allow_resource_overrides:
+                row["resource_block"].setVisible(True)
+            spec = {}
+            if chk_senerg.isChecked():
+                spec["senerg_kev"] = (e_senerg.text() or "").strip()
+            if chk_spectr.isChecked():
+                try:
+                    if (spectr_path.text() or "").strip():
+                        lines = self._spectr_lines_from_file(spectr_path.text().strip(), prob_col=self._spectr_prob_col_for_particle(particle))
+                        spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                    elif row.get("spectr_seed_lines"):
+                        spec["spectr_range"] = self._spectr_range_from_lines(row["spectr_seed_lines"])
+                except Exception:
+                    pass
+            if chk_sposit.isChecked():
+                spec["sposit"] = [(edit.text() or "").strip() for edit in sposit_edits]
+            if chk_scone.isChecked():
+                if direct_mode:
+                    spec["scone"] = [(edit.text() or "").strip() for edit in scone_direct_edits]
+                else:
+                    try:
+                        xa = float((target_edits["XA"].text() or "").strip().replace(",", "."))
+                        ya = float((target_edits["YA"].text() or "").strip().replace(",", "."))
+                        za = float((target_edits["ZA"].text() or "").strip().replace(",", "."))
+                        radius = float((target_edits["R"].text() or "").strip().replace(",", "."))
+                        beta = float((target_edits["beta"].text() or "").strip().replace(",", "."))
+                        gamma = float((target_edits["gamma"].text() or "").strip().replace(",", "."))
+                        alpha = float((target_edits["alpha"].text() or "").strip().replace(",", "."))
+                        calc_sposit, calc_scone = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
+                        spec["sposit"] = calc_sposit
+                        spec["scone"] = calc_scone
+                    except ValueError:
+                        pass
+            row["lbl_preview"].setText(f"Folder preview: {self._case_variant_folder_name(row['case_name'].text(), spec)}")
+
+        def choose_spectrum(row):
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "Choose spectrum file",
+                str(self._in_folder()),
+                "Spectrum data (*.dat *.txt);;All files (*.*)",
+            )
+            if path:
+                row["spectr_path"].setText(path)
+                row["spectr_seed_lines"] = []
+
+        def choose_geo(row):
+            start = str(Path(row["geo_override_path"].text()).parent) if (row["geo_override_path"].text() or "").strip() else str(Path(geo_path).parent if geo_path else self._in_folder())
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "Choose geometry file",
+                start,
+                "Geometry files (*.geo);;All files (*.*)",
+            )
+            if path:
+                row["geo_override_path"].setText(path)
+
+        def choose_mat_folder(row):
+            start = row["mat_folder"].text().strip() or str(self._material_list_folder() or self._in_folder())
+            folder = QFileDialog.getExistingDirectory(dlg, "Choose materials folder", start)
+            if folder:
+                row["mat_folder"].setText(folder)
+
+        def add_row(seed_index=None, seed_spec=None):
             row_index = len(rows) + 1 if seed_index is None else int(seed_index)
+            seed_spec = dict(seed_spec or {})
             box = QGroupBox(f"CASE {row_index}")
             box.setStyleSheet(
-                f"QGroupBox {{ color:#3F7FC0; background:{P['bg']};"
-                f" border:1px solid {P['border']}; border-radius:4px; margin-top:8px; padding:6px; }}"
-                f"QGroupBox::title {{ subcontrol-origin: margin; left:10px; padding:0 3px;"
-                f" color:#3F7FC0; font-weight:bold; }}"
+                f"QGroupBox {{ color:#315f92; background:{P['bg']};"
+                f" border:1px solid {P['border']}; border-radius:4px; margin-top:6px; padding:5px; }}"
+                f"QGroupBox::title {{ subcontrol-origin: margin; left:10px; padding:0 3px; color:#315f92; font-weight:bold; }}"
             )
             box_lay = QVBoxLayout(box)
-            box_lay.setContentsMargins(6, 6, 6, 6)
-            box_lay.setSpacing(4)
+            box_lay.setContentsMargins(6, 4, 6, 5)
+            box_lay.setSpacing(3)
 
             top_form = QGridLayout()
-            top_form.setHorizontalSpacing(6)
-            top_form.setVerticalSpacing(4)
+            top_form.setHorizontalSpacing(5)
+            top_form.setVerticalSpacing(3)
             hdr_case = QLabel(f"CASE {row_index}")
-            hdr_case.setStyleSheet(label_css("#3F7FC0", bold=True, size=10))
-            e_case = QLineEdit(f"{Path(in_path).stem}_case{row_index}")
-            e_case.setStyleSheet(entry_css())
-            e_in = QLineEdit(f"{Path(in_path).stem}_case{row_index}.in")
-            e_in.setStyleSheet(entry_css())
+            hdr_case.setStyleSheet(label_css("#315f92", bold=True, size=10))
+            btn_remove = QPushButton("Remove")
+            btn_remove.setStyleSheet(btn_css(P["bg2"], 68))
             chk_senerg = QCheckBox("SENERG")
             chk_spectr = QCheckBox("SPECTR")
             chk_sposit = QCheckBox("SPOSIT")
             chk_scone = QCheckBox("SCONE")
             for chk in (chk_senerg, chk_spectr, chk_sposit, chk_scone):
                 chk.setStyleSheet(checkbox_css())
+            e_case = QLineEdit(seed_spec.get("case_name") or f"{Path(in_path).stem}_case{row_index}")
+            e_case.setStyleSheet(entry_css())
+            e_in = QLineEdit(seed_spec.get("in_filename") or f"{Path(in_path).stem}_case{row_index}.in")
+            e_in.setStyleSheet(entry_css())
             top_form.addWidget(hdr_case, 0, 0)
             top_form.addWidget(chk_senerg, 0, 1)
             top_form.addWidget(chk_spectr, 0, 2)
             top_form.addWidget(chk_sposit, 0, 3)
             top_form.addWidget(chk_scone, 0, 4)
+            top_form.addWidget(btn_remove, 0, 5)
             top_form.addWidget(QLabel("Case Name:"), 1, 0)
             top_form.addWidget(e_case, 1, 1, 1, 2)
             top_form.addWidget(QLabel(".in filename:"), 1, 3)
-            top_form.addWidget(e_in, 1, 4)
+            top_form.addWidget(e_in, 1, 4, 1, 2)
             box_lay.addLayout(top_form)
 
             details = QWidget()
             details_lay = QGridLayout(details)
             details_lay.setContentsMargins(0, 0, 0, 0)
-            details_lay.setHorizontalSpacing(6)
-            details_lay.setVerticalSpacing(4)
+            details_lay.setHorizontalSpacing(5)
+            details_lay.setVerticalSpacing(3)
 
-            e_senerg = QLineEdit("")
+            lbl_senerg = QLabel("SENERG (keV):")
+            e_senerg = QLineEdit(str(seed_spec.get("senerg_kev", "")))
             e_senerg.setStyleSheet(entry_css())
             e_senerg.setPlaceholderText("keV")
             e_senerg.setFixedWidth(96)
-            lbl_senerg = QLabel("SENERG (keV):")
+            btn_senerg_all = QPushButton("All")
+            btn_senerg_all.setStyleSheet(btn_css(P["bg2"], 48))
             details_lay.addWidget(lbl_senerg, 0, 0)
             details_lay.addWidget(e_senerg, 0, 1)
+            details_lay.addWidget(btn_senerg_all, 0, 2)
 
-            spectr_path = QLineEdit("")
+            lbl_spectr_file = QLabel("SPECTR file:")
+            spectr_path = QLineEdit(str(seed_spec.get("spectr_file", "")))
             spectr_path.setStyleSheet(entry_css())
             spectr_path.setPlaceholderText("Spectrum file (.dat/.txt)")
             btn_spectr = QPushButton("Browse...")
             btn_spectr.setStyleSheet(btn_css(P["bg2"], 82))
-            lbl_spectr_file = QLabel("SPECTR file:")
-            details_lay.addWidget(lbl_spectr_file, 0, 2)
-            details_lay.addWidget(spectr_path, 0, 3)
-            details_lay.addWidget(btn_spectr, 0, 4)
+            btn_spectr_all = QPushButton("All")
+            btn_spectr_all.setStyleSheet(btn_css(P["bg2"], 48))
+            spectr_inline_lbl = QLabel("Using inline SPECTR block from source case")
+            spectr_inline_lbl.setStyleSheet(label_css(P["fg2"], size=8))
+            spectr_seed_lines = list(seed_spec.get("spectr_lines") or [])
+            details_lay.addWidget(lbl_spectr_file, 0, 3)
+            details_lay.addWidget(spectr_path, 0, 4)
+            details_lay.addWidget(btn_spectr, 0, 5)
+            details_lay.addWidget(btn_spectr_all, 0, 6)
+            details_lay.addWidget(spectr_inline_lbl, 1, 4, 1, 3)
 
-            sposit_edits = []
             lbl_sposit = QLabel("SPOSIT X/Y/Z:")
-            details_lay.addWidget(lbl_sposit, 1, 0)
+            btn_sposit_all = QPushButton("All")
+            btn_sposit_all.setStyleSheet(btn_css(P["bg2"], 48))
+            sposit_seed = list(seed_spec.get("sposit") or defaults["sposit"])
+            sposit_edits = []
+            details_lay.addWidget(lbl_sposit, 2, 0)
             for idx in range(3):
-                edit = QLineEdit(defaults["sposit"][idx] if row_index == 1 else "")
+                edit = QLineEdit(sposit_seed[idx] if idx < len(sposit_seed) else "")
                 edit.setStyleSheet(entry_css())
                 edit.setFixedWidth(68)
-                details_lay.addWidget(edit, 1, 1 + idx)
+                details_lay.addWidget(edit, 2, 1 + idx)
                 sposit_edits.append(edit)
+            details_lay.addWidget(btn_sposit_all, 2, 4)
             lbl_sposit_auto = QLabel("SPOSIT auto-calculated from target mode")
             lbl_sposit_auto.setStyleSheet(label_css(P["fg2"], size=8))
-            lbl_sposit_auto.setVisible(False)
-            details_lay.addWidget(lbl_sposit_auto, 1, 4)
+            details_lay.addWidget(lbl_sposit_auto, 2, 5, 1, 2)
 
             cmb_scone_mode = QComboBox()
             cmb_scone_mode.addItems(["Angles", "Target + distance + beta/gamma"])
             cmb_scone_mode.setStyleSheet(combo_css())
-            details_lay.addWidget(QLabel("SCONE mode:"), 2, 0)
-            details_lay.addWidget(cmb_scone_mode, 2, 1)
+            btn_scone_all = QPushButton("All")
+            btn_scone_all.setStyleSheet(btn_css(P["bg2"], 48))
+            details_lay.addWidget(QLabel("SCONE mode:"), 3, 0)
+            details_lay.addWidget(cmb_scone_mode, 3, 1)
+            details_lay.addWidget(btn_scone_all, 3, 2)
 
             direct_widget = QWidget()
             direct_lay = QHBoxLayout(direct_widget)
             direct_lay.setContentsMargins(0, 0, 0, 0)
-            direct_lay.setSpacing(6)
+            direct_lay.setSpacing(5)
+            scone_seed = list(seed_spec.get("scone") or defaults["scone"])
             scone_direct_edits = []
             for idx, label in enumerate(("theta", "phi", "alpha")):
                 direct_lay.addWidget(QLabel(f"{label}:"))
-                edit = QLineEdit(defaults["scone"][idx] if row_index == 1 else "")
+                edit = QLineEdit(scone_seed[idx] if idx < len(scone_seed) else "")
                 edit.setStyleSheet(entry_css())
-                edit.setFixedWidth(64)
+                edit.setFixedWidth(62)
                 direct_lay.addWidget(edit)
                 scone_direct_edits.append(edit)
             direct_lay.addStretch()
@@ -20591,8 +21041,8 @@ class SimulationTab(QWidget):
             target_widget = QWidget()
             target_lay = QGridLayout(target_widget)
             target_lay.setContentsMargins(0, 0, 0, 0)
-            target_lay.setHorizontalSpacing(5)
-            target_lay.setVerticalSpacing(4)
+            target_lay.setHorizontalSpacing(4)
+            target_lay.setVerticalSpacing(3)
             target_keys = ("XA", "YA", "ZA", "R", "beta", "gamma", "alpha")
             target_labels = ("Target X", "Target Y", "Target Z", "Distance R", "beta", "gamma", "alpha")
             target_edits = {}
@@ -20600,103 +21050,126 @@ class SimulationTab(QWidget):
                 target_lay.addWidget(QLabel(label + ":"), idx // 4, (idx % 4) * 2)
                 edit = QLineEdit("")
                 edit.setStyleSheet(entry_css())
-                edit.setFixedWidth(64)
+                edit.setFixedWidth(62)
                 target_lay.addWidget(edit, idx // 4, (idx % 4) * 2 + 1)
                 target_edits[key] = edit
             scone_stack = QStackedWidget()
-            scone_stack.addWidget(direct_widget)
-            scone_stack.addWidget(target_widget)
-            details_lay.addWidget(scone_stack, 2, 2, 1, 3)
+            direct_wrapper = QWidget()
+            dw_lay = QVBoxLayout(direct_wrapper)
+            dw_lay.setContentsMargins(0, 0, 0, 0)
+            dw_lay.addWidget(direct_widget)
+            target_wrapper = QWidget()
+            tw_lay = QVBoxLayout(target_wrapper)
+            tw_lay.setContentsMargins(0, 0, 0, 0)
+            tw_lay.addWidget(target_widget)
+            scone_stack.addWidget(direct_wrapper)
+            scone_stack.addWidget(target_wrapper)
+            details_lay.addWidget(scone_stack, 3, 3, 1, 4)
 
+            resource_block = QFrame()
+            resource_block.setVisible(bool(allow_resource_overrides))
+            resource_block.setStyleSheet(f"QFrame {{ background:transparent; border:0; }}")
+            resource_lay = QGridLayout(resource_block)
+            resource_lay.setContentsMargins(0, 0, 0, 0)
+            resource_lay.setHorizontalSpacing(5)
+            resource_lay.setVerticalSpacing(3)
+            geo_override_path = QLineEdit(str(seed_spec.get("geo_override_path") or geo_path or ""))
+            geo_override_path.setStyleSheet(entry_css())
+            btn_geo = QPushButton("Browse...")
+            btn_geo.setStyleSheet(btn_css(P["bg2"], 82))
+            btn_geo_all = QPushButton("All")
+            btn_geo_all.setStyleSheet(btn_css(P["bg2"], 48))
+            mat_folder_edit = QLineEdit(str(seed_spec.get("mat_folder") or ""))
+            mat_folder_edit.setStyleSheet(entry_css())
+            btn_mat = QPushButton("Browse...")
+            btn_mat.setStyleSheet(btn_css(P["bg2"], 82))
+            btn_mat_all = QPushButton("All")
+            btn_mat_all.setStyleSheet(btn_css(P["bg2"], 48))
+            resource_lay.addWidget(QLabel("Geo file:"), 0, 0)
+            resource_lay.addWidget(geo_override_path, 0, 1)
+            resource_lay.addWidget(btn_geo, 0, 2)
+            resource_lay.addWidget(btn_geo_all, 0, 3)
+            resource_lay.addWidget(QLabel("Mat folder:"), 1, 0)
+            resource_lay.addWidget(mat_folder_edit, 1, 1)
+            resource_lay.addWidget(btn_mat, 1, 2)
+            resource_lay.addWidget(btn_mat_all, 1, 3)
+            box_lay.addWidget(details)
+            if allow_resource_overrides:
+                box_lay.addWidget(resource_block)
             lbl_preview = QLabel("")
             lbl_preview.setWordWrap(True)
-            lbl_preview.setStyleSheet(label_css(P["fg2"], size=9))
-            box_lay.addWidget(details)
+            lbl_preview.setStyleSheet(label_css(P["fg2"], size=8))
             box_lay.addWidget(lbl_preview)
             content_lay.addWidget(box)
 
-            def choose_spectrum():
-                path, _ = QFileDialog.getOpenFileName(
-                    dlg,
-                    "Choose spectrum file",
-                    str(self._in_folder()),
-                    "Spectrum data (*.dat *.txt);;All files (*.*)",
-                )
-                if path:
-                    spectr_path.setText(path)
-
-            btn_spectr.clicked.connect(choose_spectrum)
-
-            def refresh_row():
-                direct_mode = cmb_scone_mode.currentIndex() == 0
-                target_mode = chk_scone.isChecked() and not direct_mode
-                scone_stack.setCurrentIndex(0 if direct_mode else 1)
-                scone_stack.setVisible(chk_scone.isChecked())
-                lbl_senerg.setVisible(chk_senerg.isChecked())
-                e_senerg.setVisible(chk_senerg.isChecked())
-                lbl_spectr_file.setVisible(chk_spectr.isChecked())
-                spectr_path.setVisible(chk_spectr.isChecked())
-                btn_spectr.setVisible(chk_spectr.isChecked())
-                lbl_sposit.setVisible(chk_sposit.isChecked() and not target_mode)
-                lbl_sposit_auto.setVisible(target_mode)
-                for edit in sposit_edits:
-                    edit.setVisible(chk_sposit.isChecked() and not target_mode)
-                spec = {}
-                if chk_senerg.isChecked():
-                    spec["senerg_kev"] = (e_senerg.text() or "").strip()
-                if chk_spectr.isChecked():
-                    try:
-                        if (spectr_path.text() or "").strip():
-                            lines = self._spectr_lines_from_file(spectr_path.text().strip(), prob_col=self._spectr_prob_col_for_particle(particle))
-                            spec["spectr_range"] = self._spectr_range_from_lines(lines)
-                    except Exception:
-                        pass
-                if chk_sposit.isChecked():
-                    spec["sposit"] = [(edit.text() or "").strip() for edit in sposit_edits]
-                if chk_scone.isChecked():
-                    if cmb_scone_mode.currentIndex() == 0:
-                        spec["scone"] = [(edit.text() or "").strip() for edit in scone_direct_edits]
-                    else:
-                        try:
-                            xa = float((target_edits["XA"].text() or "").strip().replace(",", "."))
-                            ya = float((target_edits["YA"].text() or "").strip().replace(",", "."))
-                            za = float((target_edits["ZA"].text() or "").strip().replace(",", "."))
-                            radius = float((target_edits["R"].text() or "").strip().replace(",", "."))
-                            beta = float((target_edits["beta"].text() or "").strip().replace(",", "."))
-                            gamma = float((target_edits["gamma"].text() or "").strip().replace(",", "."))
-                            alpha = float((target_edits["alpha"].text() or "").strip().replace(",", "."))
-                            calc_sposit, calc_scone = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
-                            spec["sposit"] = calc_sposit
-                            spec["scone"] = calc_scone
-                        except ValueError:
-                            pass
-                preview = self._case_variant_folder_name(e_case.text(), spec)
-                lbl_preview.setText(f"Folder preview: {preview}")
-                scone_stack.updateGeometry()
-                box.updateGeometry()
-
-            for widget in [e_case, e_in, e_senerg, spectr_path, cmb_scone_mode, chk_senerg, chk_spectr, chk_sposit, chk_scone, *sposit_edits, *scone_direct_edits, *target_edits.values()]:
-                if isinstance(widget, QComboBox):
-                    widget.currentTextChanged.connect(refresh_row)
-                elif isinstance(widget, QCheckBox):
-                    widget.toggled.connect(refresh_row)
-                else:
-                    widget.textChanged.connect(refresh_row)
-            refresh_row()
-            rows.append({
+            row = {
+                "box": box,
+                "hdr_case": hdr_case,
                 "case_name": e_case,
                 "in_name": e_in,
                 "senerg": chk_senerg,
                 "senerg_edit": e_senerg,
                 "spectr": chk_spectr,
                 "spectr_path": spectr_path,
+                "spectr_seed_lines": spectr_seed_lines,
+                "spectr_inline_lbl": spectr_inline_lbl,
                 "sposit": chk_sposit,
                 "sposit_edits": sposit_edits,
                 "scone": chk_scone,
                 "scone_mode": cmb_scone_mode,
                 "scone_direct_edits": scone_direct_edits,
                 "scone_target_edits": target_edits,
-            })
+                "lbl_preview": lbl_preview,
+                "lbl_senerg": lbl_senerg,
+                "lbl_spectr_file": lbl_spectr_file,
+                "lbl_sposit": lbl_sposit,
+                "lbl_sposit_auto": lbl_sposit_auto,
+                "scone_stack": scone_stack,
+                "direct_wrapper": direct_wrapper,
+                "target_wrapper": target_wrapper,
+                "resource_block": resource_block,
+                "geo_override_path": geo_override_path,
+                "mat_folder": mat_folder_edit,
+                "btn_senerg_all": btn_senerg_all,
+                "btn_spectr_all": btn_spectr_all,
+                "btn_sposit_all": btn_sposit_all,
+                "btn_scone_all": btn_scone_all,
+            }
+
+            btn_remove.clicked.connect(lambda _=False, r=row: remove_row(r))
+            btn_spectr.clicked.connect(lambda _=False, r=row: choose_spectrum(r))
+            btn_senerg_all.clicked.connect(lambda _=False, edit=e_senerg: propagate_line_value(edit, "senerg_edit"))
+            btn_spectr_all.clicked.connect(lambda _=False, edit=spectr_path: propagate_line_value(edit, "spectr_path"))
+            btn_sposit_all.clicked.connect(lambda _=False, edits=sposit_edits: propagate_triplet(edits, "sposit_edits"))
+            btn_scone_all.clicked.connect(
+                lambda _=False, r=row: (
+                    propagate_scone_direct(r["scone_direct_edits"]) if r["scone_mode"].currentIndex() == 0 else propagate_target_bundle(r)
+                )
+            )
+            if allow_resource_overrides:
+                btn_geo.clicked.connect(lambda _=False, r=row: choose_geo(r))
+                btn_mat.clicked.connect(lambda _=False, r=row: choose_mat_folder(r))
+                btn_geo_all.clicked.connect(lambda _=False, edit=geo_override_path: propagate_line_value(edit, "geo_override_path"))
+                btn_mat_all.clicked.connect(lambda _=False, edit=mat_folder_edit: propagate_line_value(edit, "mat_folder"))
+
+            for widget in [e_case, e_in, e_senerg, spectr_path, cmb_scone_mode, chk_senerg, chk_spectr, chk_sposit, chk_scone, *sposit_edits, *scone_direct_edits, *target_edits.values(), geo_override_path, mat_folder_edit]:
+                if isinstance(widget, QComboBox):
+                    widget.currentTextChanged.connect(lambda _txt, r=row: refresh_row_preview(r))
+                elif isinstance(widget, QCheckBox):
+                    widget.toggled.connect(lambda _chk=False, r=row: refresh_row_preview(r))
+                else:
+                    widget.textChanged.connect(lambda _txt, r=row: refresh_row_preview(r))
+
+            if seed_spec.get("senerg_kev") not in (None, ""):
+                chk_senerg.setChecked(True)
+            if seed_spec.get("spectr_file") or seed_spec.get("spectr_lines"):
+                chk_spectr.setChecked(True)
+            if seed_spec.get("sposit"):
+                chk_sposit.setChecked(True)
+            if seed_spec.get("scone"):
+                chk_scone.setChecked(True)
+            rows.append(row)
+            refresh_row_preview(row)
 
         def add_rows(count):
             try:
@@ -20705,9 +21178,14 @@ class SimulationTab(QWidget):
                 count = 0
             for _ in range(max(0, count)):
                 add_row()
+            renumber_rows()
 
-        for idx in range(1, max(1, int(case_count)) + 1):
-            add_row(idx)
+        if seed_specs:
+            for idx, seed_spec in enumerate(seed_specs, start=1):
+                add_row(idx, seed_spec=seed_spec)
+        else:
+            for idx in range(1, max(1, int(case_count)) + 1):
+                add_row(idx)
         scroll.setWidget(content)
         lay.addWidget(scroll, stretch=1)
 
@@ -20725,7 +21203,7 @@ class SimulationTab(QWidget):
         add_row_bar.setSpacing(8)
         btn_add_row = QPushButton("Add Case Row")
         btn_add_row.setStyleSheet(btn_css(P["bg2"], 132))
-        btn_add_row.clicked.connect(lambda: add_row())
+        btn_add_row.clicked.connect(lambda: add_rows(1))
         add_row_bar.addWidget(btn_add_row)
         add_row_bar.addWidget(QLabel("Add many:"))
         spn_add_rows = QSpinBox()
@@ -20754,43 +21232,47 @@ class SimulationTab(QWidget):
         for idx, row in enumerate(rows, start=1):
             case_name = self._workspace_safe_token(row["case_name"].text(), "")
             if not case_name:
-                QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx} needs a Case Name.")
+                QMessageBox.warning(self, dialog_title, f"CASE {idx} needs a Case Name.")
                 return None
             in_filename = self._case_variant_in_filename(row["in_name"].text(), case_name)
             spec = {"case_name": case_name, "in_filename": in_filename}
             if row["senerg"].isChecked() and row["spectr"].isChecked():
-                QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: choose either SENERG or SPECTR, not both.")
+                QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose either SENERG or SPECTR, not both.")
                 return None
             if row["senerg"].isChecked():
                 raw = (row["senerg_edit"].text() or "").strip()
                 if not raw:
-                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: enter the SENERG value in keV.")
+                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: enter the SENERG value in keV.")
                     return None
                 spec["senerg_kev"] = raw
             if row["spectr"].isChecked():
                 path = (row["spectr_path"].text() or "").strip()
-                if not path:
-                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: choose a SPECTR file.")
+                if path:
+                    try:
+                        lines = self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
+                    except Exception as exc:
+                        QMessageBox.warning(self, dialog_title, f"CASE {idx}: invalid SPECTR file.\n\n{exc}")
+                        return None
+                    spec["spectr_file"] = path
+                    spec["spectr_lines"] = lines
+                    spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                elif row.get("spectr_seed_lines"):
+                    spec["spectr_lines"] = list(row["spectr_seed_lines"])
+                    spec["spectr_range"] = self._spectr_range_from_lines(row["spectr_seed_lines"])
+                else:
+                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose a SPECTR file.")
                     return None
-                try:
-                    lines = self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
-                except Exception as exc:
-                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: invalid SPECTR file.\n\n{exc}")
-                    return None
-                spec["spectr_file"] = path
-                spec["spectr_lines"] = lines
-                spec["spectr_range"] = self._spectr_range_from_lines(lines)
             if row["sposit"].isChecked():
                 values = [(edit.text() or "").strip() for edit in row["sposit_edits"]]
                 if not all(values):
-                    QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: fill all SPOSIT coordinates.")
+                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: fill all SPOSIT coordinates.")
                     return None
                 spec["sposit"] = values
             if row["scone"].isChecked():
                 if row["scone_mode"].currentIndex() == 0:
                     values = [(edit.text() or "").strip() for edit in row["scone_direct_edits"]]
                     if not all(values):
-                        QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: fill all SCONE angle values.")
+                        QMessageBox.warning(self, dialog_title, f"CASE {idx}: fill all SCONE angle values.")
                         return None
                     spec["scone"] = values
                 else:
@@ -20803,7 +21285,7 @@ class SimulationTab(QWidget):
                         gamma = float((row["scone_target_edits"]["gamma"].text() or "").strip().replace(",", "."))
                         alpha = float((row["scone_target_edits"]["alpha"].text() or "").strip().replace(",", "."))
                     except ValueError:
-                        QMessageBox.warning(self, "Create Batch Cases", f"CASE {idx}: use numeric values for target, distance, beta, gamma, and alpha.")
+                        QMessageBox.warning(self, dialog_title, f"CASE {idx}: use numeric values for target, distance, beta, gamma, and alpha.")
                         return None
                     sposit_vals, scone_vals = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
                     spec["sposit"] = sposit_vals
@@ -20822,23 +21304,22 @@ class SimulationTab(QWidget):
                                 "alpha_deg": alpha,
                             },
                             "output": {
-                                "sposit": {
-                                    "x": sposit_vals[0],
-                                    "y": sposit_vals[1],
-                                    "z": sposit_vals[2],
-                                },
-                                "scone": {
-                                    "theta_deg": scone_vals[0],
-                                    "phi_deg": scone_vals[1],
-                                    "alpha_deg": scone_vals[2],
-                                },
+                                "sposit": {"x": sposit_vals[0], "y": sposit_vals[1], "z": sposit_vals[2]},
+                                "scone": {"theta_deg": scone_vals[0], "phi_deg": scone_vals[1], "alpha_deg": scone_vals[2]},
                             },
                         },
                         in_path=in_path,
                     )
+            if allow_resource_overrides:
+                geo_override = (row["geo_override_path"].text() or "").strip()
+                mat_folder = (row["mat_folder"].text() or "").strip()
+                if geo_override:
+                    spec["geo_override_path"] = geo_override
+                if mat_folder:
+                    spec["mat_folder"] = mat_folder
             specs.append(spec)
         if not specs:
-            QMessageBox.warning(self, "Create Batch Cases", "No valid batch case rows were prepared.")
+            QMessageBox.warning(self, dialog_title, "No valid batch case rows were prepared.")
             return None
         return specs
 
@@ -21007,33 +21488,17 @@ class SimulationTab(QWidget):
             QMessageBox.warning(self, "Create Case", "Save the .in file first.")
             return
         in_path = Path(self._in_path)
+        base_source_text = self.editor.toPlainText()
         geo_path = self._current_geom_path()
         geo_name = self._current_geom_filename()
         if geo_path and not geo_path.exists() and geo_name and not Path(geo_name).is_absolute():
             root_geo = self._workspace_folder() / geo_name
             if root_geo.exists():
                 geo_path = root_geo
-        if self._project_root:
-            # Project mode: always land in the project cases folder (guaranteed to exist
-            # by apply_project_context, but mkdir again as a safety net).
-            _proj_folders = dict((self._project_meta or {}).get("folders") or {})
-            case_root = Path(self._project_root) / _proj_folders.get("cases", PROJECT_DIR_CASES)
-            case_root.mkdir(parents=True, exist_ok=True)
-        elif self._workspace_root:
-            case_root = Path(self._workspace_root)
-        else:
-            # Solo mode with no workspace set: ask the user once.
-            _start = str(self._in_folder())
-            _chosen = QFileDialog.getExistingDirectory(self, "Choose folder for new case", _start)
-            if not _chosen:
-                return
-            case_root = Path(_chosen)
-            self._set_workspace_root(str(case_root), log_label="Case root (solo, user-selected)")
-        group_rel, cancelled = self._select_case_group_for_creation(case_root)
-        if cancelled:
+        target_info = self._case_creation_target_root(in_path)
+        if target_info is None:
             return
-        target_root = case_root / group_rel if group_rel else case_root
-        target_root.mkdir(parents=True, exist_ok=True)
+        case_root, target_root, group_rel = target_info
         template_dir = self._resolve_template_dir(case_root)
         if not geo_path:
             geo_path = self._geomfn_list_folder() / (geo_name or "")
@@ -21143,9 +21608,19 @@ class SimulationTab(QWidget):
                 batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(in_path))
                 batch_root.mkdir(parents=True, exist_ok=True)
                 for spec in batch_specs:
+                    spec_geo_path = Path(spec.get("geo_override_path") or geo_path)
+                    if not spec_geo_path.exists():
+                        QMessageBox.warning(self, "Create Batch Cases", f"Missing geometry file for {spec.get('case_name', 'case')}:\n{spec_geo_path}")
+                        return
+                    spec_mat_folder = Path(spec.get("mat_folder") or mat_folder)
+                    if spec.get("mat_folder") and not spec_mat_folder.exists():
+                        QMessageBox.warning(self, "Create Batch Cases", f"Missing materials folder for {spec.get('case_name', 'case')}:\n{spec_mat_folder}")
+                        return
+                    spec_workspace_geo_name = self._geo_alias_for_penelope(spec_geo_path)
+                    spec_base_text = self._replace_geomfn_in_text(base_source_text, spec_workspace_geo_name)
                     folder_name = self._case_variant_folder_name(spec["case_name"], spec)
                     case_dir = self._unique_workspace_dir(batch_root / folder_name)
-                    batch_text = self._apply_case_variant_source_overrides(workspace_text, spec)
+                    batch_text = self._apply_case_variant_source_overrides(spec_base_text, spec)
                     title_line = self._case_variant_title(spec["case_name"], spec)
                     batch_text, _ = self._replace_or_insert_line_in_text(
                         batch_text,
@@ -21157,10 +21632,10 @@ class SimulationTab(QWidget):
                         case_dir,
                         in_filename=spec["in_filename"],
                         in_text=batch_text,
-                        geo_path=geo_path,
-                        workspace_geo_name=workspace_geo_name,
+                        geo_path=spec_geo_path,
+                        workspace_geo_name=spec_workspace_geo_name,
                         template_dir=template_dir,
-                        mat_sources=mat_sources,
+                        mat_sources=_mat_sources(spec_geo_path, spec_mat_folder),
                         required_refs=required_refs,
                         effective_execs=effective_execs,
                     )
@@ -21168,8 +21643,8 @@ class SimulationTab(QWidget):
                     self._log_project_case_creation(
                         case_dir,
                         result,
-                        geo_path,
-                        workspace_geo_name,
+                        spec_geo_path,
+                        spec_workspace_geo_name,
                         group_rel=group_rel,
                         source_in_path=in_path,
                         spec=spec,
@@ -21179,8 +21654,8 @@ class SimulationTab(QWidget):
                         self._case_creation_log_record(
                             case_dir,
                             result,
-                            geo_path,
-                            workspace_geo_name,
+                            spec_geo_path,
+                            spec_workspace_geo_name,
                             group_rel=group_rel,
                             source_in_path=in_path,
                             spec=spec,
@@ -21288,6 +21763,267 @@ class SimulationTab(QWidget):
         if created_dirs and not self._project_root:
             self._set_workspace_root(created_dirs[-1][0], log_label="Case root (auto-set from created case)")
             self._update_file_source_labels()
+
+    def _case_creation_target_root(self, in_path=None):
+        in_path = Path(in_path) if in_path else None
+        if self._project_root:
+            _proj_folders = dict((self._project_meta or {}).get("folders") or {})
+            case_root = Path(self._project_root) / _proj_folders.get("cases", PROJECT_DIR_CASES)
+            case_root.mkdir(parents=True, exist_ok=True)
+        elif self._workspace_root:
+            case_root = Path(self._workspace_root)
+        else:
+            start_folder = str((in_path.parent if in_path else self._in_folder()))
+            chosen = QFileDialog.getExistingDirectory(self, "Choose folder for new case", start_folder)
+            if not chosen:
+                return None
+            case_root = Path(chosen)
+            self._set_workspace_root(str(case_root), log_label="Case root (solo, user-selected)")
+        group_rel, cancelled = self._select_case_group_for_creation(case_root)
+        if cancelled:
+            return None
+        target_root = case_root / group_rel if group_rel else case_root
+        target_root.mkdir(parents=True, exist_ok=True)
+        return case_root, target_root, group_rel
+
+    def _duplicate_case_workspace(self):
+        record = self._select_logged_case_record_dialog()
+        if not record:
+            return
+        source_case_dir = self._resolve_project_logged_path(record.get("case_folder"))
+        source_in_name = str(record.get("in_file") or "").strip()
+        if not source_case_dir or not source_case_dir.exists():
+            QMessageBox.warning(self, "Duplicate Case", "The selected source case folder no longer exists.")
+            return
+        source_in_path = source_case_dir / source_in_name if source_in_name else None
+        if not source_in_path or not source_in_path.exists():
+            in_files = sorted(source_case_dir.glob("*.in"))
+            if not in_files:
+                QMessageBox.warning(self, "Duplicate Case", "The selected source case has no .in file.")
+                return
+            source_in_path = in_files[0]
+        try:
+            source_text = _decode_text_bytes(source_in_path.read_bytes())
+        except Exception as exc:
+            QMessageBox.warning(self, "Duplicate Case", f"Could not read the source .in file.\n\n{exc}")
+            return
+        seed_spec = self._case_variant_spec_from_log_record(record)
+        if not seed_spec:
+            QMessageBox.warning(self, "Duplicate Case", "Could not reconstruct the source case settings.")
+            return
+        base_geo_path = self._resolve_project_logged_path(record.get("geo_source_path"))
+        if not base_geo_path or not Path(base_geo_path).exists():
+            geo_file = str(record.get("geo_file") or "").strip()
+            if geo_file:
+                candidate = source_case_dir / geo_file
+                if candidate.exists():
+                    base_geo_path = candidate
+        if not base_geo_path or not Path(base_geo_path).exists():
+            QMessageBox.warning(self, "Duplicate Case", "The source geometry file could not be found.")
+            return
+        target_info = self._case_creation_target_root(source_in_path)
+        if target_info is None:
+            return
+        case_root, target_root, group_rel = target_info
+        template_dir = self._resolve_template_dir(case_root)
+        effective_execs = self._effective_executable_paths()
+        try:
+            required_refs = self._resolve_required_input_reference_sources(
+                source_in_path,
+                source_text,
+                interactive=True,
+                purpose="duplicate case",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Duplicate Case", str(exc))
+            return
+        specs = self._batch_case_variants_dialog(
+            source_in_path,
+            base_geo_path,
+            case_count=1,
+            seed_specs=[seed_spec],
+            allow_resource_overrides=True,
+            dialog_title="Duplicate Case",
+            intro_text="Review the copied case settings below. You can change source values, geometry, materials, add more rows, or remove rows before creating the duplicate case(s).",
+        )
+        if not specs:
+            return
+        mat_folder_default = source_case_dir if any(source_case_dir.glob("*.mat")) else self._material_list_folder()
+        created_dirs = []
+        for spec in specs:
+            spec_geo_path = Path(spec.get("geo_override_path") or base_geo_path)
+            if not spec_geo_path.exists():
+                QMessageBox.warning(self, "Duplicate Case", f"Missing geometry file for {spec.get('case_name', 'case')}:\n{spec_geo_path}")
+                return
+            spec_mat_folder = Path(spec.get("mat_folder") or mat_folder_default)
+            if spec.get("mat_folder") and not spec_mat_folder.exists():
+                QMessageBox.warning(self, "Duplicate Case", f"Missing materials folder for {spec.get('case_name', 'case')}:\n{spec_mat_folder}")
+                return
+            spec_geo_name = self._geo_alias_for_penelope(spec_geo_path)
+            base_text = self._replace_geomfn_in_text(source_text, spec_geo_name)
+            case_text = self._apply_case_variant_source_overrides(base_text, spec)
+            case_text, _ = self._replace_or_insert_line_in_text(
+                case_text,
+                "TITLE",
+                f"TITLE  {self._case_variant_title(spec['case_name'], spec)}",
+                before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
+            )
+            case_dir = self._unique_workspace_dir(target_root / self._case_variant_folder_name(spec["case_name"], spec))
+            result = self._write_case_workspace(
+                case_dir,
+                in_filename=spec["in_filename"],
+                in_text=case_text,
+                geo_path=spec_geo_path,
+                workspace_geo_name=spec_geo_name,
+                template_dir=template_dir,
+                mat_sources=[source_in_path.parent, source_case_dir, spec_mat_folder],
+                required_refs=required_refs,
+                effective_execs=effective_execs,
+            )
+            created_dirs.append((case_dir, result))
+            self._log_project_case_creation(
+                case_dir,
+                result,
+                spec_geo_path,
+                spec_geo_name,
+                group_rel=group_rel,
+                source_in_path=source_in_path,
+                spec=spec,
+            )
+        if created_dirs:
+            self.console.log(f"[SIM] Duplicated {len(created_dirs)} case(s) from {source_case_dir.name}\n", "ok")
+            self.status_message.emit(f"Duplicate case(s) created: {len(created_dirs)}")
+
+    def _duplicate_batch_workspace(self):
+        entry = self._select_logged_batch_entry_dialog()
+        if not entry:
+            return
+        source_in_path = self._resolve_project_logged_path(entry.get("source_in_path"))
+        if not source_in_path or not source_in_path.exists():
+            QMessageBox.warning(self, "Duplicate Batch", "The original source .in file for this batch could not be found.")
+            return
+        try:
+            source_text = _decode_text_bytes(source_in_path.read_bytes())
+        except Exception as exc:
+            QMessageBox.warning(self, "Duplicate Batch", f"Could not read the source .in file.\n\n{exc}")
+            return
+        batch_case_records = [case for case in list(entry.get("cases") or []) if isinstance(case, dict)]
+        batch_specs = [self._case_variant_spec_from_log_record(case) for case in batch_case_records]
+        batch_specs = [spec for spec in batch_specs if spec]
+        if not batch_specs:
+            QMessageBox.warning(self, "Duplicate Batch", "Could not reconstruct the batch case settings.")
+            return
+        base_geo_path = self._resolve_project_logged_path(entry.get("geo_source_path"))
+        if not base_geo_path or not Path(base_geo_path).exists():
+            first_case_dir = self._resolve_project_logged_path(batch_case_records[0].get("case_folder")) if batch_case_records else None
+            geo_file = str(entry.get("geo_file") or "").strip()
+            if first_case_dir and geo_file:
+                candidate = first_case_dir / geo_file
+                if candidate.exists():
+                    base_geo_path = candidate
+        if not base_geo_path or not Path(base_geo_path).exists():
+            QMessageBox.warning(self, "Duplicate Batch", "The source geometry file for this batch could not be found.")
+            return
+        target_info = self._case_creation_target_root(source_in_path)
+        if target_info is None:
+            return
+        case_root, target_root, group_rel = target_info
+        template_dir = self._resolve_template_dir(case_root)
+        effective_execs = self._effective_executable_paths()
+        try:
+            required_refs = self._resolve_required_input_reference_sources(
+                source_in_path,
+                source_text,
+                interactive=True,
+                purpose="duplicate batch",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Duplicate Batch", str(exc))
+            return
+        edited_specs = self._batch_case_variants_dialog(
+            source_in_path,
+            base_geo_path,
+            case_count=len(batch_specs),
+            seed_specs=batch_specs,
+            allow_resource_overrides=True,
+            dialog_title="Duplicate Batch",
+            intro_text="Review the copied batch rows below. You can change any source values, geometry, materials, add more rows, or remove rows before creating the duplicated batch.",
+        )
+        if not edited_specs:
+            return
+        batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
+        batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path))
+        batch_root.mkdir(parents=True, exist_ok=True)
+        created_dirs = []
+        batch_log_records = []
+        default_mat_folder = source_in_path.parent
+        for spec in edited_specs:
+            spec_geo_path = Path(spec.get("geo_override_path") or base_geo_path)
+            if not spec_geo_path.exists():
+                QMessageBox.warning(self, "Duplicate Batch", f"Missing geometry file for {spec.get('case_name', 'case')}:\n{spec_geo_path}")
+                return
+            spec_mat_folder = Path(spec.get("mat_folder") or default_mat_folder)
+            if spec.get("mat_folder") and not spec_mat_folder.exists():
+                QMessageBox.warning(self, "Duplicate Batch", f"Missing materials folder for {spec.get('case_name', 'case')}:\n{spec_mat_folder}")
+                return
+            spec_geo_name = self._geo_alias_for_penelope(spec_geo_path)
+            base_text = self._replace_geomfn_in_text(source_text, spec_geo_name)
+            case_text = self._apply_case_variant_source_overrides(base_text, spec)
+            case_text, _ = self._replace_or_insert_line_in_text(
+                case_text,
+                "TITLE",
+                f"TITLE  {self._case_variant_title(spec['case_name'], spec)}",
+                before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
+            )
+            case_dir = self._unique_workspace_dir(batch_root / self._case_variant_folder_name(spec["case_name"], spec))
+            result = self._write_case_workspace(
+                case_dir,
+                in_filename=spec["in_filename"],
+                in_text=case_text,
+                geo_path=spec_geo_path,
+                workspace_geo_name=spec_geo_name,
+                template_dir=template_dir,
+                mat_sources=[source_in_path.parent, spec_mat_folder],
+                required_refs=required_refs,
+                effective_execs=effective_execs,
+            )
+            created_dirs.append((case_dir, result))
+            self._log_project_case_creation(
+                case_dir,
+                result,
+                spec_geo_path,
+                spec_geo_name,
+                group_rel=group_rel,
+                source_in_path=source_in_path,
+                spec=spec,
+                batch_id=batch_id,
+            )
+            batch_log_records.append(
+                self._case_creation_log_record(
+                    case_dir,
+                    result,
+                    spec_geo_path,
+                    spec_geo_name,
+                    group_rel=group_rel,
+                    source_in_path=source_in_path,
+                    spec=spec,
+                    batch_id=batch_id,
+                )
+            )
+        if created_dirs:
+            self._log_project_batch_creation(
+                batch_id,
+                group_rel,
+                target_root,
+                batch_root,
+                source_in_path,
+                base_geo_path,
+                self._geo_alias_for_penelope(base_geo_path),
+                batch_log_records,
+            )
+            self._set_workspace_root(batch_root, log_label="Case root (duplicated batch)")
+            self.console.log(f"[SIM] Duplicated batch created: {len(created_dirs)} case(s) under {batch_root}\n", "ok")
+            self.status_message.emit(f"Duplicate batch created: {len(created_dirs)}")
 
     def _write_case_workspace(self, case_dir, in_filename, in_text, geo_path, workspace_geo_name, template_dir, mat_sources, required_refs, effective_execs):
         case_dir = Path(case_dir)
@@ -21964,73 +22700,16 @@ class SimulationTab(QWidget):
         dlg.exec()
 
     def _current_source_defaults(self):
-        text = self._get_text()
-        defaults = {
-            "particle": "2",
-            "energy_type": "SENERG",
-            "energy_value": "130",
-            "energy_unit": "keV",
-            "spectrum_source_kind": getattr(self, "_spectr_source_kind", "file"),
-            "spectrum_path": getattr(self, "_spectr_source_path", ""),
-            "spectrum_db_path": getattr(self, "_spectr_database_path", ""),
-            "spectrum_db_label": getattr(self, "_spectr_database_label", ""),
-            "spectrum_prob_col": getattr(self, "_spectr_prob_column", 6),
-            "spectrum_lines": [],
-            "sposit": ["0.0", "0.0", "0.0"],
-            "scone": ["0", "0", "0"],
-        }
-
-        match = re.search(r"^\s*SKPAR\s+(\S+)", text, re.IGNORECASE | re.MULTILINE)
-        if match and match.group(1) in {"1", "2", "3"}:
-            defaults["particle"] = match.group(1)
-
-        spectr_lines = [
-            line.strip()
-            for line in text.splitlines()
-            if re.match(r"^\s*SPECTR\b", line, re.IGNORECASE)
-        ]
-        if spectr_lines:
-            defaults["energy_type"] = "SPECTR"
-            defaults["spectrum_lines"] = spectr_lines
-            defaults["spectrum_prob_col"] = self._spectr_prob_col_for_particle(defaults["particle"])
-        else:
-            match = re.search(r"^\s*SENERG\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                defaults["energy_type"] = "SENERG"
-                raw = match.group(1).strip()
-                lowered = raw.lower()
-                try:
-                    value = float(raw)
-                    if value >= 1e6:
-                        defaults["energy_value"] = f"{value / 1e6:g}"
-                        defaults["energy_unit"] = "MeV"
-                    else:
-                        defaults["energy_value"] = f"{value / 1e3:g}"
-                        defaults["energy_unit"] = "keV"
-                except ValueError:
-                    if lowered.endswith("e6"):
-                        defaults["energy_value"] = raw[:-2]
-                        defaults["energy_unit"] = "MeV"
-                    elif lowered.endswith("e3"):
-                        defaults["energy_value"] = raw[:-2]
-                        defaults["energy_unit"] = "keV"
-                    else:
-                        defaults["energy_value"] = raw
-                        defaults["energy_unit"] = "keV"
-            elif getattr(self, "_source_energy_mode", "") in {"SENERG", "SPECTR"}:
-                defaults["energy_type"] = self._source_energy_mode
-
-        match = re.search(r"^\s*SPOSIT\s+([^\[]+)", text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            vals = match.group(1).split()[:3]
-            if len(vals) == 3:
-                defaults["sposit"] = vals
-
-        match = re.search(r"^\s*SCONE\s+([^\[]+)", text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            vals = match.group(1).split()[:3]
-            if len(vals) == 3:
-                defaults["scone"] = vals
+        defaults = self._source_defaults_from_text(
+            self._get_text(),
+            spectrum_path=getattr(self, "_spectr_source_path", ""),
+            spectrum_db_path=getattr(self, "_spectr_database_path", ""),
+            spectrum_db_label=getattr(self, "_spectr_database_label", ""),
+            spectrum_prob_col=getattr(self, "_spectr_prob_column", 6),
+        )
+        if getattr(self, "_source_energy_mode", "") in {"SENERG", "SPECTR"} and not defaults.get("spectrum_lines"):
+            defaults["energy_type"] = self._source_energy_mode
+        defaults["spectrum_source_kind"] = getattr(self, "_spectr_source_kind", "file")
         return defaults
 
     def _cmd_particle_source(self):
@@ -26780,13 +27459,13 @@ class AnalysisLoadWorker(QObject):
 class AnalysisTab(QWidget):
     status_message = Signal(str)
     DOSE_HEADERS = [
-        "Case", "Distance (m)", "Source-Origin/Wall Distance (m)", "Source-Body Distance (m)",
-        "Wall Thickness (cm)", "Body", "Component",
+        "Case", "R (m)", "Body", "Component",
         "Edep (eV)", "dE (eV)", "Edep (J)", "dE (J)", "Error (%)", "Mass (kg)",
         "Dose (Gy)", "dDose (Gy)", "Dose (eV/g)", "dDose (eV/g)",
         "N ref", "Time ref (s)", "Target Err (%)", "NSIMSH @5%", "Time @5% (s)",
         "Quality", "Geometry Type", "Geometry",
     ]
+    DOSE_CONFIG_SHEET = "__DOSE_CONFIG__"
     EV_TO_J = 1.602176634e-19
     TARGET_ERR_PCT = 5.0
     RISK_CANDIDATE_N = (3e6, 1e7, 3e7, 1e8)
@@ -26797,6 +27476,7 @@ class AnalysisTab(QWidget):
         self._multi_root = None
         self._dose_xlsx = None
         self._dose_xlsx_user_selected = False
+        self._dose_workbook_config = None
         self._geo_bodies = {}
         self._body_geometry = {}
         self._geo_surfaces = {}
@@ -27197,12 +27877,32 @@ class AnalysisTab(QWidget):
             return
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
-        self._dose_xlsx = Path(path)
+        chosen_path = Path(path)
+        config = None
+        if chosen_path.exists():
+            openpyxl = self._load_openpyxl()
+            if openpyxl is not None:
+                try:
+                    wb = openpyxl.load_workbook(chosen_path)
+                    config = self._read_dose_workbook_config(wb)
+                except Exception:
+                    config = None
+        else:
+            config = self._prompt_dose_workbook_config(existing=self._dose_workbook_config)
+            if config is None:
+                self._log_analysis("Dose workbook selection canceled: target BODY / R configuration is required for a new workbook.", "warn")
+                return
+        self._dose_xlsx = chosen_path
         self._dose_xlsx_user_selected = True
+        self._dose_workbook_config = config
         state = "existing" if self._dose_xlsx.exists() else "will be created on append"
-        self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} ({state})")
+        self._update_dose_xlsx_label(state)
         self.status_message.emit(f"Dose workbook selected: {self._dose_xlsx}")
-        self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}).", "info")
+        summary = self._dose_workbook_config_summary()
+        if summary:
+            self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}; {summary}).", "info")
+        else:
+            self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}).", "info")
         self._refresh_dose_columns()
 
     def _extract_source_info_from_in(self, folder):
@@ -27647,8 +28347,9 @@ class AnalysisTab(QWidget):
             default_xlsx = analysis_root / "dose_analysis.xlsx"
             if default_xlsx.exists():
                 self._dose_xlsx = default_xlsx
+                self._dose_workbook_config = None
                 if hasattr(self, "lbl_dose_xlsx"):
-                    self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} (project default)")
+                    self._update_dose_xlsx_label("project default")
         self._refresh_analysis_workspace_candidates()
         self._log_analysis(f"Project context applied: {root}", "info")
 
@@ -27758,9 +28459,10 @@ class AnalysisTab(QWidget):
             if default_xlsx.exists():
                 self._dose_xlsx = default_xlsx
                 self._dose_xlsx_user_selected = False
-                self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} (auto-detected)")
+                self._dose_workbook_config = None
+                self._update_dose_xlsx_label("auto-detected")
         elif self._dose_xlsx_user_selected:
-            self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} (locked)")
+            self._update_dose_xlsx_label("locked")
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.summary.setPlainText("Loading…")
@@ -28609,6 +29311,233 @@ class AnalysisTab(QWidget):
             thick = float(mt.group(1))
         return name, dist, thick
 
+    def _dose_body_column_index(self):
+        return self.DOSE_HEADERS.index("Body")
+
+    def _body_center_cm(self, geo_body_id):
+        try:
+            geo_body_id = int(geo_body_id)
+        except (TypeError, ValueError):
+            return None
+        body = self._geo_body_defs.get(geo_body_id)
+        if not body:
+            return None
+        bounds = self._body_axis_bounds(body, self._geo_surfaces)
+        if not bounds:
+            return None
+        try:
+            return tuple((float(bounds[axis][0]) + float(bounds[axis][1])) / 2.0 for axis in ("X", "Y", "Z"))
+        except Exception:
+            return None
+
+    def _available_dose_target_bodies(self):
+        choices = []
+        for geo_body_id, body in sorted((self._geo_body_defs or {}).items()):
+            label = str(body.get("label") or f"BODY({geo_body_id})").strip()
+            center = self._body_center_cm(geo_body_id)
+            center_text = "center unavailable"
+            if center is not None:
+                center_text = f"center=({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) cm"
+            choices.append({
+                "id": int(geo_body_id),
+                "label": label,
+                "display": f"Body {int(geo_body_id)}: {label}  [{center_text}]",
+            })
+        return choices
+
+    def _read_dose_workbook_config(self, wb):
+        if self.DOSE_CONFIG_SHEET not in wb.sheetnames:
+            return None
+        ws = wb[self.DOSE_CONFIG_SHEET]
+        config = {}
+        for row in range(1, ws.max_row + 1):
+            key = str(ws.cell(row, 1).value or "").strip()
+            if not key:
+                continue
+            config[key] = ws.cell(row, 2).value
+        if not config:
+            return None
+        try:
+            body_id = int(config.get("target_body_id"))
+        except (TypeError, ValueError):
+            return None
+        mode = str(config.get("distance_mode") or "direct").strip().lower()
+        if mode not in ("direct", "linear"):
+            mode = "direct"
+        axis = str(config.get("linear_axis") or "Z").strip().upper()
+        if axis not in ("X", "Y", "Z"):
+            axis = "Z"
+        return {
+            "target_body_id": body_id,
+            "target_body_label": str(config.get("target_body_label") or f"BODY({body_id})"),
+            "distance_mode": mode,
+            "linear_axis": axis,
+        }
+
+    def _write_dose_workbook_config(self, wb, config):
+        ws = wb[self.DOSE_CONFIG_SHEET] if self.DOSE_CONFIG_SHEET in wb.sheetnames else wb.create_sheet(self.DOSE_CONFIG_SHEET)
+        ws.delete_rows(1, ws.max_row or 1)
+        rows = [
+            ("version", "1"),
+            ("target_body_id", int(config["target_body_id"])),
+            ("target_body_label", str(config.get("target_body_label") or "")),
+            ("distance_mode", str(config.get("distance_mode") or "direct")),
+            ("linear_axis", str(config.get("linear_axis") or "Z")),
+        ]
+        for idx, (key, value) in enumerate(rows, start=1):
+            ws.cell(idx, 1).value = key
+            ws.cell(idx, 2).value = value
+        ws.sheet_state = "hidden"
+
+    def _dose_workbook_config_summary(self, config=None):
+        config = config or self._dose_workbook_config or {}
+        if not config:
+            return ""
+        label = str(config.get("target_body_label") or f"BODY({config.get('target_body_id', '?')})")
+        mode = str(config.get("distance_mode") or "direct")
+        if mode == "linear":
+            return f"target={label}; R=linear {config.get('linear_axis', 'Z')}"
+        return f"target={label}; R=direct"
+
+    def _update_dose_xlsx_label(self, state_text):
+        if not self._dose_xlsx:
+            self.lbl_dose_xlsx.setText("Dose workbook: none selected")
+            return
+        summary = self._dose_workbook_config_summary()
+        if summary:
+            self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} ({state_text}; {summary})")
+        else:
+            self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} ({state_text})")
+
+    def _prompt_dose_workbook_config(self, existing=None):
+        if not self._workspace or not self._geo_body_defs:
+            QMessageBox.warning(
+                self,
+                "Dose workbook target",
+                "Load an analysis case first so the workbook can be configured with a target body and R mode.",
+            )
+            return None
+        bodies = self._available_dose_target_bodies()
+        if not bodies:
+            QMessageBox.warning(self, "Dose workbook target", "No BODY definitions are available in the current geometry.")
+            return None
+        existing = dict(existing or {})
+        sposit = self._source_position_cm()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Dose Workbook Target")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(680)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "Choose the target BODY used to calculate the workbook distance column `R (m)`.\n"
+            "Direct distance uses the BODY center and SPOSIT. Linear distance uses one chosen axis only."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"]))
+        lay.addWidget(intro)
+
+        form = QFormLayout()
+        cmb_body = QComboBox()
+        cmb_body.setStyleSheet(combo_dropdown_css())
+        for body_info in bodies:
+            cmb_body.addItem(body_info["display"], body_info)
+        form.addRow("Target BODY:", cmb_body)
+
+        cmb_mode = QComboBox()
+        cmb_mode.setStyleSheet(combo_css())
+        cmb_mode.addItem("Direct distance (SPOSIT to BODY center)", "direct")
+        cmb_mode.addItem("Linear distance (axis-aligned)", "linear")
+        form.addRow("Distance mode:", cmb_mode)
+
+        cmb_axis = QComboBox()
+        cmb_axis.setStyleSheet(combo_css())
+        cmb_axis.addItems(["X", "Y", "Z"])
+        form.addRow("Linear axis:", cmb_axis)
+        lay.addLayout(form)
+
+        lbl_preview = QLabel("")
+        lbl_preview.setWordWrap(True)
+        lbl_preview.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(lbl_preview)
+
+        def refresh_preview():
+            body_info = cmb_body.currentData() or {}
+            body_id = body_info.get("id")
+            center = self._body_center_cm(body_id)
+            mode = str(cmb_mode.currentData() or "direct")
+            axis = cmb_axis.currentText().strip().upper() or "Z"
+            cmb_axis.setEnabled(mode == "linear")
+            if not sposit or center is None:
+                preview = f"SPOSIT: {sposit or 'unavailable'}\nBODY center: {center or 'unavailable'}\nR preview: unavailable"
+            else:
+                if mode == "linear":
+                    axis_idx = {"X": 0, "Y": 1, "Z": 2}[axis]
+                    value = abs(float(center[axis_idx]) - float(sposit[axis_idx])) / 100.0
+                    preview = (
+                        f"SPOSIT: ({sposit[0]:.2f}, {sposit[1]:.2f}, {sposit[2]:.2f}) cm\n"
+                        f"BODY center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) cm\n"
+                        f"R ({axis}-axis): {value:.6f} m"
+                    )
+                else:
+                    value = math.sqrt(sum((float(center[i]) - float(sposit[i])) ** 2 for i in range(3))) / 100.0
+                    preview = (
+                        f"SPOSIT: ({sposit[0]:.2f}, {sposit[1]:.2f}, {sposit[2]:.2f}) cm\n"
+                        f"BODY center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) cm\n"
+                        f"R (direct): {value:.6f} m"
+                    )
+            lbl_preview.setText(preview)
+
+        default_body_id = existing.get("target_body_id")
+        if default_body_id is not None:
+            for i in range(cmb_body.count()):
+                data = cmb_body.itemData(i) or {}
+                if data.get("id") == default_body_id:
+                    cmb_body.setCurrentIndex(i)
+                    break
+        default_mode = str(existing.get("distance_mode") or "direct")
+        cmb_mode.setCurrentIndex(1 if default_mode == "linear" else 0)
+        default_axis = str(existing.get("linear_axis") or "Z").upper()
+        axis_idx = cmb_axis.findText(default_axis)
+        if axis_idx >= 0:
+            cmb_axis.setCurrentIndex(axis_idx)
+
+        cmb_body.currentIndexChanged.connect(lambda _i: refresh_preview())
+        cmb_mode.currentIndexChanged.connect(lambda _i: refresh_preview())
+        cmb_axis.currentIndexChanged.connect(lambda _i: refresh_preview())
+        refresh_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        lay.addWidget(buttons)
+        if not dlg.exec():
+            return None
+        body_info = cmb_body.currentData() or {}
+        return {
+            "target_body_id": int(body_info["id"]),
+            "target_body_label": str(body_info["label"]),
+            "distance_mode": str(cmb_mode.currentData() or "direct"),
+            "linear_axis": str(cmb_axis.currentText().strip().upper() or "Z"),
+        }
+
+    def _distance_r_m(self, config):
+        config = config or self._dose_workbook_config or {}
+        if not config:
+            return ""
+        sposit = self._source_position_cm()
+        center = self._body_center_cm(config.get("target_body_id"))
+        if not sposit or center is None:
+            return ""
+        mode = str(config.get("distance_mode") or "direct").lower()
+        if mode == "linear":
+            axis = str(config.get("linear_axis") or "Z").upper()
+            axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(axis, 2)
+            return abs(float(center[axis_idx]) - float(sposit[axis_idx])) / 100.0
+        return math.sqrt(sum((float(center[i]) - float(sposit[i])) ** 2 for i in range(3))) / 100.0
+
     def _load_openpyxl(self):
         try:
             import openpyxl
@@ -28627,8 +29556,11 @@ class AnalysisTab(QWidget):
             path = (self._workspace or Path.cwd()) / "dose_analysis.xlsx"
             self._dose_xlsx = path
             self._dose_xlsx_user_selected = False
-            self.lbl_dose_xlsx.setText(f"Dose workbook: {path} (will be created on append)")
+            self._dose_workbook_config = None
+            self._update_dose_xlsx_label("will be created on append")
             self._log_analysis(f"Dose workbook not set; defaulting to: {path}", "info")
+        else:
+            self._dose_xlsx = path
         if path.exists():
             wb = openpyxl.load_workbook(path)
             ws = wb.active
@@ -28641,6 +29573,24 @@ class AnalysisTab(QWidget):
         changed = self._normalize_dose_sheet_headers(ws)
         if changed:
             self._log_analysis("Dose workbook headers were inserted/updated.", "warn")
+        config = self._read_dose_workbook_config(wb)
+        if config is None:
+            config = self._dose_workbook_config or self._prompt_dose_workbook_config()
+            if config is None:
+                self._log_analysis("Dose workbook setup canceled: target BODY / R configuration is required.", "warn")
+                return None, None
+            self._write_dose_workbook_config(wb, config)
+            self._log_analysis(
+                f"Dose workbook target configured: {self._dose_workbook_config_summary(config)}.",
+                "info",
+            )
+        else:
+            self._log_analysis(
+                f"Dose workbook target loaded: {self._dose_workbook_config_summary(config)}.",
+                "info",
+            )
+        self._dose_workbook_config = config
+        self._update_dose_xlsx_label("existing" if path.exists() else "will be created on append")
         return wb, ws
 
     def _normalize_dose_sheet_headers(self, ws):
@@ -28684,6 +29634,7 @@ class AnalysisTab(QWidget):
     def _apply_dose_number_formats(self, ws):
         headers = self._dose_header_map(ws)
         scientific_headers = (
+            "R (m)",
             "Edep (eV)",
             "dE (eV)",
             "Edep (J)",
@@ -28693,8 +29644,6 @@ class AnalysisTab(QWidget):
             "dDose (Gy)",
             "Dose (eV/g)",
             "dDose (eV/g)",
-            "Source-Origin/Wall Distance (m)",
-            "Source-Body Distance (m)",
             "NSIMSH @5%",
             "Time @5% (s)",
         )
@@ -28761,16 +29710,8 @@ class AnalysisTab(QWidget):
         ws.freeze_panes = "A2"
 
     def _dose_rows_for_current_results(self):
-        case, distance, thickness = self._case_metadata()
-        id_meta = self._workspace_id_metadata(case)
-        if id_meta.get("pd_m") is not None:
-            distance = id_meta["pd_m"]
-            source_origin_distance = id_meta["pd_m"]
-        else:
-            source_origin_distance = self._source_origin_distance_m()
-        if id_meta.get("wt_cm") is not None:
-            thickness = id_meta["wt_cm"]
-        fixed_source_body_distance = id_meta.get("source_body_m")
+        case = self._workspace.name if self._workspace else ""
+        r_value = self._distance_r_m(self._dose_workbook_config)
         total_edep = 0.0
         total_dedep_sq = 0.0
         total_mass = 0.0
@@ -28786,20 +29727,13 @@ class AnalysisTab(QWidget):
                 total_mass += float(mass)
             error_ref = result.get("error", "")
             edep_ref = result.get("edep", 0.0)
-            if fixed_source_body_distance is not None:
-                source_body_distance = fixed_source_body_distance
-            else:
-                source_body_distance = self._source_body_distance_m(result.get("geo_body_id", result.get("body_id")))
             n_ref, t_ref = self._reference_display_values()
             target_err, n_target, t_target = self._prediction_values(error_ref, edep_ref)
             edep_j = result["edep"] * self.EV_TO_J
             dedep_j = result["dedep"] * self.EV_TO_J
             rows.append([
                 case,
-                distance,
-                source_origin_distance,
-                source_body_distance,
-                thickness,
+                r_value,
                 f"Body {result['body_id']}",
                 result["component"],
                 result["edep"],
@@ -28836,10 +29770,7 @@ class AnalysisTab(QWidget):
         total_dedep_j = total_dedep * self.EV_TO_J
         rows.append([
             case,
-            distance,
-            source_origin_distance,
-            fixed_source_body_distance if fixed_source_body_distance is not None else "",
-            thickness,
+            r_value,
             "TOTAL",
             "Total Dosage",
             total_edep,
@@ -28876,9 +29807,10 @@ class AnalysisTab(QWidget):
 
     def _remove_total_rows_from_sheet(self, ws):
         removed = 0
+        body_col = self._dose_body_column_index() + 1
         row = ws.max_row
         while row >= 2:
-            if str(ws.cell(row, 6).value or "").upper() == "TOTAL":
+            if str(ws.cell(row, body_col).value or "").upper() == "TOTAL":
                 ws.delete_rows(row, 1)
                 removed += 1
             row -= 1
@@ -28919,10 +29851,12 @@ class AnalysisTab(QWidget):
             ws.append(row)
 
     def _body_rows_only(self, rows):
-        return [row for row in rows if not (len(row) > 5 and str(row[5]).upper() == "TOTAL")]
+        idx = self._dose_body_column_index()
+        return [row for row in rows if not (len(row) > idx and str(row[idx]).upper() == "TOTAL")]
 
     def _total_rows_only(self, rows):
-        return [row for row in rows if len(row) > 5 and str(row[5]).upper() == "TOTAL"]
+        idx = self._dose_body_column_index()
+        return [row for row in rows if len(row) > idx and str(row[idx]).upper() == "TOTAL"]
 
     def _sync_totals_sheet(self, wb, rows):
         ws = wb["TOTALS"] if "TOTALS" in wb.sheetnames else wb.create_sheet("TOTALS")
@@ -29750,7 +30684,7 @@ class AnalysisTab(QWidget):
             self._log_analysis(f"Append failed: workbook is open -> {self._dose_xlsx}", "err")
             QMessageBox.warning(self, "Workbook open", "Close the Excel workbook before appending rows.")
             return
-        self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx}")
+        self._update_dose_xlsx_label("existing")
         self.status_message.emit(f"Appended dose rows {start_row}-{ws.max_row}")
         self._log_analysis(
             f"Append complete: {len(body_rows)} body row(s) saved to main sheet; total row synced to TOTALS in {self._dose_xlsx}",
@@ -30971,14 +31905,23 @@ class AnalysisTab(QWidget):
         archived = self._archive_previous_multi_appends(root, xlsx_path)
         if archived:
             self._log_analysis(f"Archived {archived} previous multi append workbook(s) to 'old appends'.", "info")
+        previous_workspace = self._workspace
+        if not xlsx_path.exists() and self._dose_workbook_config is None and workspaces:
+            preview_folder = workspaces[0]
+            try:
+                self._workspace = preview_folder
+                self._load_geo_context(preview_folder)
+            except Exception as exc:
+                self._log_analysis(f"Could not preload geometry for dose workbook target selection: {exc}", "warn")
         wb, ws = self._ensure_dose_workbook(xlsx_path)
         if wb is None:
             self._log_analysis("Multi Append canceled: workbook is unavailable.", "err")
+            if previous_workspace and previous_workspace.exists():
+                self._workspace = previous_workspace
             return
-        previous_workspace = self._workspace
         self._dose_xlsx = xlsx_path
         self._dose_xlsx_user_selected = True
-        self.lbl_dose_xlsx.setText(f"Dose workbook: {xlsx_path} (multi append)")
+        self._update_dose_xlsx_label("multi append")
         processed = 0
         replaced_rows = 0
         grouped_rows = 0
@@ -31039,7 +31982,7 @@ class AnalysisTab(QWidget):
                 self.lbl_workspace.setText(f"Case: {self._workspace}")
             self._dose_xlsx = xlsx_path
             self._dose_xlsx_user_selected = True
-            self.lbl_dose_xlsx.setText(f"Dose workbook: {xlsx_path} (locked)")
+            self._update_dose_xlsx_label("locked")
         msg = f"Updated {processed} case(s) in:\n{xlsx_path}\n\nReplaced {replaced_rows} existing main-sheet row(s)."
         if group_sheets:
             msg += "\n\nGrouped sheets:\n" + "\n".join(sorted(group_sheets))
@@ -31551,8 +32494,9 @@ class PenelopeStudio(QMainWindow):
             if suffix == ".xlsx":
                 self.analysis_tab._dose_xlsx = path
                 self.analysis_tab._dose_xlsx_user_selected = True
+                self.analysis_tab._dose_workbook_config = None
                 if hasattr(self.analysis_tab, "lbl_dose_xlsx"):
-                    self.analysis_tab.lbl_dose_xlsx.setText(f"Dose workbook: {path} (project)")
+                    self.analysis_tab._update_dose_xlsx_label("project")
                 self.tabs.setCurrentIndex(2)
                 return
         except Exception as exc:
@@ -32852,8 +33796,9 @@ class PenelopeStudio(QMainWindow):
                 if candidate.exists():
                     self.analysis_tab._dose_xlsx = candidate
                     self.analysis_tab._dose_xlsx_user_selected = False
+                    self.analysis_tab._dose_workbook_config = None
                     if hasattr(self.analysis_tab, "lbl_dose_xlsx"):
-                        self.analysis_tab.lbl_dose_xlsx.setText(f"Dose workbook: {candidate} (auto)")
+                        self.analysis_tab._update_dose_xlsx_label("auto")
                     break
 
         self.analysis_tab._open_risk_assessment(
