@@ -617,7 +617,7 @@ DEFAULT_IN_TEMPLATE = """TITLE
        .
        >>>>>>>> Material data and simulation parameters.
        .
-       >>>>>>>> Geometry definition file.
+       >>>>>>>> Geometry and local simulation parameters.
        .
        >>>>>>>> Interaction forcing.
 IFORCE 1 1 4  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]
@@ -650,6 +650,111 @@ TIME   2e9                         [Allotted simulation time, in sec]
        .
 END      
 """
+
+SIM_SECTION_SPECS = [
+    {
+        "key": "source",
+        "title": "Source definition",
+        "aliases": ("source definition",),
+        "required": True,
+        "description": (
+            "Define the primary source: particle kind, monoenergetic or spectral energy, "
+            "source position, and beam angular definition. In penmain this is the core "
+            "source block controlled mainly by SKPAR, SENERG/SPECTR, SPOSIT, and SCONE."
+        ),
+    },
+    {
+        "key": "psf",
+        "title": "Input phase-space file (psf)",
+        "aliases": ("input phase-space file", "phase-space file"),
+        "required": False,
+        "description": (
+            "Feed primaries from a previously generated phase-space file. This block uses "
+            "IPSFN plus optional IPSPLI, WGTWIN, and EPMAX controls."
+        ),
+    },
+    {
+        "key": "materials",
+        "title": "Material data and simulation parameters",
+        "aliases": ("material data and simulation parameters",),
+        "required": True,
+        "description": (
+            "Declare MFNAME and MSIMPA entries. Material numbering follows the order of "
+            "the list and is used by the geometry."
+        ),
+    },
+    {
+        "key": "geometry",
+        "title": "Geometry and local simulation parameters",
+        "aliases": ("geometry and local simulation parameters", "geometry definition file"),
+        "required": True,
+        "description": (
+            "Link the pengeom .geo file and any local transport controls such as DSMAX and "
+            "EABSB for selected bodies."
+        ),
+    },
+    {
+        "key": "interaction",
+        "title": "Interaction forcing",
+        "aliases": ("interaction forcing",),
+        "required": False,
+        "description": (
+            "Variance-reduction block for IFORCE. It should be used carefully and only where "
+            "a clear efficiency gain is expected."
+        ),
+    },
+    {
+        "key": "emerging",
+        "title": "Emerging particles",
+        "aliases": ("emerging particles",),
+        "required": False,
+        "description": (
+            "Tallies energy and angular distributions of particles emerging from the system, "
+            "mainly through NBE and NBANGL."
+        ),
+    },
+    {
+        "key": "impact",
+        "title": "Impact detectors",
+        "aliases": ("impact detectors",),
+        "required": False,
+        "description": (
+            "Define up to 25 impact detectors with IMPDET and their associated IDBODY, "
+            "IDSPC, IDPSF, IDFLNC, and IDKPAR lines."
+        ),
+    },
+    {
+        "key": "endet",
+        "title": "Energy-deposition detectors",
+        "aliases": ("energy deposition detectors",),
+        "required": False,
+        "description": (
+            "Define absorbed-energy detectors with ENDETC, EDSPC, and EDBODY for selected "
+            "bodies."
+        ),
+    },
+    {
+        "key": "dose",
+        "title": "Dose distribution",
+        "aliases": ("dose distribution", "absorbed dose distributions"),
+        "required": False,
+        "description": (
+            "Set the 3D dose box with GRIDX, GRIDY, GRIDZ, and GRIDBN. The tally is done "
+            "on a uniform orthogonal grid inside a user-defined parallelepiped."
+        ),
+    },
+    {
+        "key": "job",
+        "title": "Job properties",
+        "aliases": ("job properties",),
+        "required": True,
+        "description": (
+            "Resume and dump controls plus run-level job settings such as RESUME, DUMPTO, "
+            "DUMPP, RSEED, NSIMSH, TIME, and END."
+        ),
+    },
+]
+SIM_SECTION_SPEC_MAP = {spec["key"]: spec for spec in SIM_SECTION_SPECS}
 
 # PENELOPE/RANECU seed limits used by penmain input RSEED.
 PENELOPE_ISEED1_MAX = 2147483562
@@ -856,6 +961,53 @@ def _geo_axis_markers(surfaces):
             axis, coeff = non_zero[0]
             markers[axis].append(-a0 / coeff)
     return markers
+
+
+def _geo_body_axis_bounds(body, surfaces):
+    """Best-effort axis-aligned bounds for one BODY from raw .geo data."""
+    if not body or not surfaces:
+        return None
+    axis_planes = {"X": [], "Y": [], "Z": []}
+    shape_bounds = {"X": [], "Y": [], "Z": []}
+    for sid, _side in body.get("surfaces", []):
+        surf = surfaces.get(sid)
+        if not surf:
+            continue
+        p = surf.get("params", {})
+        coeffs = [("X", p.get("AX", 0.0)), ("Y", p.get("AY", 0.0)), ("Z", p.get("AZ", 0.0))]
+        nonzero = [(axis, coeff) for axis, coeff in coeffs if abs(coeff or 0.0) > 1e-12]
+        if len(nonzero) == 1 and "A0" in p:
+            axis, coeff = nonzero[0]
+            axis_planes[axis].append(-p["A0"] / coeff)
+        for axis in ("X", "Y", "Z"):
+            scale_key = f"{axis}-SCALE"
+            shift_key = f"{axis}-SHIFT"
+            if scale_key in p:
+                scale = abs(p.get(scale_key, 0.0) or 0.0)
+                shift = p.get(shift_key, 0.0) or 0.0
+                if scale > 0:
+                    shape_bounds[axis].append((shift - scale, shift + scale))
+    global_markers = _geo_axis_markers(surfaces)
+    global_bounds = _geo_axis_bounds(surfaces)
+    bounds = {}
+    for axis in ("X", "Y", "Z"):
+        if len(axis_planes[axis]) >= 2:
+            bounds[axis] = (min(axis_planes[axis]), max(axis_planes[axis]))
+        elif shape_bounds[axis]:
+            lows = [lo for lo, _hi in shape_bounds[axis]]
+            highs = [hi for _lo, hi in shape_bounds[axis]]
+            bounds[axis] = (min(lows), max(highs))
+        elif len(global_markers[axis]) >= 2:
+            bounds[axis] = (min(global_markers[axis]), max(global_markers[axis]))
+        else:
+            gb = global_bounds[axis]
+            if gb["low"] is not None and gb["high"] is not None:
+                bounds[axis] = (gb["low"], gb["high"])
+            else:
+                return None
+        if abs(bounds[axis][1] - bounds[axis][0]) < 1e-12:
+            return None
+    return bounds
 
 
 def _linked_rep_candidates_for_geo(geo_path):
@@ -1099,6 +1251,15 @@ def apply_global_tooltip_style():
     pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#000000"))
     QToolTip.setPalette(pal)
 
+
+def show_uniform_tooltip(global_pos, text, anchor=None):
+    apply_global_tooltip_style()
+    QToolTip.showText(global_pos, text, anchor)
+
+
+def hide_uniform_tooltip():
+    QToolTip.hideText()
+
 _GLOBAL_TOOLTIP_FILTER = None
 
 class UnifiedTooltipEventFilter(QObject):
@@ -1134,9 +1295,9 @@ class UnifiedTooltipEventFilter(QObject):
                 text = str(tip)
                 anchor = obj
         if text:
-            QToolTip.showText(global_pos, text, anchor)
+            show_uniform_tooltip(global_pos, text, anchor)
             return True
-        QToolTip.hideText()
+        hide_uniform_tooltip()
         return False
 
 def install_global_tooltip_filter():
@@ -1910,17 +2071,17 @@ class GutterEditor(QPlainTextEdit):
                 tip = ""
             if tip:
                 if tip != self._last_hover_preview:
-                    QToolTip.showText(ev.globalPosition().toPoint(), tip, self.viewport())
+                    show_uniform_tooltip(ev.globalPosition().toPoint(), tip, self.viewport())
                     self._last_hover_preview = tip
             elif self._last_hover_preview:
-                QToolTip.hideText()
+                hide_uniform_tooltip()
                 self._last_hover_preview = ""
         self._update_ctrl_click_cursor(_pt, ev.modifiers())
         super().mouseMoveEvent(ev)
 
     def leaveEvent(self, ev):
         if self._last_hover_preview:
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             self._last_hover_preview = ""
         self.viewport().unsetCursor()
         super().leaveEvent(ev)
@@ -2262,7 +2423,7 @@ class GutterEditor(QPlainTextEdit):
     def _on_popup_item_hovered(self, item):
         tip = item.toolTip() if item else ""
         if tip:
-            QToolTip.showText(QCursor.pos(), tip, self._popup)
+            show_uniform_tooltip(QCursor.pos(), tip, self._popup)
 
     def _accept_popup(self, item):
         self._popup.hide()
@@ -8637,7 +8798,7 @@ class GeometryTab(QWidget):
                 self._handle_body_block_hover(event.position().toPoint())
                 return False          # let the list widget process the event too
             if etype in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
-                QToolTip.hideText()
+                hide_uniform_tooltip()
         return super().eventFilter(obj, event)
 
     def _handle_body_block_hover(self, pos):
@@ -8649,19 +8810,19 @@ class GeometryTab(QWidget):
         """
         item = self.lst_body_blocks.itemAt(pos)
         if item is None:
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             return
         payload = item.data(Qt.ItemDataRole.UserRole)
         if not payload or payload.get("type") != "block":
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             return
         block_row = payload.get("block_row", -1)
         if not (0 <= block_row < len(self._geo_blocks)):
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             return
         block_text = (self._geo_blocks[block_row] or "").strip()
         if not block_text:
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             return
 
         # Measure the pixel width of the ID part of the item text.
@@ -8679,9 +8840,9 @@ class GeometryTab(QWidget):
 
         if x_in_item <= id_end_px:
             global_pos = self.lst_body_blocks.viewport().mapToGlobal(pos)
-            QToolTip.showText(global_pos, block_text, self.lst_body_blocks.viewport())
+            show_uniform_tooltip(global_pos, block_text, self.lst_body_blocks.viewport())
         else:
-            QToolTip.hideText()
+            hide_uniform_tooltip()
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -17027,6 +17188,7 @@ def _prepare_saved_sim_state_snapshot(state_path):
         parts.append(f"{len(finished_runs)} finished run record(s)")
     payload["parts"] = parts
     payload["batch_total"] = int(state.get("batch_total", len(queue)) or 0)
+    payload["use_dmp"] = bool(state.get("use_dmp", False))
     return payload
 
 
@@ -17126,6 +17288,11 @@ class SimulationTab(QWidget):
         self._geo_list_folder = None
         self._mat_list_folder = None
         self._instructions_root = None
+        self._staged_in_text = None
+        self._staged_in_path = None
+        self._staged_geo_list_folder = None
+        self._staged_mat_list_folder = None
+        self._staged_update_callback = None
         self._global_executables = {
             "gview2d": "",
             "gview3d": "",
@@ -17491,98 +17658,7 @@ class SimulationTab(QWidget):
         rl.addLayout(source_row)
 
         rl.addWidget(self._separator_line())
-
-        # Source section
-        rl.addWidget(QLabel("- Source", styleSheet=label_css(P["fg2"])))
-        self.btn_particle_source = QPushButton("Add Particle")
-        self.btn_particle_source.setToolTip("Add or edit SKPAR, SENERG, SPOSIT and SCONE in the Source definition section.")
-        self.btn_particle_source.setStyleSheet(btn_css(width=220))
-        self.btn_particle_source.clicked.connect(self._cmd_particle_source)
-        rl.addWidget(self.btn_particle_source)
-        self.btn_create_spectrum = QPushButton("Add/Edit Spectrum")
-        self.btn_create_spectrum.setToolTip("Create or update a named spectrum in the local spectrum database.")
-        self.btn_create_spectrum.setStyleSheet(btn_css(width=220))
-        self.btn_create_spectrum.clicked.connect(self._cmd_create_spectrum)
-        rl.addWidget(self.btn_create_spectrum)
-
-        rl.addWidget(self._separator_line())
-
-        # Materials section
-        rl.addWidget(QLabel("- Materials", styleSheet=label_css(P["fg2"])))
-        for text, tip, slot in [
-            ("Add/Edit Materials", "manage MFNAME + MSIMPA order and values", self._cmd_edit_materials),
-            ("Remove Material",   "by filename",     self._cmd_remove_material),
-        ]:
-            b = QPushButton(text)
-            b.setToolTip(tip)
-            b.setStyleSheet(btn_css(width=220))
-            b.clicked.connect(slot)
-            rl.addWidget(b)
-
-        rl.addWidget(self._separator_line())
-
-        # Geometry section
-        rl.addWidget(QLabel("- Geometry & Run", styleSheet=label_css(P["fg2"])))
-        for text, tip, slot in [
-            ("Set Geometry File", "GEOMFN",  self._cmd_geomfn),
-            ("ADD IMPDET",        "IMPDET",  self._cmd_add_impdet),
-            ("Set Sim Showers",   "NSIMSH",  self._cmd_nsimsh),
-            ("Set Time Limit",    "TIME",    self._cmd_time),
-        ]:
-            b = QPushButton(text)
-            b.setToolTip(tip)
-            b.setStyleSheet(btn_css(width=220))
-            b.clicked.connect(slot)
-            rl.addWidget(b)
-
-        self.chk_interaction_forcing = QCheckBox("Interaction forcing")
-        self.chk_interaction_forcing.setToolTip("Add/remove the default IFORCE section.")
-        self.chk_interaction_forcing.setStyleSheet(checkbox_css())
-        self.chk_interaction_forcing.toggled.connect(self._set_interaction_forcing_enabled)
-        rl.addWidget(self.chk_interaction_forcing)
-
-        self.chk_emerging_particles = QCheckBox("Emerging particles")
-        self.chk_emerging_particles.setToolTip("Add/remove NBE and NBANGL section.")
-        self.chk_emerging_particles.setStyleSheet(checkbox_css())
-        self.chk_emerging_particles.toggled.connect(self._set_emerging_particles_enabled)
-        rl.addWidget(self.chk_emerging_particles)
-
-        self.chk_impact_detectors = QCheckBox("Impact detectors")
-        self.chk_impact_detectors.setToolTip("Add/remove the impact-detector section. Turning on creates a default detector for body 1.")
-        self.chk_impact_detectors.setStyleSheet(checkbox_css())
-        self.chk_impact_detectors.toggled.connect(self._set_impact_detectors_enabled)
-        rl.addWidget(self.chk_impact_detectors)
-
-        self.btn_add_endetc = QPushButton("Add EDep Detector")
-        self.btn_add_endetc.setToolTip("Add or edit an ENDETC/EDSPC/EDBODY detector entry.")
-        self.btn_add_endetc.setStyleSheet(btn_css(width=220))
-        self.btn_add_endetc.clicked.connect(self._cmd_add_endetc)
-        rl.addWidget(self.btn_add_endetc)
-
-        self.chk_energy_deposition = QCheckBox("Energy deposition detectors")
-        self.chk_energy_deposition.setToolTip("Add/remove the ENDETC dose-spectrum detector section.")
-        self.chk_energy_deposition.setStyleSheet(checkbox_css())
-        self.chk_energy_deposition.toggled.connect(self._set_energy_deposition_enabled)
-        rl.addWidget(self.chk_energy_deposition)
-
-        self.btn_dose_distribution = QPushButton("Dose Distribution")
-        self.btn_dose_distribution.setToolTip("Set the GRIDX/GRIDY/GRIDZ/GRIDBN dose box with geometry-based defaults.")
-        self.btn_dose_distribution.setStyleSheet(btn_css(width=220))
-        self.btn_dose_distribution.clicked.connect(self._cmd_dose_distribution)
-        rl.addWidget(self.btn_dose_distribution)
-
-        self.chk_dose_distribution = QCheckBox("Dose distribution")
-        self.chk_dose_distribution.setToolTip("Add/remove the 3D absorbed dose box section controlled by GRIDX/GRIDY/GRIDZ/GRIDBN.")
-        self.chk_dose_distribution.setStyleSheet(checkbox_css())
-        self.chk_dose_distribution.toggled.connect(self._set_dose_distribution_enabled)
-        rl.addWidget(self.chk_dose_distribution)
-
-        self.chk_job_properties = QCheckBox("Job properties")
-        self.chk_job_properties.setToolTip("Add/remove RESUME, DUMPTO and DUMPP section before NSIMSH.")
-        self.chk_job_properties.setStyleSheet(checkbox_css())
-        self.chk_job_properties.toggled.connect(self._set_job_properties_enabled)
-        rl.addWidget(self.chk_job_properties)
-
+        rl.addWidget(self._build_sim_section_sidebar())
         rl.addWidget(self._separator_line())
 
         # Case section
@@ -17623,23 +17699,23 @@ class SimulationTab(QWidget):
         create_workspace_btn.setStyleSheet(btn_css(width=136))
         create_workspace_btn.clicked.connect(self._create_case_workspace)
         workspace_row.addWidget(create_workspace_btn)
-        duplicate_case_btn = QToolButton()
-        duplicate_case_btn.setText("Duplicate")
-        duplicate_case_btn.setToolTip("Duplicate a previously created case or batch using the same case editor with optional changes.")
-        duplicate_case_btn.setStyleSheet(
+        edit_case_btn = QToolButton()
+        edit_case_btn.setText("Edit")
+        edit_case_btn.setToolTip("Edit a previously created case or batch by PENELOPE input blocks, either in place or as a duplicated copy with changes.")
+        edit_case_btn.setStyleSheet(
             f"QToolButton {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; padding:6px 12px; }}"
             f"QToolButton:hover {{ background:{P['bg3']}; border-color:{P['accent']}; }}"
         )
-        duplicate_case_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        duplicate_case_menu = QMenu(duplicate_case_btn)
-        duplicate_case_menu.setStyleSheet(
+        edit_case_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        edit_case_menu = QMenu(edit_case_btn)
+        edit_case_menu.setStyleSheet(
             f"QMenu {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; }}"
             f"QMenu::item:selected {{ background:{P['sel']}; }}"
         )
-        duplicate_case_menu.addAction("Duplicate Case...", self._duplicate_case_workspace)
-        duplicate_case_menu.addAction("Duplicate Batch...", self._duplicate_batch_workspace)
-        duplicate_case_btn.setMenu(duplicate_case_menu)
-        workspace_row.addWidget(duplicate_case_btn)
+        edit_case_menu.addAction("Edit Case...", self._edit_case_workspace)
+        edit_case_menu.addAction("Edit Batch...", self._edit_batch_workspace)
+        edit_case_btn.setMenu(edit_case_menu)
+        workspace_row.addWidget(edit_case_btn)
         split_runs_btn = QPushButton("Split Runs...")
         split_runs_btn.setToolTip("Create independent CPU split-run folders with unique RSEED values and optional batch queueing. This is not GPU offload.")
         split_runs_btn.setStyleSheet(btn_css(width=118))
@@ -17911,6 +17987,193 @@ class SimulationTab(QWidget):
         line.setStyleSheet(f"color:{P['border']};")
         return line
 
+    def _build_sim_section_sidebar(self):
+        self._sim_section_buttons = {}
+        self._sim_section_toggles = {}
+        group = QGroupBox("PENELOPE Input Blocks")
+        group.setToolTip("Manual-oriented control of the main penmain input-file sections.")
+        group.setStyleSheet(group_css())
+        lay = QVBoxLayout(group)
+        lay.setContentsMargins(8, 12, 8, 8)
+        lay.setSpacing(6)
+
+        hint = QLabel(
+            "Blocks are listed in the same penmain input order described in the manual. "
+            "Required blocks open their editor; optional blocks use one checkbox, and the block is only added if you confirm the setup."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=8))
+        lay.addWidget(hint)
+        for spec in SIM_SECTION_SPECS:
+            key = spec["key"]
+            if key == "psf":
+                continue
+            if spec.get("required"):
+                btn = QPushButton(spec["title"])
+                btn.setToolTip(spec["description"])
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                btn.setStyleSheet(btn_css())
+                btn.clicked.connect(lambda _checked=False, current_key=key: self._open_sim_section(current_key))
+                lay.addWidget(btn)
+                self._sim_section_buttons[key] = btn
+                self._sim_section_toggles[key] = None
+                if key == "source":
+                    self.btn_particle_source = btn
+                elif key == "materials":
+                    self.btn_materials_section = btn
+                elif key == "geometry":
+                    self.btn_geometry_section = btn
+                elif key == "job":
+                    self.btn_job_properties = btn
+            else:
+                chk = QCheckBox(spec["title"])
+                chk.setToolTip(spec["description"])
+                chk.setStyleSheet(checkbox_css())
+                chk.toggled.connect(lambda checked, current_key=key: self._handle_optional_sim_section_toggle(current_key, checked))
+                lay.addWidget(chk)
+                self._sim_section_buttons[key] = None
+                self._sim_section_toggles[key] = chk
+                if key == "interaction":
+                    self.chk_interaction_forcing = chk
+                elif key == "emerging":
+                    self.chk_emerging_particles = chk
+                elif key == "impact":
+                    self.chk_impact_detectors = chk
+                elif key == "endet":
+                    self.chk_energy_deposition = chk
+                elif key == "dose":
+                    self.chk_dose_distribution = chk
+                elif key == "psf":
+                    self.chk_psf_section = chk
+
+        return group
+
+    def _sim_section_title_matches(self, key, line):
+        spec = SIM_SECTION_SPEC_MAP.get(key, {})
+        low = str(line or "").strip().lower()
+        if not low:
+            return False
+        return any(alias in low for alias in spec.get("aliases", ()))
+
+    def _has_psf_section(self):
+        text = self._get_text()
+        if re.search(r"^\s*(IPSFN|IPSPLI|WGTWIN|EPMAX)\b", text, re.IGNORECASE | re.MULTILINE):
+            return True
+        return any(self._sim_section_title_matches("psf", line) for line in text.split("\n"))
+
+    def _sim_section_is_present(self, key):
+        if key == "source":
+            return True
+        if key == "psf":
+            return self._has_psf_section()
+        if key == "materials":
+            return True
+        if key == "geometry":
+            return True
+        if key == "interaction":
+            return self._has_interaction_forcing()
+        if key == "emerging":
+            return self._has_emerging_particles()
+        if key == "impact":
+            return self._has_impact_detectors()
+        if key == "endet":
+            return self._has_energy_deposition_detectors()
+        if key == "dose":
+            return self._has_dose_distribution()
+        if key == "job":
+            return self._has_job_properties_section()
+        return False
+
+    def _set_sim_section_enabled(self, key, enabled):
+        if key == "psf":
+            self._set_psf_section_enabled(enabled)
+        elif key == "interaction":
+            self._set_interaction_forcing_enabled(enabled)
+        elif key == "emerging":
+            self._set_emerging_particles_enabled(enabled)
+        elif key == "impact":
+            self._set_impact_detectors_enabled(enabled)
+        elif key == "endet":
+            self._set_energy_deposition_enabled(enabled)
+        elif key == "dose":
+            self._set_dose_distribution_enabled(enabled)
+        elif key == "job":
+            self._set_job_properties_enabled(enabled)
+
+    def _handle_optional_sim_section_toggle(self, key, checked):
+        if checked:
+            if key == "interaction":
+                choice = QMessageBox.question(
+                    self,
+                    "Interaction forcing",
+                    "Add the Interaction forcing block with the current Studio default values?",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok,
+                )
+                if choice == QMessageBox.StandardButton.Ok:
+                    self._set_interaction_forcing_enabled(True)
+            elif key == "emerging":
+                choice = QMessageBox.question(
+                    self,
+                    "Emerging particles",
+                    "Add the Emerging particles block with the current Studio default values?",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok,
+                )
+                if choice == QMessageBox.StandardButton.Ok:
+                    self._set_emerging_particles_enabled(True)
+            else:
+                self._open_sim_section(key)
+            if not self._sim_section_is_present(key):
+                toggle = self._sim_section_toggles.get(key)
+                if toggle is not None:
+                    toggle.blockSignals(True)
+                    toggle.setChecked(False)
+                    toggle.blockSignals(False)
+        else:
+            self._set_sim_section_enabled(key, False)
+
+    def _open_sim_section(self, key):
+        if key == "source":
+            self._cmd_particle_source()
+        elif key == "psf":
+            self._cmd_particle_source()
+        elif key == "materials":
+            self._cmd_edit_materials()
+        elif key == "geometry":
+            self._cmd_geomfn()
+        elif key == "interaction":
+            self._set_interaction_forcing_enabled(True)
+        elif key == "emerging":
+            self._set_emerging_particles_enabled(True)
+        elif key == "impact":
+            self._cmd_add_impdet()
+        elif key == "endet":
+            self._cmd_add_endetc()
+        elif key == "dose":
+            self._cmd_dose_distribution()
+        elif key == "job":
+            self._cmd_job_properties()
+
+    def _update_sim_section_sidebar(self):
+        buttons = getattr(self, "_sim_section_buttons", {})
+        toggles = getattr(self, "_sim_section_toggles", {})
+        if not buttons or not toggles:
+            return
+        for spec in SIM_SECTION_SPECS:
+            key = spec["key"]
+            present = self._sim_section_is_present(key)
+            required = bool(spec.get("required"))
+            btn = buttons.get(key)
+            toggle = toggles.get(key)
+            if btn is not None:
+                btn.setStyleSheet(btn_css(P["bg3"] if present else P["bg2"]))
+            if toggle is not None:
+                toggle.blockSignals(True)
+                toggle.setChecked(present)
+                toggle.setStyleSheet(checkbox_css())
+                toggle.blockSignals(False)
+
     #  File ops 
 
     def _new_in(self):
@@ -18005,7 +18268,7 @@ class SimulationTab(QWidget):
                 return "psf"
             if "material data" in title:
                 return "materials"
-            if "geometry definition" in title:
+            if "geometry definition" in title or "geometry and local simulation parameters" in title:
                 return "geometry"
             if "interaction forcing" in title:
                 return "forcing"
@@ -18221,12 +18484,22 @@ class SimulationTab(QWidget):
     #  Smart-edit helpers 
 
     def _get_text(self):
+        if self._staged_in_text is not None:
+            return str(self._staged_in_text)
         return self.editor.toPlainText()
 
     def has_unsaved_changes(self):
         return self.editor.document().isModified()
 
     def _set_text(self, text):
+        if self._staged_in_text is not None:
+            self._staged_in_text = str(text or "")
+            if callable(self._staged_update_callback):
+                try:
+                    self._staged_update_callback()
+                except Exception:
+                    pass
+            return
         cur_pos = self.editor.textCursor().position()
         self.editor.setPlainText(text)
         cur = self.editor.textCursor()
@@ -18234,6 +18507,11 @@ class SimulationTab(QWidget):
         self.editor.setTextCursor(cur)
 
     def _in_folder(self):
+        if self._staged_in_path:
+            try:
+                return Path(self._staged_in_path).parent
+            except Exception:
+                pass
         if self._in_path:
             return Path(self._in_path).parent
         # No .in saved yet — prefer Documents, then cwd.
@@ -18244,6 +18522,25 @@ class SimulationTab(QWidget):
         except Exception:
             pass
         return Path.cwd()
+
+    def _begin_staged_in_edit_session(self, text, in_path, *, geo_folder=None, mat_folder=None, on_change=None):
+        self._staged_in_text = str(text or "")
+        self._staged_in_path = str(in_path) if in_path else ""
+        self._staged_geo_list_folder = str(geo_folder) if geo_folder else None
+        self._staged_mat_list_folder = str(mat_folder) if mat_folder else None
+        self._staged_update_callback = on_change
+        if callable(self._staged_update_callback):
+            try:
+                self._staged_update_callback()
+            except Exception:
+                pass
+
+    def _end_staged_in_edit_session(self):
+        self._staged_in_text = None
+        self._staged_in_path = None
+        self._staged_geo_list_folder = None
+        self._staged_mat_list_folder = None
+        self._staged_update_callback = None
 
     def _project_instructions_folder(self):
         """Return the project instructions folder path, or None if no project is active."""
@@ -18403,12 +18700,13 @@ class SimulationTab(QWidget):
             self.sim_blocks_section.setVisible(bool(visible))
 
     def _update_sim_action_labels(self):
-        if hasattr(self, "btn_particle_source"):
-            self.btn_particle_source.setText("Edit Particle" if self._has_source_keywords() else "Add Particle")
-        if hasattr(self, "chk_job_properties"):
-            self.chk_job_properties.blockSignals(True)
-            self.chk_job_properties.setChecked(self._has_job_properties_section())
-            self.chk_job_properties.blockSignals(False)
+        if self._staged_in_text is not None:
+            if callable(self._staged_update_callback):
+                try:
+                    self._staged_update_callback()
+                except Exception:
+                    pass
+            return
         if hasattr(self, "chk_impact_detectors"):
             self.chk_impact_detectors.blockSignals(True)
             self.chk_impact_detectors.setChecked(self._has_impact_detectors())
@@ -18430,6 +18728,7 @@ class SimulationTab(QWidget):
             self.chk_emerging_particles.setChecked(self._has_emerging_particles())
             self.chk_emerging_particles.blockSignals(False)
         self._refresh_sim_blocks()
+        self._update_sim_section_sidebar()
 
     def _tree_item(self, parent, title, value="", action="", payload=None):
         label = str(title) if value in ("", None) else f"{title}: {value}"
@@ -18514,7 +18813,7 @@ class SimulationTab(QWidget):
         else:
             self._tree_item(material_list, "No materials", "Add/Edit Materials", "materials")
 
-        geom_root = self._tree_item(None, ">>>>>>>> Geometry definition file.", "", "geometry")
+        geom_root = self._tree_item(None, ">>>>>>>> Geometry and local simulation parameters.", "", "geometry")
         self._tree_item(geom_root, "Geo file linked", self._current_geom_filename() or "(missing)", "geometry")
 
         if self._has_interaction_forcing():
@@ -18542,7 +18841,7 @@ class SimulationTab(QWidget):
             )
             self._tree_item(dose_root, "Dose box", summary, "dose")
         if self._has_job_properties_section():
-            job_root = self._tree_item(None, ">>>>>>>> Job properties", "", "job")
+            job_root = self._tree_item(None, ">>>>>>>> Job properties.", "", "job")
             self._tree_item(job_root, "Value", "dump filename and DUMPP", "job")
         nsim = re.search(r"^\s*(NSIMSH\b[^\n]*)", text, re.IGNORECASE | re.MULTILINE)
         time = re.search(r"^\s*(TIME\b[^\n]*)", text, re.IGNORECASE | re.MULTILINE)
@@ -18569,17 +18868,17 @@ class SimulationTab(QWidget):
 
     def _add_sim_block(self):
         menu = QMenu(self)
-        menu.addAction("Particle source", self._cmd_particle_source)
-        menu.addAction("Material", self._cmd_add_material)
-        menu.addAction("Geometry file", self._cmd_geomfn)
-        menu.addAction("Impact detector", self._cmd_add_impdet)
-        menu.addAction("Energy-deposition detector", self._cmd_add_endetc)
+        menu.addAction("Source definition", self._cmd_particle_source)
+        menu.addAction("Material data and simulation parameters", self._cmd_add_material)
+        menu.addAction("Geometry and local simulation parameters", self._cmd_geomfn)
+        menu.addAction("Impact detectors", self._cmd_add_impdet)
+        menu.addAction("Energy-deposition detectors", self._cmd_add_endetc)
         menu.addAction("Dose distribution", self._cmd_dose_distribution)
         menu.addSeparator()
         menu.addAction("Interaction forcing", lambda: self._set_interaction_forcing_enabled(True))
         menu.addAction("Emerging particles", lambda: self._set_emerging_particles_enabled(True))
-        menu.addAction("Energy deposition detectors", lambda: self._set_energy_deposition_enabled(True))
-        menu.addAction("Dose distribution section", lambda: self._set_dose_distribution_enabled(True))
+        menu.addAction("Energy-deposition detectors", lambda: self._set_energy_deposition_enabled(True))
+        menu.addAction("Dose distribution", lambda: self._set_dose_distribution_enabled(True))
         menu.addAction("Job properties", lambda: self._set_job_properties_enabled(True))
         menu.exec(QCursor.pos())
 
@@ -18597,7 +18896,7 @@ class SimulationTab(QWidget):
         if not action:
             self._add_common_block_actions(menu)
         elif action == "source":
-            menu.addAction("Edit Source", self._cmd_particle_source)
+            menu.addAction("Source definition", self._cmd_particle_source)
             menu.addSeparator()
             menu.addAction("Add/Edit SKPAR", self._cmd_edit_skpar)
             menu.addAction("Add/Edit SENERG", self._cmd_edit_senerg)
@@ -18606,6 +18905,9 @@ class SimulationTab(QWidget):
             menu.addAction("Add/Edit SCONE", self._cmd_edit_scone)
             menu.addSeparator()
             menu.addAction("Delete Source Block", self._delete_selected_sim_block)
+        elif action == "psf":
+            menu.addAction("Source definition", self._cmd_particle_source)
+            menu.addAction("Remove Input phase-space file", self._delete_selected_sim_block)
         elif action == "energy":
             menu.addAction("Choose SENERG or SPECTR", self._cmd_edit_energy_mode)
             menu.addAction("Delete Energy", self._delete_selected_sim_block)
@@ -18652,13 +18954,13 @@ class SimulationTab(QWidget):
             menu.addAction("Edit Dose Distribution", self._cmd_dose_distribution)
             menu.addAction("Remove Dose Distribution", self._delete_selected_sim_block)
         elif action == "interaction":
-            menu.addAction("Toggle Interaction Forcing", self.chk_interaction_forcing.toggle)
+            menu.addAction("Interaction Forcing", lambda: self._handle_optional_sim_section_toggle("interaction", True))
             menu.addAction("Remove Interaction Forcing", self._delete_selected_sim_block)
         elif action == "emerging":
-            menu.addAction("Toggle Emerging Particles", self.chk_emerging_particles.toggle)
+            menu.addAction("Emerging Particles", lambda: self._handle_optional_sim_section_toggle("emerging", True))
             menu.addAction("Remove Emerging Particles", self._delete_selected_sim_block)
         elif action == "job":
-            menu.addAction("Toggle Job Properties", self.chk_job_properties.toggle)
+            menu.addAction("Edit Job Properties", self._cmd_job_properties)
             menu.addAction("Remove Job Properties", self._delete_selected_sim_block)
         elif action == "nsimsh":
             menu.addAction("Edit Showers (NSIMSH)", self._cmd_nsimsh)
@@ -18675,18 +18977,16 @@ class SimulationTab(QWidget):
             menu.exec(self.sim_blocks.viewport().mapToGlobal(pos))
 
     def _add_common_block_actions(self, menu):
-        menu.addAction("Add Particle Source", self._cmd_particle_source)
-        menu.addAction("Add/Edit Materials", self._cmd_edit_materials)
-        menu.addAction("Set Geometry File", self._cmd_geomfn)
-        menu.addAction("Add Impact Detector", self._cmd_add_impdet)
-        menu.addAction("Add Energy-Deposition Detector", self._cmd_add_endetc)
-        menu.addAction("Edit Dose Distribution", self._cmd_dose_distribution)
+        menu.addAction("Source definition", self._cmd_particle_source)
+        menu.addAction("Material data and simulation parameters", self._cmd_edit_materials)
+        menu.addAction("Geometry and local simulation parameters", self._cmd_geomfn)
+        menu.addAction("Impact detectors", self._cmd_add_impdet)
+        menu.addAction("Energy-deposition detectors", self._cmd_add_endetc)
+        menu.addAction("Dose distribution", self._cmd_dose_distribution)
+        menu.addAction("Job properties", self._cmd_job_properties)
         menu.addSeparator()
-        menu.addAction("Add Interaction Forcing", lambda: self._set_interaction_forcing_enabled(True))
-        menu.addAction("Add Emerging Particles", lambda: self._set_emerging_particles_enabled(True))
-        menu.addAction("Add Energy Deposition Detectors", lambda: self._set_energy_deposition_enabled(True))
-        menu.addAction("Add Dose Distribution", lambda: self._set_dose_distribution_enabled(True))
-        menu.addAction("Add Job Properties", lambda: self._set_job_properties_enabled(True))
+        menu.addAction("Interaction forcing", lambda: self._handle_optional_sim_section_toggle("interaction", True))
+        menu.addAction("Emerging particles", lambda: self._handle_optional_sim_section_toggle("emerging", True))
 
     def _replace_source_attribute(self, keywords, new_lines):
         self._replace_section_keywords("Source definition", keywords, new_lines)
@@ -19152,6 +19452,8 @@ class SimulationTab(QWidget):
             self._cmd_edit_sposit()
         elif action == "scone":
             self._cmd_edit_scone()
+        elif action == "psf":
+            self._cmd_particle_source()
         elif action in {"materials", "material_list"}:
             self._cmd_edit_materials() if self._material_entries() else self._cmd_add_material()
         elif action == "material" and payload is not None:
@@ -19167,11 +19469,11 @@ class SimulationTab(QWidget):
         elif action == "dose":
             self._cmd_dose_distribution()
         elif action == "interaction":
-            self.chk_interaction_forcing.toggle()
+            self._handle_optional_sim_section_toggle("interaction", True)
         elif action == "emerging":
-            self.chk_emerging_particles.toggle()
+            self._handle_optional_sim_section_toggle("emerging", True)
         elif action == "job":
-            self.chk_job_properties.toggle()
+            self._cmd_job_properties()
         elif action == "nsimsh":
             self._cmd_nsimsh()
         elif action == "time":
@@ -19189,6 +19491,8 @@ class SimulationTab(QWidget):
             self._remove_keywords(("SPOSIT",))
         elif action == "scone":
             self._remove_keywords(("SCONE",))
+        elif action == "psf":
+            self._set_psf_section_enabled(False)
         elif action in {"material", "material_param"} and payload is not None:
             self._delete_material_occurrence(int(payload))
         elif action == "materials":
@@ -19290,12 +19594,38 @@ class SimulationTab(QWidget):
     def _has_dose_distribution(self):
         return bool(re.search(r"^\s*(GRIDX|GRIDY|GRIDZ|GRIDBN)\b", self._get_text(), re.IGNORECASE | re.MULTILINE))
 
-    def _section_bounds(self, title):
-        lines = self._get_text().split("\n")
-        title_l = title.lower()
+    def _sim_section_spec_for_title(self, title):
+        title_l = str(title or "").strip().lower()
+        if not title_l:
+            return None
+        for spec in SIM_SECTION_SPECS:
+            names = [spec.get("title", "")] + list(spec.get("aliases", ()))
+            for name in names:
+                low = str(name or "").strip().lower()
+                if not low:
+                    continue
+                if title_l == low or title_l in low or low in title_l:
+                    return spec
+        return None
+
+    def _section_aliases_for_title(self, title):
+        spec = self._sim_section_spec_for_title(title)
+        if spec is None:
+            return [str(title or "").strip().lower()]
+        names = [spec.get("title", "")] + list(spec.get("aliases", ()))
+        aliases = []
+        for name in names:
+            low = str(name or "").strip().lower()
+            if low and low not in aliases:
+                aliases.append(low)
+        return aliases or [str(title or "").strip().lower()]
+
+    def _section_bounds_in_lines(self, lines, title):
+        aliases = self._section_aliases_for_title(title)
         start = None
         for i, line in enumerate(lines):
-            if title_l in line.lower():
+            low = line.lower()
+            if any(alias in low for alias in aliases):
                 start = i
                 break
         if start is None:
@@ -19307,6 +19637,54 @@ class SimulationTab(QWidget):
                 end = i
                 break
         return lines, start, end
+
+    def _section_bounds(self, title):
+        return self._section_bounds_in_lines(self._get_text().split("\n"), title)
+
+    def _section_header_for_title(self, title):
+        spec = self._sim_section_spec_for_title(title)
+        key = spec.get("key") if spec else None
+        header_map = {
+            "source": "       >>>>>>>> Source definition.",
+            "psf": "       >>>>>>>> Input phase-space file (psf).",
+            "materials": "       >>>>>>>> Material data and simulation parameters.",
+            "geometry": "       >>>>>>>> Geometry and local simulation parameters.",
+            "interaction": "       >>>>>>>> Interaction forcing.",
+            "emerging": "       >>>>>>>> Emerging particles. Energy and angular distributions.",
+            "impact": "       >>>>>>>> Impact detectors (up to 25 different detectors).",
+            "endet": "       >>>>>>>> Energy deposition detectors (up to 25).",
+            "dose": "       >>>>>>>> Dose distribution.",
+            "job": "       >>>>>>>> Job properties.",
+        }
+        if key in header_map:
+            return header_map[key]
+        return f"       >>>>>>>> {title}."
+
+    def _insert_index_for_new_section(self, title, lines):
+        spec = self._sim_section_spec_for_title(title)
+        if spec is None:
+            return next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
+        order = [entry["key"] for entry in SIM_SECTION_SPECS]
+        try:
+            idx = order.index(spec["key"])
+        except ValueError:
+            return next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
+        for later_key in order[idx + 1:]:
+            later_title = SIM_SECTION_SPEC_MAP[later_key]["title"]
+            _, later_start, _ = self._section_bounds_in_lines(lines, later_title)
+            if later_start is not None:
+                return later_start
+        return next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
+
+    def _ensure_sim_section(self, title):
+        lines, start, end = self._section_bounds(title)
+        if start is not None:
+            return lines, start, end
+        lines = self._get_text().split("\n")
+        insert_at = self._insert_index_for_new_section(title, lines)
+        lines[insert_at:insert_at] = [self._section_header_for_title(title), "       ."]
+        self._set_text("\n".join(lines))
+        return self._section_bounds(title)
 
     def _insert_index_before_section_dot(self, lines, start, end):
         if start is None:
@@ -19320,14 +19698,7 @@ class SimulationTab(QWidget):
         return end
 
     def _replace_section_keywords(self, title, keywords, new_lines):
-        lines, start, end = self._section_bounds(title)
-        if start is None:
-            lines = self._get_text().split("\n")
-            insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line)), len(lines))
-            lines[insert_at:insert_at] = [f"       >>>>>>>> {title}."] + list(new_lines) + ["       ."]
-            self._set_text("\n".join(lines))
-            self._update_sim_action_labels()
-            return
+        lines, start, end = self._ensure_sim_section(title)
         keyword_re = re.compile(r"^\s*(?:" + "|".join(re.escape(k) for k in keywords) + r")\b", re.IGNORECASE)
         section = [line for line in lines[start + 1:end] if not keyword_re.match(line)]
         insert_rel = next((i for i, line in enumerate(section) if line.strip() == "."), len(section))
@@ -19335,6 +19706,161 @@ class SimulationTab(QWidget):
         lines[start + 1:end] = section
         self._set_text("\n".join(lines))
         self._update_sim_action_labels()
+
+    def _extract_section_lines_from_text(self, text, title):
+        lines = str(text or "").split("\n")
+        _, start, end = self._section_bounds_in_lines(lines, title)
+        if start is None:
+            return None
+        return list(lines[start:end])
+
+    def _replace_section_in_text(self, text, title, new_section_lines):
+        lines = str(text or "").split("\n")
+        _, start, end = self._section_bounds_in_lines(lines, title)
+        replacement = list(new_section_lines) if new_section_lines is not None else None
+        if start is None:
+            if replacement is None:
+                return "\n".join(lines)
+            insert_at = self._insert_index_for_new_section(title, lines)
+            lines[insert_at:insert_at] = replacement
+            return "\n".join(lines)
+        if replacement is None:
+            del lines[start:end]
+        else:
+            lines[start:end] = replacement
+        return "\n".join(lines)
+
+    def _changed_sim_sections_between_texts(self, original_text, edited_text):
+        titles = [
+            "Source definition",
+            "Input phase-space file (psf)",
+            "Material data and simulation parameters",
+            "Geometry and local simulation parameters",
+            "Interaction forcing",
+            "Emerging particles",
+            "Impact detectors",
+            "Energy deposition detectors",
+            "Dose distribution",
+            "Job properties",
+        ]
+        changes = []
+        for title in titles:
+            before = self._extract_section_lines_from_text(original_text, title)
+            after = self._extract_section_lines_from_text(edited_text, title)
+            if before != after:
+                changes.append((title, after))
+        return changes
+
+    def _apply_section_changes_to_text(self, text, changes):
+        updated = str(text or "")
+        for title, new_section_lines in list(changes or []):
+            updated = self._replace_section_in_text(updated, title, new_section_lines)
+        return updated
+
+    def _extract_section_keyword_lines(self, text, title, keywords):
+        section_lines = self._extract_section_lines_from_text(text, title)
+        if not section_lines:
+            return []
+        keyword_re = re.compile(
+            r"^\s*(?:" + "|".join(re.escape(str(k)) for k in tuple(keywords)) + r")\b",
+            re.IGNORECASE,
+        )
+        return [
+            line
+            for line in list(section_lines or [])[1:]
+            if line.strip() != "." and keyword_re.match(line)
+        ]
+
+    def _replace_keywords_in_section_text(self, text, title, keywords, new_lines):
+        lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        _, start, end = self._section_bounds_in_lines(lines, title)
+        if start is None:
+            insert_at = self._insert_index_for_new_section(title, lines)
+            lines[insert_at:insert_at] = [self._section_header_for_title(title), "       ."]
+            _, start, end = self._section_bounds_in_lines(lines, title)
+        keyword_re = re.compile(
+            r"^\s*(?:" + "|".join(re.escape(str(k)) for k in tuple(keywords)) + r")\b",
+            re.IGNORECASE,
+        )
+        section = [line for line in lines[start + 1:end] if not keyword_re.match(line)]
+        insert_rel = next((i for i, line in enumerate(section) if line.strip() == "."), len(section))
+        section[insert_rel:insert_rel] = list(new_lines or [])
+        lines[start + 1:end] = section
+        return "\n".join(lines)
+
+    def _extract_keyword_line_from_text(self, text, keyword):
+        match = re.search(
+            r"^\s*" + re.escape(str(keyword)) + r"\b.*$",
+            str(text or ""),
+            re.IGNORECASE | re.MULTILINE,
+        )
+        return match.group(0) if match else None
+
+    def _remove_keyword_line_from_text(self, text, keyword):
+        lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        pat = re.compile(r"^\s*" + re.escape(str(keyword)) + r"\b", re.IGNORECASE)
+        return "\n".join([line for line in lines if not pat.match(line)])
+
+    def _changed_global_keyword_lines_between_texts(self, original_text, edited_text, keywords=("RSEED", "NSIMSH", "TIME")):
+        changes = []
+        for keyword in tuple(keywords or ()):
+            before = self._extract_keyword_line_from_text(original_text, keyword)
+            after = self._extract_keyword_line_from_text(edited_text, keyword)
+            if before != after:
+                changes.append((str(keyword), after))
+        return changes
+
+    def _apply_global_keyword_line_changes_to_text(self, text, changes):
+        updated = str(text or "")
+        for keyword, new_line in list(changes or []):
+            if new_line is None:
+                updated = self._remove_keyword_line_from_text(updated, keyword)
+            else:
+                updated, _ = self._replace_or_insert_line_in_text(updated, keyword, new_line)
+        return updated
+
+    def _source_attribute_patch_from_texts(self, original_text, edited_text):
+        patches = []
+        specs = (
+            (("SKPAR",), "SKPAR"),
+            (("SENERG", "SPECTR"), "ENERGY"),
+            (("SPOSIT",), "SPOSIT"),
+            (("SCONE",), "SCONE"),
+        )
+        for keywords, _label in specs:
+            before = self._extract_section_keyword_lines(original_text, "Source definition", keywords)
+            after = self._extract_section_keyword_lines(edited_text, "Source definition", keywords)
+            if before != after:
+                patches.append((tuple(keywords), after))
+        return patches
+
+    def _apply_source_attribute_patch_to_text(self, text, source_patch):
+        updated = str(text or "")
+        for keywords, new_lines in list(source_patch or []):
+            updated = self._replace_keywords_in_section_text(updated, "Source definition", keywords, new_lines)
+        return updated
+
+    def _collect_sim_block_edit_changes(self, original_text, edited_text):
+        section_changes = [
+            (title, new_section_lines)
+            for title, new_section_lines in self._changed_sim_sections_between_texts(original_text, edited_text)
+            if title != "Source definition"
+        ]
+        source_patch = self._source_attribute_patch_from_texts(original_text, edited_text)
+        global_changes = self._changed_global_keyword_lines_between_texts(original_text, edited_text)
+        return {
+            "section_changes": section_changes,
+            "source_patch": source_patch,
+            "global_changes": global_changes,
+        }
+
+    def _apply_sim_block_edit_changes_to_text(self, text, changes):
+        updated = str(text or "")
+        payload = dict(changes or {})
+        updated = self._apply_section_changes_to_text(updated, payload.get("section_changes") or [])
+        updated = self._apply_source_attribute_patch_to_text(updated, payload.get("source_patch") or [])
+        updated = self._apply_global_keyword_line_changes_to_text(updated, payload.get("global_changes") or [])
+        return updated
 
     def _normalize_source_section_order(self):
         if self._normalizing_source_order:
@@ -19379,7 +19905,7 @@ class SimulationTab(QWidget):
             self._normalizing_source_order = False
 
     def _insert_lines_in_section(self, title, new_lines):
-        lines, start, end = self._section_bounds(title)
+        lines, start, end = self._ensure_sim_section(title)
         insert_at = self._insert_index_before_section_dot(lines, start, end)
         lines[insert_at:insert_at] = list(new_lines)
         self._set_text("\n".join(lines))
@@ -19410,6 +19936,8 @@ class SimulationTab(QWidget):
         return candidates[0] if candidates else (self._in_folder() / path.name)
 
     def _geomfn_list_folder(self):
+        if self._staged_geo_list_folder:
+            return Path(self._staged_geo_list_folder)
         if self._geo_list_folder:
             return Path(self._geo_list_folder)
         project_geom = self._project_geometry_folder()
@@ -19427,6 +19955,8 @@ class SimulationTab(QWidget):
             return []
 
     def _material_list_folder(self):
+        if self._staged_mat_list_folder:
+            return Path(self._staged_mat_list_folder)
         if self._mat_list_folder:
             return Path(self._mat_list_folder)
         project_mats = self._project_materials_folder()
@@ -19497,6 +20027,13 @@ class SimulationTab(QWidget):
         self.console.log(f"[SIM] Instructions root set: {self._instructions_root}\n", "info")
 
     def _update_file_source_labels(self):
+        if self._staged_in_text is not None:
+            if callable(self._staged_update_callback):
+                try:
+                    self._staged_update_callback()
+                except Exception:
+                    pass
+            return
         if hasattr(self, "lbl_instructions_root"):
             inst_path = self._instructions_root_path()
             self.lbl_instructions_root.setText(f"Instructions: {inst_path}")
@@ -20605,22 +21142,22 @@ class SimulationTab(QWidget):
 
     def _select_logged_case_record_dialog(self):
         if not self._project_root:
-            QMessageBox.information(self, "Duplicate Case", "Open a project first so Studio can read the case creation log.")
+            QMessageBox.information(self, "Edit Case", "Open a project first so Studio can read the case creation log.")
             return None
         entries = [
             entry for entry in self._read_project_log_entries(self._project_case_creation_log_path())
             if isinstance(entry, dict)
         ]
         if not entries:
-            QMessageBox.information(self, "Duplicate Case", "No project case creation log entries were found.")
+            QMessageBox.information(self, "Edit Case", "No project case creation log entries were found.")
             return None
         dlg = QDialog(self)
         dlg.setModal(True)
-        dlg.setWindowTitle("Duplicate Case")
+        dlg.setWindowTitle("Edit Case")
         dlg.setMinimumWidth(760)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
-        hint = QLabel("Choose a previously created case to use as the duplication source.")
+        hint = QLabel("Choose a previously created case to edit or duplicate with block-based changes.")
         hint.setWordWrap(True)
         hint.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(hint)
@@ -20652,22 +21189,22 @@ class SimulationTab(QWidget):
 
     def _select_logged_batch_entry_dialog(self):
         if not self._project_root:
-            QMessageBox.information(self, "Duplicate Batch", "Open a project first so Studio can read the batch creation log.")
+            QMessageBox.information(self, "Edit Batch", "Open a project first so Studio can read the batch creation log.")
             return None
         entries = [
             entry for entry in self._read_project_log_entries(self._project_batch_case_creation_log_path())
             if isinstance(entry, dict)
         ]
         if not entries:
-            QMessageBox.information(self, "Duplicate Batch", "No project batch creation log entries were found.")
+            QMessageBox.information(self, "Edit Batch", "No project batch creation log entries were found.")
             return None
         dlg = QDialog(self)
         dlg.setModal(True)
-        dlg.setWindowTitle("Duplicate Batch")
+        dlg.setWindowTitle("Edit Batch")
         dlg.setMinimumWidth(820)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
-        hint = QLabel("Choose a previously created batch to duplicate and edit.")
+        hint = QLabel("Choose a previously created batch to edit or duplicate with block-based changes.")
         hint.setWordWrap(True)
         hint.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(hint)
@@ -20696,6 +21233,182 @@ class SimulationTab(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted or not lst.currentItem():
             return None
         return lst.currentItem().data(Qt.ItemDataRole.UserRole)
+
+    def _sim_block_case_batch_edit_dialog(
+        self,
+        source_in_path,
+        source_text,
+        *,
+        geo_folder=None,
+        mat_folder=None,
+        dialog_title="Edit Input Blocks",
+        intro_text="Edit the shared PENELOPE .in blocks below. Apply the changes in place or duplicate the case/batch carrying the new changes.",
+    ):
+        source_in_path = Path(source_in_path) if source_in_path else Path(self._in_path or self._in_folder() / "simulation.in")
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle(dialog_title)
+        dlg.resize(1120, 760)
+        dlg.setStyleSheet(
+            f"QDialog {{ background:{P['bg']}; }}"
+            f"QLabel {{ color:{P['fg']}; }}"
+        )
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        intro = QLabel(str(intro_text or ""))
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(intro)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+
+        controls_box = QGroupBox("PENELOPE Input Blocks")
+        controls_box.setStyleSheet(group_css())
+        controls_lay = QVBoxLayout(controls_box)
+        controls_lay.setContentsMargins(8, 12, 8, 8)
+        controls_lay.setSpacing(6)
+
+        hint = QLabel(
+            "Use the same block editors as a single .in file. Optional blocks only stay active if you confirm their setup."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=8))
+        controls_lay.addWidget(hint)
+
+        lbl_geo_folder = QLabel("")
+        lbl_geo_folder.setWordWrap(True)
+        lbl_geo_folder.setStyleSheet(label_css(P["fg2"], size=8))
+        lbl_mat_folder = QLabel("")
+        lbl_mat_folder.setWordWrap(True)
+        lbl_mat_folder.setStyleSheet(label_css(P["fg2"], size=8))
+        controls_lay.addWidget(lbl_geo_folder)
+        controls_lay.addWidget(lbl_mat_folder)
+        controls_lay.addWidget(self._separator_line())
+
+        local_buttons = {}
+        local_toggles = {}
+
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        preview.setStyleSheet(
+            f"QPlainTextEdit {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; font-family:Consolas,'Courier New',monospace; }}"
+        )
+
+        def refresh():
+            preview.setPlainText(self._get_text())
+            lbl_geo_folder.setText(f"Geometry source folder: {self._geomfn_list_folder()}")
+            lbl_mat_folder.setText(f"Material source folder: {self._material_list_folder()}")
+            for spec in SIM_SECTION_SPECS:
+                key = spec["key"]
+                if key == "psf":
+                    continue
+                present = self._sim_section_is_present(key)
+                btn = local_buttons.get(key)
+                chk = local_toggles.get(key)
+                if btn is not None:
+                    btn.setStyleSheet(btn_css(P["bg3"] if present else P["bg2"]))
+                if chk is not None:
+                    chk.blockSignals(True)
+                    chk.setChecked(present)
+                    chk.blockSignals(False)
+
+        def handle_optional_toggle(key, checked):
+            if checked:
+                if key == "interaction":
+                    choice = QMessageBox.question(
+                        dlg,
+                        "Interaction forcing",
+                        "Add the Interaction forcing block with the current Studio default values?",
+                        QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                        QMessageBox.StandardButton.Ok,
+                    )
+                    if choice == QMessageBox.StandardButton.Ok:
+                        self._set_interaction_forcing_enabled(True)
+                elif key == "emerging":
+                    choice = QMessageBox.question(
+                        dlg,
+                        "Emerging particles",
+                        "Add the Emerging particles block with the current Studio default values?",
+                        QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                        QMessageBox.StandardButton.Ok,
+                    )
+                    if choice == QMessageBox.StandardButton.Ok:
+                        self._set_emerging_particles_enabled(True)
+                else:
+                    self._open_sim_section(key)
+            else:
+                self._set_sim_section_enabled(key, False)
+            refresh()
+
+        for spec in SIM_SECTION_SPECS:
+            key = spec["key"]
+            if key == "psf":
+                continue
+            if spec.get("required"):
+                btn = QPushButton(spec["title"])
+                btn.setToolTip(spec["description"])
+                btn.setStyleSheet(btn_css())
+                btn.clicked.connect(lambda _checked=False, current_key=key: (self._open_sim_section(current_key), refresh()))
+                controls_lay.addWidget(btn)
+                local_buttons[key] = btn
+                local_toggles[key] = None
+            else:
+                chk = QCheckBox(spec["title"])
+                chk.setToolTip(spec["description"])
+                chk.setStyleSheet(checkbox_css())
+                chk.toggled.connect(lambda checked, current_key=key: handle_optional_toggle(current_key, checked))
+                controls_lay.addWidget(chk)
+                local_buttons[key] = None
+                local_toggles[key] = chk
+
+        top.addWidget(controls_box, 0)
+        top.addWidget(preview, 1)
+        lay.addLayout(top, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        btn_inplace = QPushButton("Apply In Place")
+        btn_inplace.setStyleSheet(btn_css(width=132))
+        btn_duplicate = QPushButton("Duplicate With Changes")
+        btn_duplicate.setStyleSheet(btn_css(width=172))
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(btn_css(P["bg2"], 88))
+        buttons.addWidget(btn_inplace)
+        buttons.addWidget(btn_duplicate)
+        buttons.addWidget(btn_cancel)
+        lay.addLayout(buttons)
+
+        btn_inplace.clicked.connect(lambda: dlg.done(2))
+        btn_duplicate.clicked.connect(lambda: dlg.done(3))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        self._begin_staged_in_edit_session(
+            source_text,
+            source_in_path,
+            geo_folder=geo_folder,
+            mat_folder=mat_folder,
+            on_change=refresh,
+        )
+        try:
+            refresh()
+            result_code = dlg.exec()
+            if result_code not in {2, 3}:
+                return None
+            return {
+                "mode": "duplicate" if result_code == 3 else "inplace",
+                "edited_text": self._get_text(),
+                "geo_folder": str(self._geomfn_list_folder()),
+                "mat_folder": str(self._material_list_folder()),
+            }
+        finally:
+            self._end_staged_in_edit_session()
 
     def _batch_case_variants_dialog(
         self,
@@ -21131,6 +21844,7 @@ class SimulationTab(QWidget):
                 "geo_override_path": geo_override_path,
                 "mat_folder": mat_folder_edit,
                 "btn_senerg_all": btn_senerg_all,
+                "btn_spectr": btn_spectr,
                 "btn_spectr_all": btn_spectr_all,
                 "btn_sposit_all": btn_sposit_all,
                 "btn_scone_all": btn_scone_all,
@@ -21398,6 +22112,58 @@ class SimulationTab(QWidget):
         if re.search(r"^\s*GEOMFN\b", text, re.IGNORECASE | re.MULTILINE):
             return re.sub(r"^\s*GEOMFN\b.*$", line, text, count=1, flags=re.IGNORECASE | re.MULTILINE)
         return text
+
+    def _current_geom_filename_from_text(self, text):
+        match = re.search(r"^\s*GEOMFN\s+(\S+)", str(text or ""), re.IGNORECASE | re.MULTILINE)
+        return match.group(1).strip() if match else ""
+
+    def _resolve_geom_path_for_text(self, text, search_folders):
+        geo_name = self._current_geom_filename_from_text(text)
+        if not geo_name:
+            return None
+        path = Path(geo_name)
+        if path.is_absolute() and path.exists():
+            return path
+        seen = set()
+        for folder in list(search_folders or []):
+            if not folder:
+                continue
+            try:
+                folder_path = Path(folder)
+            except Exception:
+                continue
+            key = str(folder_path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate = folder_path / path.name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _collect_logged_batch_case_infos(self, entry):
+        infos = []
+        for record in list((entry or {}).get("cases") or []):
+            if not isinstance(record, dict):
+                continue
+            case_dir = self._resolve_project_logged_path(record.get("case_folder"))
+            if not case_dir or not case_dir.exists():
+                continue
+            in_name = str(record.get("in_file") or "").strip()
+            in_path = case_dir / in_name if in_name else None
+            if not in_path or not in_path.exists():
+                in_files = sorted(case_dir.glob("*.in"))
+                if not in_files:
+                    continue
+                in_path = in_files[0]
+                in_name = in_path.name
+            infos.append({
+                "record": record,
+                "case_dir": case_dir,
+                "in_path": in_path,
+                "in_name": in_name,
+            })
+        return infos
 
     def _safe_copy_file(self, src, dst, overwrite=False):
         src = Path(src)
@@ -21786,6 +22552,304 @@ class SimulationTab(QWidget):
         target_root.mkdir(parents=True, exist_ok=True)
         return case_root, target_root, group_rel
 
+    def _edit_resource_paths_for_text(self, text, source_in_path, case_dir=None, geo_folder=None, mat_folder=None, fallback_geo_path=None):
+        source_in_path = Path(source_in_path) if source_in_path else None
+        case_dir = Path(case_dir) if case_dir else None
+        fallback_geo_path = Path(fallback_geo_path) if fallback_geo_path else None
+        project_geom = self._project_geometry_folder()
+        project_mats = self._project_materials_folder()
+        geo_search = [
+            geo_folder,
+            project_geom,
+            source_in_path.parent if source_in_path else None,
+            fallback_geo_path.parent if fallback_geo_path else None,
+            case_dir,
+        ]
+        geo_path = self._resolve_geom_path_for_text(text, geo_search)
+        if geo_path is None and fallback_geo_path and fallback_geo_path.exists():
+            geo_path = fallback_geo_path
+        mat_sources = []
+        seen = set()
+        for candidate in (
+            mat_folder,
+            project_mats,
+            source_in_path.parent if source_in_path else None,
+            geo_path.parent if geo_path else None,
+            case_dir,
+        ):
+            if not candidate:
+                continue
+            try:
+                path_obj = Path(candidate)
+            except Exception:
+                continue
+            key = str(path_obj).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            mat_sources.append(path_obj)
+        return geo_path, mat_sources
+
+    def _write_case_from_edited_text(
+        self,
+        case_dir,
+        in_filename,
+        updated_text,
+        *,
+        source_in_path,
+        case_source_dir=None,
+        geo_folder=None,
+        mat_folder=None,
+        fallback_geo_path=None,
+        effective_execs=None,
+    ):
+        geo_path, mat_sources = self._edit_resource_paths_for_text(
+            updated_text,
+            source_in_path,
+            case_dir=case_source_dir,
+            geo_folder=geo_folder,
+            mat_folder=mat_folder,
+            fallback_geo_path=fallback_geo_path,
+        )
+        if not geo_path or not Path(geo_path).exists():
+            raise FileNotFoundError(
+                f"Geometry file referenced by GEOMFN could not be found for {Path(in_filename).name}."
+            )
+        required_refs = self._resolve_required_input_reference_sources(
+            source_in_path,
+            updated_text,
+            interactive=True,
+            purpose="case",
+        )
+        workspace_geo_name = self._geo_alias_for_penelope(geo_path)
+        final_text = self._replace_geomfn_in_text(updated_text, workspace_geo_name)
+        return self._write_case_workspace(
+            Path(case_dir),
+            in_filename=in_filename,
+            in_text=final_text,
+            geo_path=geo_path,
+            workspace_geo_name=workspace_geo_name,
+            template_dir=None,
+            mat_sources=mat_sources,
+            required_refs=required_refs,
+            effective_execs=effective_execs or self._effective_executable_paths(),
+        )
+
+    def _edit_case_workspace(self):
+        record = self._select_logged_case_record_dialog()
+        if not record:
+            return
+        source_case_dir = self._resolve_project_logged_path(record.get("case_folder"))
+        source_in_name = str(record.get("in_file") or "").strip()
+        if not source_case_dir or not source_case_dir.exists():
+            QMessageBox.warning(self, "Edit Case", "The selected source case folder no longer exists.")
+            return
+        source_in_path = source_case_dir / source_in_name if source_in_name else None
+        if not source_in_path or not source_in_path.exists():
+            in_files = sorted(source_case_dir.glob("*.in"))
+            if not in_files:
+                QMessageBox.warning(self, "Edit Case", "The selected source case has no .in file.")
+                return
+            source_in_path = in_files[0]
+            source_in_name = source_in_path.name
+        try:
+            source_text = _decode_text_bytes(source_in_path.read_bytes())
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit Case", f"Could not read the source .in file.\n\n{exc}")
+            return
+        fallback_geo = self._resolve_project_logged_path(record.get("geo_source_path"))
+        if not fallback_geo or not Path(fallback_geo).exists():
+            fallback_geo = self._resolve_geom_path_for_text(
+                source_text,
+                [self._project_geometry_folder(), source_case_dir, source_in_path.parent],
+            )
+        edit_result = self._sim_block_case_batch_edit_dialog(
+            source_in_path,
+            source_text,
+            geo_folder=Path(fallback_geo).parent if fallback_geo else self._project_geometry_folder(),
+            mat_folder=self._project_materials_folder() or source_case_dir,
+            dialog_title="Edit Case",
+            intro_text="Edit the selected case by PENELOPE input blocks. Apply the changes in place or duplicate the case carrying the same block changes.",
+        )
+        if not edit_result:
+            return
+        changes = self._collect_sim_block_edit_changes(source_text, edit_result["edited_text"])
+        if not any(changes.values()):
+            QMessageBox.information(self, "Edit Case", "No block changes were made.")
+            return
+        target_case_dir = source_case_dir
+        group_rel = str(record.get("group_rel") or "")
+        if edit_result["mode"] == "duplicate":
+            target_info = self._case_creation_target_root(source_in_path)
+            if target_info is None:
+                return
+            _case_root, target_root, group_rel = target_info
+            target_case_dir = self._unique_workspace_dir(target_root / Path(source_case_dir).name)
+        try:
+            updated_case_text = self._apply_sim_block_edit_changes_to_text(source_text, changes)
+            result = self._write_case_from_edited_text(
+                target_case_dir,
+                source_in_name,
+                updated_case_text,
+                source_in_path=source_in_path,
+                case_source_dir=source_case_dir,
+                geo_folder=edit_result.get("geo_folder"),
+                mat_folder=edit_result.get("mat_folder"),
+                fallback_geo_path=fallback_geo,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit Case", str(exc))
+            return
+        if edit_result["mode"] == "duplicate":
+            geo_path = self._resolve_geom_path_for_text(
+                result["workspace_text"],
+                [target_case_dir, edit_result.get("geo_folder"), self._project_geometry_folder(), source_case_dir],
+            )
+            if geo_path and self._project_root:
+                self._log_project_case_creation(
+                    target_case_dir,
+                    result,
+                    geo_path,
+                    self._current_geom_filename_from_text(result["workspace_text"]),
+                    group_rel=group_rel,
+                    source_in_path=source_in_path,
+                )
+        self._in_path = str(result["workspace_in_path"])
+        self._run_folder = target_case_dir
+        self.editor.setPlainText(result["workspace_text"])
+        self.lbl_in_path.setText(result["workspace_in_path"].name)
+        self._set_workspace_root(target_case_dir, log_label="Case root (edited case)")
+        self.console.log(
+            f"[SIM] Case {'duplicated with changes' if edit_result['mode'] == 'duplicate' else 'updated in place'}: {target_case_dir}\n",
+            "ok",
+        )
+        self.status_message.emit("Case updated" if edit_result["mode"] == "inplace" else "Case duplicated with changes")
+
+    def _edit_batch_workspace(self):
+        entry = self._select_logged_batch_entry_dialog()
+        if not entry:
+            return
+        case_infos = self._collect_logged_batch_case_infos(entry)
+        if not case_infos:
+            QMessageBox.warning(self, "Edit Batch", "The selected batch has no readable case folders.")
+            return
+        source_in_path = self._resolve_project_logged_path(entry.get("source_in_path"))
+        if not source_in_path or not Path(source_in_path).exists():
+            source_in_path = Path(case_infos[0]["in_path"])
+        try:
+            source_text = _decode_text_bytes(Path(source_in_path).read_bytes())
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit Batch", f"Could not read the source .in file.\n\n{exc}")
+            return
+        fallback_geo = self._resolve_project_logged_path(entry.get("geo_source_path"))
+        if not fallback_geo or not Path(fallback_geo).exists():
+            fallback_geo = self._resolve_geom_path_for_text(
+                source_text,
+                [self._project_geometry_folder(), Path(source_in_path).parent, case_infos[0]["case_dir"]],
+            )
+        edit_result = self._sim_block_case_batch_edit_dialog(
+            source_in_path,
+            source_text,
+            geo_folder=Path(fallback_geo).parent if fallback_geo else self._project_geometry_folder(),
+            mat_folder=self._project_materials_folder() or case_infos[0]["case_dir"],
+            dialog_title="Edit Batch",
+            intro_text="Edit the shared PENELOPE input blocks for this batch. The selected block changes will be applied to every case in the batch, either in place or into a duplicated batch.",
+        )
+        if not edit_result:
+            return
+        changes = self._collect_sim_block_edit_changes(source_text, edit_result["edited_text"])
+        if not any(changes.values()):
+            QMessageBox.information(self, "Edit Batch", "No block changes were made.")
+            return
+        batch_id = ""
+        group_rel = str(entry.get("group_rel") or "")
+        batch_root = None
+        if edit_result["mode"] == "duplicate":
+            target_info = self._case_creation_target_root(source_in_path)
+            if target_info is None:
+                return
+            _case_root, target_root, group_rel = target_info
+            batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
+            batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path))
+            batch_root.mkdir(parents=True, exist_ok=True)
+        created_records = []
+        last_case_dir = None
+        last_result = None
+        try:
+            for info in case_infos:
+                case_dir = Path(info["case_dir"])
+                in_path = Path(info["in_path"])
+                in_name = str(info["in_name"] or in_path.name)
+                try:
+                    case_text = _decode_text_bytes(in_path.read_bytes())
+                except Exception:
+                    case_text = source_text
+                updated_case_text = self._apply_sim_block_edit_changes_to_text(case_text, changes)
+                target_case_dir = case_dir if edit_result["mode"] == "inplace" else self._unique_workspace_dir(batch_root / case_dir.name)
+                result = self._write_case_from_edited_text(
+                    target_case_dir,
+                    in_name,
+                    updated_case_text,
+                    source_in_path=in_path,
+                    case_source_dir=case_dir,
+                    geo_folder=edit_result.get("geo_folder"),
+                    mat_folder=edit_result.get("mat_folder"),
+                    fallback_geo_path=fallback_geo,
+                )
+                last_case_dir = target_case_dir
+                last_result = result
+                if edit_result["mode"] == "duplicate" and self._project_root:
+                    geo_path = self._resolve_geom_path_for_text(
+                        result["workspace_text"],
+                        [target_case_dir, edit_result.get("geo_folder"), self._project_geometry_folder(), case_dir],
+                    )
+                    if geo_path:
+                        self._log_project_case_creation(
+                            target_case_dir,
+                            result,
+                            geo_path,
+                            self._current_geom_filename_from_text(result["workspace_text"]),
+                            group_rel=group_rel,
+                            source_in_path=source_in_path,
+                            batch_id=batch_id,
+                        )
+                        created_records.append(
+                            self._case_creation_log_record(
+                                target_case_dir,
+                                result,
+                                geo_path,
+                                self._current_geom_filename_from_text(result["workspace_text"]),
+                                group_rel=group_rel,
+                                source_in_path=source_in_path,
+                                batch_id=batch_id,
+                            )
+                        )
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit Batch", str(exc))
+            return
+        if edit_result["mode"] == "duplicate" and self._project_root and last_result and created_records:
+            self._log_project_batch_creation(
+                batch_id,
+                group_rel,
+                batch_root.parent if batch_root else None,
+                batch_root,
+                source_in_path,
+                fallback_geo,
+                self._current_geom_filename_from_text(last_result["workspace_text"]),
+                created_records,
+            )
+        if last_case_dir and last_result:
+            self._in_path = str(last_result["workspace_in_path"])
+            self._run_folder = last_case_dir
+            self.editor.setPlainText(last_result["workspace_text"])
+            self.lbl_in_path.setText(last_result["workspace_in_path"].name)
+            self._set_workspace_root(batch_root if edit_result["mode"] == "duplicate" and batch_root else last_case_dir, log_label="Case root (edited batch)")
+        self.console.log(
+            f"[SIM] Batch {'duplicated with changes' if edit_result['mode'] == 'duplicate' else 'updated in place'}: {len(case_infos)} case(s)\n",
+            "ok",
+        )
+        self.status_message.emit("Batch updated" if edit_result["mode"] == "inplace" else "Batch duplicated with changes")
+
     def _duplicate_case_workspace(self):
         record = self._select_logged_case_record_dialog()
         if not record:
@@ -21821,6 +22885,17 @@ class SimulationTab(QWidget):
         if not base_geo_path or not Path(base_geo_path).exists():
             QMessageBox.warning(self, "Duplicate Case", "The source geometry file could not be found.")
             return
+        specs = self._batch_case_variants_dialog(
+            source_in_path,
+            base_geo_path,
+            case_count=1,
+            seed_specs=[seed_spec],
+            allow_resource_overrides=True,
+            dialog_title="Duplicate Case",
+            intro_text="Review the copied case settings below. You can change source values, geometry, materials, add more rows, or remove rows before creating the duplicate case(s).",
+        )
+        if not specs:
+            return
         target_info = self._case_creation_target_root(source_in_path)
         if target_info is None:
             return
@@ -21836,17 +22911,6 @@ class SimulationTab(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "Duplicate Case", str(exc))
-            return
-        specs = self._batch_case_variants_dialog(
-            source_in_path,
-            base_geo_path,
-            case_count=1,
-            seed_specs=[seed_spec],
-            allow_resource_overrides=True,
-            dialog_title="Duplicate Case",
-            intro_text="Review the copied case settings below. You can change source values, geometry, materials, add more rows, or remove rows before creating the duplicate case(s).",
-        )
-        if not specs:
             return
         mat_folder_default = source_case_dir if any(source_case_dir.glob("*.mat")) else self._material_list_folder()
         created_dirs = []
@@ -21924,6 +22988,17 @@ class SimulationTab(QWidget):
         if not base_geo_path or not Path(base_geo_path).exists():
             QMessageBox.warning(self, "Duplicate Batch", "The source geometry file for this batch could not be found.")
             return
+        edited_specs = self._batch_case_variants_dialog(
+            source_in_path,
+            base_geo_path,
+            case_count=len(batch_specs),
+            seed_specs=batch_specs,
+            allow_resource_overrides=True,
+            dialog_title="Duplicate Batch",
+            intro_text="Review the copied batch rows below. You can change any source values, geometry, materials, add more rows, or remove rows before creating the duplicated batch.",
+        )
+        if not edited_specs:
+            return
         target_info = self._case_creation_target_root(source_in_path)
         if target_info is None:
             return
@@ -21939,17 +23014,6 @@ class SimulationTab(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "Duplicate Batch", str(exc))
-            return
-        edited_specs = self._batch_case_variants_dialog(
-            source_in_path,
-            base_geo_path,
-            case_count=len(batch_specs),
-            seed_specs=batch_specs,
-            allow_resource_overrides=True,
-            dialog_title="Duplicate Batch",
-            intro_text="Review the copied batch rows below. You can change any source values, geometry, materials, add more rows, or remove rows before creating the duplicated batch.",
-        )
-        if not edited_specs:
             return
         batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
         batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path))
@@ -22265,25 +23329,16 @@ class SimulationTab(QWidget):
         if enabled:
             if self._has_interaction_forcing():
                 return
-            lines = self._get_text().split("\n")
-            section = [
-                "       >>>>>>>> Interaction forcing.",
+            lines, start, end = self._ensure_sim_section("Interaction forcing")
+            insert_at = self._insert_index_before_section_dot(lines, start, end)
+            lines[insert_at:insert_at] = [
                 "IFORCE 1 1 4  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
                 "IFORCE 1 1 5  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
                 "IFORCE 2 1 4  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
                 "IFORCE 2 1 5  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
                 "IFORCE 3 1 4  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
                 "IFORCE 3 1 5  -50.0  0.1 2.0          [KB,KPAR,ICOL,FORCER,WLOW,WHIG]",
-                "       .",
             ]
-            insert_at = next((i for i, line in enumerate(lines) if "emerging particles" in line.lower()), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if "impact detectors" in line.lower()), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*NSIMSH\b", line, re.IGNORECASE)), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
-            lines[insert_at:insert_at] = section
             self._set_text("\n".join(lines))
         else:
             new_lines = self._remove_section_and_keyword_lines("Interaction forcing", "IFORCE")
@@ -22296,27 +23351,35 @@ class SimulationTab(QWidget):
         if enabled:
             if self._has_emerging_particles():
                 return
-            lines = self._get_text().split("\n")
-            section = [
-                "       >>>>>>>> Emerging particles. Energy and angular distributions.",
+            lines, start, end = self._ensure_sim_section("Emerging particles")
+            insert_at = self._insert_index_before_section_dot(lines, start, end)
+            lines[insert_at:insert_at] = [
                 "NBE    0.0 130e3 130                  [Energy window and no. of bins]",
                 "NBANGL 90 45              [Nos. of bins for the angles THETA and PHI]",
-                "       .",
             ]
-            _, inter_start, inter_end = self._section_bounds("Interaction forcing")
-            insert_at = inter_end if inter_start is not None else None
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if "impact detectors" in line.lower()), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if "job properties" in line.lower()), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*NSIMSH\b", line, re.IGNORECASE)), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
-            lines[insert_at:insert_at] = section
             self._set_text("\n".join(lines))
         else:
             new_lines = self._remove_section_and_keyword_lines("Emerging particles", ("NBE", "NBANGL"))
+            if new_lines == self._get_text().split("\n"):
+                return
+            self._set_text("\n".join(new_lines))
+        self._update_sim_action_labels()
+
+    def _set_psf_section_enabled(self, enabled):
+        if enabled:
+            if self._has_psf_section():
+                return
+            lines, start, end = self._ensure_sim_section("Input phase-space file")
+            insert_at = self._insert_index_before_section_dot(lines, start, end)
+            lines[insert_at:insert_at] = [
+                "IPSFN psf-input.dat             [Input psf name, up to 20 characters]",
+                "IPSPLI 1                        [Splitting number]",
+                "WGTWIN 1.0E-35 1.0E35           [Weight window, RR & splitting of psf particles]",
+                "EPMAX 1.0E6                     [Maximum energy of particles in the psf]",
+            ]
+            self._set_text("\n".join(lines))
+        else:
+            new_lines = self._remove_section_and_keyword_lines("Input phase-space file", ("IPSFN", "IPSPLI", "WGTWIN", "EPMAX"))
             if new_lines == self._get_text().split("\n"):
                 return
             self._set_text("\n".join(new_lines))
@@ -22381,6 +23444,43 @@ class SimulationTab(QWidget):
 
     def _spectr_prob_col_for_particle(self, particle):
         return {"1": 4, "2": 6, "3": 8}.get(str(particle).strip(), 6)
+
+    def _current_phase_space_defaults(self):
+        text = self._get_text()
+        defaults = {
+            "ipsfn": "",
+            "ipspli": "1",
+            "wgtwin_min": "1.0E-35",
+            "wgtwin_max": "1.0E35",
+            "epmax": "1.0E6",
+        }
+        match = re.search(r"^\s*IPSFN\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["ipsfn"] = match.group(1).strip()
+        match = re.search(r"^\s*IPSPLI\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["ipspli"] = match.group(1).strip()
+        match = re.search(r"^\s*WGTWIN\s+([^\s\[]+)\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["wgtwin_min"], defaults["wgtwin_max"] = match.group(1).strip(), match.group(2).strip()
+        match = re.search(r"^\s*EPMAX\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["epmax"] = match.group(1).strip()
+        return defaults
+
+    def _apply_phase_space_input_values(self, values):
+        ipsfn = str(values.get("IPSFN file", "") or "").strip()
+        if not ipsfn:
+            QMessageBox.warning(self, "Input phase-space file", "IPSFN file is required when the PSF section is enabled.")
+            return False
+        lines = [
+            f"IPSFN {ipsfn:<24}[Input psf name, up to 20 characters]",
+            f"IPSPLI {str(values.get('IPSPLI', '') or '').strip() or '1':<23}[Splitting number]",
+            f"WGTWIN {str(values.get('WGTWIN min', '') or '').strip() or '1.0E-35'} {str(values.get('WGTWIN max', '') or '').strip() or '1.0E35'}           [Weight window, RR & splitting of psf particles]",
+            f"EPMAX {str(values.get('EPMAX (eV)', '') or '').strip() or '1.0E6':<24}[Maximum energy of particles in the psf]",
+        ]
+        self._replace_section_keywords("Input phase-space file", ("IPSFN", "IPSPLI", "WGTWIN", "EPMAX"), lines)
+        return True
 
     def _normalize_spectrum_label(self, label):
         return re.sub(r"\s+", " ", str(label or "").strip())
@@ -22712,12 +23812,31 @@ class SimulationTab(QWidget):
         defaults["spectrum_source_kind"] = getattr(self, "_spectr_source_kind", "file")
         return defaults
 
+    def _cmd_phase_space_input(self):
+        defaults = self._current_phase_space_defaults()
+        dlg = _SimpleDialog(
+            "Input phase-space file (psf)",
+            [
+                ("IPSFN file", "entry", None, defaults["ipsfn"] or "psf-input.dat"),
+                ("IPSPLI", "entry", None, defaults["ipspli"]),
+                ("WGTWIN min", "entry", None, defaults["wgtwin_min"]),
+                ("WGTWIN max", "entry", None, defaults["wgtwin_max"]),
+                ("EPMAX (eV)", "entry", None, defaults["epmax"]),
+            ],
+            self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self._apply_phase_space_input_values(dlg.values()):
+            self.console.log("[SIM] Input phase-space section updated.\n", "ok")
+
     def _cmd_particle_source(self):
         source_defaults = self._current_source_defaults()
+        phase_defaults = self._current_phase_space_defaults()
         dlg = QDialog(self)
-        dlg.setWindowTitle("Add Particle Source" if not self._has_source_keywords() else "Edit Particle Source")
+        dlg.setWindowTitle("Source definition")
         dlg.setModal(True)
-        dlg.setMinimumWidth(520)
+        dlg.setMinimumWidth(620)
         dlg.setStyleSheet(
             f"QDialog {{ background:{P['bg']}; }}"
             f"QLabel {{ color:{P['fg']}; }}"
@@ -22726,18 +23845,31 @@ class SimulationTab(QWidget):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setSpacing(8)
 
+        cmb_source_mode = QComboBox()
+        cmb_source_mode.addItems(["Simple Source Definition", "Input psf file"])
+        cmb_source_mode.setCurrentIndex(1 if self._has_psf_section() else 0)
+        cmb_source_mode.setStyleSheet(combo_css())
+        form.addRow("Mode:", cmb_source_mode)
+
+        simple_rows = []
+        def add_simple_row(label_text, widget):
+            lbl = QLabel(label_text)
+            form.addRow(lbl, widget)
+            simple_rows.append((lbl, widget))
+            return lbl
+
         cmb_particle = QComboBox()
         cmb_particle.addItems(["1 - electron", "2 - photon", "3 - positron"])
         particle_idx = {"1": 0, "2": 1, "3": 2}.get(source_defaults["particle"], 1)
         cmb_particle.setCurrentIndex(particle_idx)
         cmb_particle.setStyleSheet(combo_css())
-        form.addRow("SKPAR:", cmb_particle)
+        add_simple_row("SKPAR:", cmb_particle)
 
         cmb_energy_type = QComboBox()
         cmb_energy_type.addItems(["SENERG - single energy", "SPECTR - spectrum source"])
         cmb_energy_type.setCurrentIndex(1 if source_defaults["energy_type"] == "SPECTR" else 0)
         cmb_energy_type.setStyleSheet(combo_css())
-        form.addRow("Energy type:", cmb_energy_type)
+        add_simple_row("Energy type:", cmb_energy_type)
 
         energy_row = QWidget()
         energy_lay = QHBoxLayout(energy_row)
@@ -22754,24 +23886,21 @@ class SimulationTab(QWidget):
         energy_lay.addWidget(e_energy)
         energy_lay.addWidget(cmb_unit)
         energy_lay.addStretch()
-        lbl_senerg = QLabel("SENERG:")
-        form.addRow(lbl_senerg, energy_row)
+        lbl_senerg = add_simple_row("SENERG:", energy_row)
 
         e_spectrum = QLineEdit("")
         e_spectrum.setStyleSheet(entry_css())
         e_spectrum.setPlaceholderText("Existing SPECTR will be preserved; click to replace from file")
         e_spectrum.setReadOnly(True)
         e_spectrum.setVisible(False)
-        lbl_spectr = QLabel("SPECTR:")
-        form.addRow(lbl_spectr, e_spectrum)
+        lbl_spectr = add_simple_row("SPECTR:", e_spectrum)
 
         cmb_spectrum_source = QComboBox()
         cmb_spectrum_source.addItems(["File (.dat/.txt)", "Spectrum Database"])
         cmb_spectrum_source.setStyleSheet(combo_css())
         cmb_spectrum_source.setCurrentIndex(1 if source_defaults.get("spectrum_source_kind") == "database" else 0)
         cmb_spectrum_source.setVisible(False)
-        lbl_spectrum_source = QLabel("Spectrum source:")
-        form.addRow(lbl_spectrum_source, cmb_spectrum_source)
+        lbl_spectrum_source = add_simple_row("Spectrum source:", cmb_spectrum_source)
 
         db_row = QWidget()
         db_lay = QHBoxLayout(db_row)
@@ -22785,8 +23914,7 @@ class SimulationTab(QWidget):
         db_lay.addWidget(cmb_spectrum_db, stretch=1)
         db_lay.addWidget(btn_create_spectrum)
         db_row.setVisible(False)
-        lbl_spectrum_db = QLabel("Spectrum DB:")
-        form.addRow(lbl_spectrum_db, db_row)
+        lbl_spectrum_db = add_simple_row("Spectrum DB:", db_row)
 
         def refresh_spectrum_db_choices(selected_label=""):
             labels = self._spectrum_database_choices()
@@ -22828,10 +23956,10 @@ class SimulationTab(QWidget):
             edit = QLineEdit(source_defaults["sposit"][idx])
             edit.setStyleSheet(entry_css())
             edit.setFixedWidth(72)
-            pos_lay.addWidget(edit)
-            pos_edits[axis] = edit
+        pos_lay.addWidget(edit)
+        pos_edits[axis] = edit
         pos_lay.addStretch()
-        form.addRow("SPOSIT:", pos_row)
+        add_simple_row("SPOSIT:", pos_row)
 
         cone_row = QWidget()
         cone_lay = QHBoxLayout(cone_row)
@@ -22853,7 +23981,7 @@ class SimulationTab(QWidget):
         cone_lay.addWidget(calc_btn)
         cone_lay.addWidget(help_btn)
         cone_lay.addStretch()
-        form.addRow("SCONE:", cone_row)
+        add_simple_row("SCONE:", cone_row)
 
         calc_group = QGroupBox("Calculate source from target, distance, beta, gamma")
         calc_group.setStyleSheet(group_css())
@@ -22893,7 +24021,36 @@ class SimulationTab(QWidget):
         calc_lay.addWidget(load_target_btn, 2, 2, 1, 2)
         calc_lay.addWidget(apply_calc_btn, 2, 4, 1, 2)
         calc_lay.addWidget(calc_hint, 3, 0, 1, 6)
-        form.addRow("", calc_group)
+        lbl_calc = add_simple_row("", calc_group)
+
+        psf_box = QGroupBox("Input phase-space file (psf)")
+        psf_box.setStyleSheet(group_css())
+        psf_form = QFormLayout(psf_box)
+        psf_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        e_ipsfn = QLineEdit(phase_defaults["ipsfn"] or "psf-input.dat")
+        e_ipspli = QLineEdit(phase_defaults["ipspli"])
+        e_wgtwin_min = QLineEdit(phase_defaults["wgtwin_min"])
+        e_wgtwin_max = QLineEdit(phase_defaults["wgtwin_max"])
+        e_epmax = QLineEdit(phase_defaults["epmax"])
+        for edit in (e_ipsfn, e_ipspli, e_wgtwin_min, e_wgtwin_max, e_epmax):
+            edit.setStyleSheet(entry_css())
+        wgt_row = QWidget()
+        wgt_lay = QHBoxLayout(wgt_row)
+        wgt_lay.setContentsMargins(0, 0, 0, 0)
+        wgt_lay.setSpacing(6)
+        wgt_lay.addWidget(QLabel("Min:"))
+        wgt_lay.addWidget(e_wgtwin_min)
+        wgt_lay.addWidget(QLabel("Max:"))
+        wgt_lay.addWidget(e_wgtwin_max)
+        wgt_lay.addStretch()
+        psf_form.addRow("IPSFN:", e_ipsfn)
+        psf_form.addRow("IPSPLI:", e_ipspli)
+        psf_form.addRow("WGTWIN:", wgt_row)
+        psf_form.addRow("EPMAX:", e_epmax)
+        psf_note = QLabel("When this mode is active, penmain reads primaries from the phase-space file and ignores the simple source definition values.")
+        psf_note.setWordWrap(True)
+        psf_note.setStyleSheet(label_css(P["fg2"]))
+        psf_form.addRow("", psf_note)
 
         def _parse_float_field(key):
             raw = (calc_edits[key].text() or "").strip().replace(",", ".")
@@ -23045,30 +24202,54 @@ class SimulationTab(QWidget):
         ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
 
         def update_energy_mode():
+            simple_mode = cmb_source_mode.currentIndex() == 0
             is_spectrum = cmb_energy_type.currentText().startswith("SPECTR")
             use_db = cmb_spectrum_source.currentIndex() == 1
-            lbl_senerg.setVisible(not is_spectrum)
-            energy_row.setVisible(not is_spectrum)
-            lbl_spectr.setVisible(is_spectrum)
-            e_spectrum.setVisible(is_spectrum and not use_db)
-            lbl_spectrum_source.setVisible(is_spectrum)
-            cmb_spectrum_source.setVisible(is_spectrum)
-            lbl_spectrum_db.setVisible(is_spectrum and use_db)
-            db_row.setVisible(is_spectrum and use_db)
-            note.setVisible(is_spectrum)
+            lbl_senerg.setVisible(simple_mode and not is_spectrum)
+            energy_row.setVisible(simple_mode and not is_spectrum)
+            lbl_spectr.setVisible(simple_mode and is_spectrum)
+            e_spectrum.setVisible(simple_mode and is_spectrum and not use_db)
+            lbl_spectrum_source.setVisible(simple_mode and is_spectrum)
+            cmb_spectrum_source.setVisible(simple_mode and is_spectrum)
+            lbl_spectrum_db.setVisible(simple_mode and is_spectrum and use_db)
+            db_row.setVisible(simple_mode and is_spectrum and use_db)
+            note.setVisible(simple_mode and is_spectrum)
             ok_btn.setEnabled(True)
+
+        def update_source_mode():
+            simple_mode = cmb_source_mode.currentIndex() == 0
+            for lbl, widget in simple_rows:
+                lbl.setVisible(simple_mode)
+                widget.setVisible(simple_mode)
+            lbl_calc.setVisible(simple_mode)
+            psf_box.setVisible(not simple_mode)
+            update_energy_mode()
 
         cmb_energy_type.currentTextChanged.connect(lambda _txt: update_energy_mode())
         cmb_spectrum_source.currentTextChanged.connect(lambda _txt: update_energy_mode())
-        update_energy_mode()
+        cmb_source_mode.currentTextChanged.connect(lambda _txt: update_source_mode())
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
 
         lay = QVBoxLayout(dlg)
         lay.addLayout(form)
+        lay.addWidget(psf_box)
         lay.addWidget(note)
         lay.addWidget(buttons)
+        update_source_mode()
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if cmb_source_mode.currentIndex() == 1:
+            values = {
+                "IPSFN file": e_ipsfn.text(),
+                "IPSPLI": e_ipspli.text(),
+                "WGTWIN min": e_wgtwin_min.text(),
+                "WGTWIN max": e_wgtwin_max.text(),
+                "EPMAX (eV)": e_epmax.text(),
+            }
+            if self._apply_phase_space_input_values(values):
+                self.console.log("[SIM] Source definition updated (input psf file mode).\n", "ok")
             return
 
         particle = cmb_particle.currentText().split(" ", 1)[0]
@@ -23137,6 +24318,8 @@ class SimulationTab(QWidget):
             self._spectr_auto_sync_enabled = False
             self._spectr_source_kind = "file"
             self._spectr_database_label = ""
+
+        self._set_psf_section_enabled(False)
 
         self._replace_source_attribute(
             ("SKPAR", "SENERG", "SPECTR", "SPOSIT", "SCONE"),
@@ -23291,6 +24474,40 @@ class SimulationTab(QWidget):
         self._set_text("\n".join(lines))
         self._update_sim_action_labels()
 
+    def _import_material_files_to_project(self, parent=None):
+        target_dir = self._project_materials_folder()
+        if target_dir is None:
+            QMessageBox.warning(parent or self, "Import materials", "Open a project first so Studio knows which project materials folder should receive the imported .mat files.")
+            return False
+        start_dir = str(self._material_list_folder() or self._in_folder())
+        paths, _ = QFileDialog.getOpenFileNames(
+            parent or self,
+            "Import materials to project folder",
+            start_dir,
+            "Material files (*.mat);;All files (*.*)",
+        )
+        if not paths:
+            return False
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        skipped = 0
+        for raw in paths:
+            src = Path(raw)
+            dst = target_dir / src.name
+            try:
+                changed = self._safe_copy_file(src, dst, overwrite=False)
+                if changed:
+                    copied += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                self.console.log(f"[SIM] Material import failed for {src.name}: {exc}\n", "warn")
+                skipped += 1
+        self._mat_list_folder = str(target_dir)
+        self._update_file_source_labels()
+        self.console.log(f"[SIM] Imported {copied} material file(s) into project folder; {skipped} skipped.\n", "ok" if copied else "warn")
+        return copied > 0
+
     def _cmd_edit_materials(self):
         entries = self._material_entries()
         mat_files = self._material_dropdown_files()
@@ -23315,6 +24532,18 @@ class SimulationTab(QWidget):
         hint.setStyleSheet(label_css(P["fg2"]))
         hint.setWordWrap(True)
         outer.addWidget(hint)
+        top_btn_row = QHBoxLayout()
+        top_btn_row.setContentsMargins(0, 0, 0, 0)
+        top_btn_row.setSpacing(6)
+        btn_import_materials = QPushButton("Import Materials")
+        btn_import_materials.setToolTip("Copy selected .mat files into the active project's materials folder.")
+        btn_import_materials.setStyleSheet(btn_css(P["bg2"], 130))
+        btn_import_materials.clicked.connect(
+            lambda: (dlg.done(43) if self._import_material_files_to_project(dlg) else None)
+        )
+        top_btn_row.addWidget(btn_import_materials)
+        top_btn_row.addStretch()
+        outer.addLayout(top_btn_row)
         folder_row = QWidget()
         folder_lay = QHBoxLayout(folder_row)
         folder_lay.setContentsMargins(0, 0, 0, 0)
@@ -23488,7 +24717,7 @@ class SimulationTab(QWidget):
         buttons.rejected.connect(dlg.reject)
         outer.addWidget(buttons)
         result = dlg.exec()
-        if result == 42:
+        if result in {42, 43}:
             self._cmd_edit_materials()
             return
         if result != QDialog.DialogCode.Accepted:
@@ -23655,12 +24884,9 @@ class SimulationTab(QWidget):
         self.console.log(f"[SIM] Geometry file set: {v}\n", "ok")
 
     def _ensure_impact_section(self):
-        lines, start, end = self._section_bounds("Impact detectors")
-        if start is not None:
-            return lines, start, end
-
-        new_section = [
-            "       >>>>>>>> Impact detectors (up to 25 different detectors).",
+        lines, start, end = self._ensure_sim_section("Impact detectors")
+        section_text = "\n".join(lines[start + 1:end])
+        comments = [
             "       IPSF=0; no psf is created.",
             "       IPSF=1; the psf is created.",
             "       IDCUT=0; tracking is discontinued at the detector entrance.",
@@ -23668,21 +24894,13 @@ class SimulationTab(QWidget):
             "       IDCUT=2; the detector does not affect tracking, the energy",
             "                distribution of particle fluence (averaged over the",
             "                volume of the detector) is calculated.",
-            "       .",
         ]
-
-        _em_lines, em_start, em_end = self._section_bounds("Emerging particles")
-        if em_start is not None:
-            insert_at = em_end
-        else:
-            insert_at = next((i for i, line in enumerate(lines) if "job properties" in line.lower()), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*NSIMSH\b", line, re.IGNORECASE)), None)
-            if insert_at is None:
-                insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
-        lines[insert_at:insert_at] = new_section
-        self._set_text("\n".join(lines))
-        lines, start, end = self._section_bounds("Impact detectors")
+        missing = [line for line in comments if line not in section_text]
+        if missing:
+            insert_at = self._insert_index_before_section_dot(lines, start, end)
+            lines[insert_at:insert_at] = missing
+            self._set_text("\n".join(lines))
+            lines, start, end = self._section_bounds("Impact detectors")
         return lines, start, end
 
     def _cmd_add_impdet(self):
@@ -23740,34 +24958,7 @@ class SimulationTab(QWidget):
         self.console.log(f"[SIM] Added IMPDET for body {body_id}.\n", "ok")
 
     def _ensure_energy_deposition_section(self):
-        lines, start, end = self._section_bounds("Energy deposition detectors")
-        if start is not None:
-            return lines, start, end
-
-        new_section = [
-            "       >>>>>>>> Energy deposition detectors (up to 25).",
-            "       .",
-        ]
-
-        _imp_lines, imp_start, imp_end = self._section_bounds("Impact detectors")
-        if imp_start is not None:
-            insert_at = imp_end
-        else:
-            _em_lines, em_start, em_end = self._section_bounds("Emerging particles")
-            if em_start is not None:
-                insert_at = em_end
-            else:
-                insert_at = next((i for i, line in enumerate(lines) if "dose distribution" in line.lower()), None)
-                if insert_at is None:
-                    insert_at = next((i for i, line in enumerate(lines) if "job properties" in line.lower()), None)
-                if insert_at is None:
-                    insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*NSIMSH\b", line, re.IGNORECASE)), None)
-                if insert_at is None:
-                    insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
-        lines[insert_at:insert_at] = new_section
-        self._set_text("\n".join(lines))
-        lines, start, end = self._section_bounds("Energy deposition detectors")
-        return lines, start, end
+        return self._ensure_sim_section("Energy deposition detectors")
 
     def _set_energy_deposition_enabled(self, enabled):
         if enabled:
@@ -23887,7 +25078,15 @@ class SimulationTab(QWidget):
             values["nx"], values["ny"], values["nz"] = match.group(1), match.group(2), match.group(3)
         return values
 
-    def _suggest_dose_distribution_values(self, prefer_current=True):
+    def _suggest_dose_distribution_values(
+        self,
+        prefer_current=True,
+        scope="geometry",
+        body_id=None,
+        padding_cm=0.5,
+        voxel_step_cm=0.5,
+        force_odd_bins=True,
+    ):
         current = self._current_dose_distribution_values()
         if prefer_current and all(k in current for k in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max", "nx", "ny", "nz")):
             return current
@@ -23901,31 +25100,54 @@ class SimulationTab(QWidget):
         if geo_path and geo_path.exists():
             try:
                 text = _decode_text_bytes(geo_path.read_bytes())
-                surfaces, _bodies = _parse_geo(text)
+                surfaces, bodies = _parse_geo(text)
                 markers = _geo_axis_markers(surfaces)
-                bounds = _geo_axis_bounds(surfaces)
+                global_bounds = _geo_axis_bounds(surfaces)
+                axis_bounds = {}
+                if str(scope or "geometry").lower() == "body" and body_id not in (None, "", 0):
+                    try:
+                        wanted_id = int(body_id)
+                    except (TypeError, ValueError):
+                        wanted_id = 0
+                    body = next((b for b in (bodies or []) if int(b.get("id", 0) or 0) == wanted_id), None)
+                    body_bounds = _geo_body_axis_bounds(body, surfaces) if body else None
+                    if body_bounds:
+                        axis_bounds = body_bounds
+                if not axis_bounds:
+                    for axis in ("X", "Y", "Z"):
+                        lo = global_bounds[axis]["low"]
+                        hi = global_bounds[axis]["high"]
+                        if lo is None or hi is None:
+                            vals = markers.get(axis, [])
+                            if vals:
+                                lo = min(vals)
+                                hi = max(vals)
+                        if lo is not None and hi is not None:
+                            axis_bounds[axis] = (lo, hi)
+                try:
+                    pad_override = float(padding_cm)
+                except (TypeError, ValueError):
+                    pad_override = 0.5
+                try:
+                    voxel_step = max(0.01, float(voxel_step_cm))
+                except (TypeError, ValueError):
+                    voxel_step = 0.5
                 for axis, key_min, key_max in (("X", "x_min", "x_max"), ("Y", "y_min", "y_max"), ("Z", "z_min", "z_max")):
-                    lo = bounds[axis]["low"]
-                    hi = bounds[axis]["high"]
-                    if lo is None or hi is None:
-                        vals = markers.get(axis, [])
-                        if vals:
-                            lo = min(vals)
-                            hi = max(vals)
-                    if lo is None or hi is None:
+                    if axis not in axis_bounds:
                         continue
+                    lo, hi = axis_bounds[axis]
                     if abs(hi - lo) < 1e-12:
-                        pad = 1.0
+                        pad = max(pad_override, 1.0)
                     else:
-                        pad = max(abs(hi - lo) * 0.05, 0.5)
+                        pad = max(abs(hi - lo) * 0.05, pad_override)
                     lo -= pad
                     hi += pad
                     defaults[key_min] = f"{lo:g}"
                     defaults[key_max] = f"{hi:g}"
-                    span = max(hi - lo, 0.5)
-                    bins_val = min(101, max(11, int(round(span / 0.5))))
-                    if bins_val % 2 == 0:
-                        bins_val += 1 if bins_val < 101 else -1
+                    span = max(hi - lo, voxel_step)
+                    bins_val = min(301, max(3, int(round(span / voxel_step))))
+                    if force_odd_bins and bins_val % 2 == 0:
+                        bins_val += 1 if bins_val < 301 else -1
                     defaults[{"X": "nx", "Y": "ny", "Z": "nz"}[axis]] = str(max(1, bins_val))
             except Exception:
                 pass
@@ -23934,31 +25156,7 @@ class SimulationTab(QWidget):
         return defaults
 
     def _ensure_dose_distribution_section(self):
-        lines, start, end = self._section_bounds("Dose distribution")
-        if start is not None:
-            return lines, start, end
-
-        new_section = [
-            "       >>>>>>>> Dose distribution.",
-            "       .",
-        ]
-        _ed_lines, ed_start, ed_end = self._section_bounds("Energy deposition detectors")
-        if ed_start is not None:
-            insert_at = ed_end
-        else:
-            _imp_lines, imp_start, imp_end = self._section_bounds("Impact detectors")
-            if imp_start is not None:
-                insert_at = imp_end
-            else:
-                insert_at = next((i for i, line in enumerate(lines) if "job properties" in line.lower()), None)
-                if insert_at is None:
-                    insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*NSIMSH\b", line, re.IGNORECASE)), None)
-                if insert_at is None:
-                    insert_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*END\b", line, re.IGNORECASE)), len(lines))
-        lines[insert_at:insert_at] = new_section
-        self._set_text("\n".join(lines))
-        lines, start, end = self._section_bounds("Dose distribution")
-        return lines, start, end
+        return self._ensure_sim_section("Dose distribution")
 
     def _set_dose_distribution_enabled(self, enabled):
         if enabled:
@@ -23989,6 +25187,65 @@ class SimulationTab(QWidget):
         dlg.setMinimumWidth(560)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
+
+        geo_path = self._current_geom_path()
+        geo_row = QHBoxLayout()
+        geo_row.setContentsMargins(0, 0, 0, 0)
+        geo_row.setSpacing(6)
+        geo_row.addWidget(QLabel("Linked GEOMFN:"))
+        lbl_geo = QLabel(str(geo_path) if geo_path else "(none)")
+        lbl_geo.setWordWrap(True)
+        lbl_geo.setStyleSheet(label_css(P["fg2"]))
+        geo_row.addWidget(lbl_geo, stretch=1)
+        lay.addLayout(geo_row)
+
+        auto_group = QGroupBox("Auto-fit from linked geometry")
+        auto_group.setStyleSheet(group_css())
+        auto_form = QGridLayout(auto_group)
+        auto_form.setHorizontalSpacing(8)
+        auto_form.setVerticalSpacing(6)
+        cmb_scope = QComboBox()
+        cmb_scope.setStyleSheet(combo_css())
+        cmb_scope.addItem("Whole linked geometry (GEOMFN)", "geometry")
+        cmb_scope.addItem("Selected BODY in linked geometry", "body")
+        cmb_body = QComboBox()
+        cmb_body.setStyleSheet(combo_dropdown_css())
+        cmb_body.setEnabled(False)
+        body_options = self._geo_body_options()
+        for option in body_options:
+            body_txt = (option or "").strip().split(maxsplit=1)[0]
+            try:
+                body_ident = int(body_txt)
+            except ValueError:
+                continue
+            cmb_body.addItem(option, body_ident)
+        e_padding = QLineEdit("0.5")
+        e_padding.setStyleSheet(entry_css())
+        e_padding.setFixedWidth(90)
+        e_voxel = QLineEdit("0.5")
+        e_voxel.setStyleSheet(entry_css())
+        e_voxel.setFixedWidth(90)
+        chk_odd = QCheckBox("Prefer odd bin counts")
+        chk_odd.setStyleSheet(checkbox_css())
+        chk_odd.setChecked(True)
+        lbl_auto_preview = QLabel("")
+        lbl_auto_preview.setWordWrap(True)
+        lbl_auto_preview.setStyleSheet(label_css(P["fg2"], size=9))
+        btn_geom = QPushButton("Auto-fill from linked geometry")
+        btn_geom.setStyleSheet(btn_css(width=210))
+        auto_form.addWidget(QLabel("Reference:"), 0, 0)
+        auto_form.addWidget(cmb_scope, 0, 1, 1, 3)
+        auto_form.addWidget(QLabel("BODY:"), 1, 0)
+        auto_form.addWidget(cmb_body, 1, 1, 1, 3)
+        auto_form.addWidget(QLabel("Padding (cm):"), 2, 0)
+        auto_form.addWidget(e_padding, 2, 1)
+        auto_form.addWidget(QLabel("Voxel step (cm):"), 2, 2)
+        auto_form.addWidget(e_voxel, 2, 3)
+        auto_form.addWidget(chk_odd, 3, 0, 1, 2)
+        auto_form.addWidget(btn_geom, 3, 2, 1, 2)
+        auto_form.addWidget(lbl_auto_preview, 4, 0, 1, 4)
+        lay.addWidget(auto_group)
+
         form = QGridLayout()
         form.setHorizontalSpacing(8)
         form.setVerticalSpacing(6)
@@ -24009,29 +25266,54 @@ class SimulationTab(QWidget):
         lay.addLayout(form)
 
         hint = QLabel(
-            "This defines the penmain dose box. Studio can suggest bounds from the current GEOMFN geometry; "
-            "odd bin counts are usually preferred so the central axes pass through voxel centres."
+            "This defines the penmain dose box. Studio can auto-fit the XYZ bounds from the current GEOMFN "
+            "geometry or from one selected BODY, and it can derive GRIDBN from a target voxel step."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(label_css(P["fg2"]))
         lay.addWidget(hint)
 
-        btn_geom = QPushButton("Use Geometry Defaults")
-        btn_geom.setStyleSheet(btn_css(width=160))
+        def current_auto_args():
+            return {
+                "scope": str(cmb_scope.currentData() or "geometry"),
+                "body_id": cmb_body.currentData(),
+                "padding_cm": e_padding.text().strip() or "0.5",
+                "voxel_step_cm": e_voxel.text().strip() or "0.5",
+                "force_odd_bins": chk_odd.isChecked(),
+            }
+
+        def refresh_auto_preview():
+            args = current_auto_args()
+            cmb_body.setEnabled(args["scope"] == "body")
+            sugg = self._suggest_dose_distribution_values(prefer_current=False, **args)
+            preview = (
+                f"X[{sugg.get('x_min', '?')}, {sugg.get('x_max', '?')}]  "
+                f"Y[{sugg.get('y_min', '?')}, {sugg.get('y_max', '?')}]  "
+                f"Z[{sugg.get('z_min', '?')}, {sugg.get('z_max', '?')}]\n"
+                f"GRIDBN = ({sugg.get('nx', '?')}, {sugg.get('ny', '?')}, {sugg.get('nz', '?')})"
+            )
+            if args["scope"] == "body" and cmb_body.currentText():
+                preview = f"{cmb_body.currentText()}\n" + preview
+            elif geo_path:
+                preview = f"{Path(geo_path).name}\n" + preview
+            lbl_auto_preview.setText(preview)
+
         def refill_from_geometry():
-            sugg = self._suggest_dose_distribution_values(prefer_current=False)
+            sugg = self._suggest_dose_distribution_values(prefer_current=False, **current_auto_args())
             for key, edit in fields.items():
                 edit.setText(sugg.get(key, edit.text()))
         btn_geom.clicked.connect(refill_from_geometry)
+        cmb_scope.currentIndexChanged.connect(lambda _i: refresh_auto_preview())
+        cmb_body.currentIndexChanged.connect(lambda _i: refresh_auto_preview())
+        e_padding.textChanged.connect(lambda _txt: refresh_auto_preview())
+        e_voxel.textChanged.connect(lambda _txt: refresh_auto_preview())
+        chk_odd.stateChanged.connect(lambda _state: refresh_auto_preview())
+        refresh_auto_preview()
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.setStyleSheet(btn_css(P["bg2"]))
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(btn_geom)
-        btn_row.addStretch()
-        lay.addLayout(btn_row)
         lay.addWidget(buttons)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -24085,6 +25367,86 @@ class SimulationTab(QWidget):
         self._replace_or_insert_before_end(
             "TIME",
             f"TIME   {v:<24}         [Allotted simulation time, in sec]")
+
+    def _current_job_properties_defaults(self):
+        text = self._get_text()
+        defaults = {
+            "resume": "",
+            "dumpto": "dump.dmp",
+            "dumpp": "60",
+            "rseed1": "",
+            "rseed2": "",
+            "nsimsh": "1e6",
+            "time": "3600",
+        }
+        match = re.search(r"^\s*RESUME\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["resume"] = match.group(1).strip()
+        match = re.search(r"^\s*DUMPTO\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["dumpto"] = match.group(1).strip()
+        match = re.search(r"^\s*DUMPP\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["dumpp"] = match.group(1).strip()
+        match = re.search(r"^\s*RSEED\s+([^\s\[]+)\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["rseed1"], defaults["rseed2"] = match.group(1).strip(), match.group(2).strip()
+        match = re.search(r"^\s*NSIMSH\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["nsimsh"] = match.group(1).strip()
+        match = re.search(r"^\s*TIME\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            defaults["time"] = match.group(1).strip()
+        return defaults
+
+    def _cmd_job_properties(self):
+        defaults = self._current_job_properties_defaults()
+        dlg = _SimpleDialog(
+            "Job Properties",
+            [
+                ("Resume file", "entry", None, defaults["resume"]),
+                ("Dump file", "entry", None, defaults["dumpto"]),
+                ("Dump period (s)", "entry", None, defaults["dumpp"]),
+                ("RSEED 1", "entry", None, defaults["rseed1"]),
+                ("RSEED 2", "entry", None, defaults["rseed2"]),
+                ("NSIMSH", "entry", None, defaults["nsimsh"]),
+                ("Time (seconds)", "entry", None, defaults["time"]),
+            ],
+            self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dlg.values()
+        section_lines = []
+        resume = str(values.get("Resume file", "") or "").strip()
+        dumpto = str(values.get("Dump file", "") or "").strip()
+        dumpp = str(values.get("Dump period (s)", "") or "").strip()
+        if resume:
+            section_lines.append(f"RESUME {resume:<24}[Resume from this dump file, 20 chars]")
+        if dumpto:
+            section_lines.append(f"DUMPTO {dumpto:<23}[Generate this dump file, 20 chars]")
+        if dumpp:
+            section_lines.append(f"DUMPP  {dumpp:<24}[Dumping period, in sec]")
+        self._replace_section_keywords("Job properties", ("RESUME", "DUMPTO", "DUMPP"), section_lines)
+
+        rseed1 = str(values.get("RSEED 1", "") or "").strip()
+        rseed2 = str(values.get("RSEED 2", "") or "").strip()
+        if rseed1 and rseed2:
+            self._replace_or_insert_before_end(
+                "RSEED",
+                f"RSEED  {rseed1} {rseed2}                 [Seeds of the random-number generator]"
+            )
+        nsim = str(values.get("NSIMSH", "") or "").strip() or defaults["nsimsh"]
+        self._replace_or_insert_before_end(
+            "NSIMSH",
+            f"NSIMSH {nsim:<24}      [Desired number of simulated showers]"
+        )
+        time_v = str(values.get("Time (seconds)", "") or "").strip() or defaults["time"]
+        self._replace_or_insert_before_end(
+            "TIME",
+            f"TIME   {time_v:<24}         [Allotted simulation time, in sec]"
+        )
+        self.console.log("[SIM] Job properties updated.\n", "ok")
 
 
     #  Split-run folder generation
@@ -25208,16 +26570,16 @@ class SimulationTab(QWidget):
     def _show_batch_result_tooltip(self, key):
         key = self._batch_key_from_link(key)
         if not key:
-            QToolTip.hideText()
+            hide_uniform_tooltip()
             return
         title, rows = self._batch_rows_for_key(key)
         if not rows:
-            QToolTip.showText(QCursor.pos(), f"{title}<br>No runs recorded.", self.lbl_batch_progress)
+            show_uniform_tooltip(QCursor.pos(), f"{title}<br>No runs recorded.", self.lbl_batch_progress)
             return
         preview = rows[:12]
         more = "" if len(rows) <= len(preview) else f"<br><i>... {len(rows) - len(preview)} more. Click for full list.</i>"
         html = f"<b>{escape(title)}</b><br>" + "<br>".join(escape(row) for row in preview) + more
-        QToolTip.showText(QCursor.pos(), html, self.lbl_batch_progress)
+        show_uniform_tooltip(QCursor.pos(), html, self.lbl_batch_progress)
 
     def _show_batch_result_list(self, key):
         key = self._batch_key_from_link(key)
@@ -25584,21 +26946,27 @@ class SimulationTab(QWidget):
                 self._record_batch_result("failed", in_path, "duplicate active case", run_folder=run_folder)
                 self._update_batch_progress()
             return False
-        try:
-            self._archive_previous_run_outputs(
-                in_path,
-                run_folder,
-                fresh=(int(retry_count) == 0),
-                include_dmp=not preserve_dmp,
+        if preserve_dmp:
+            self.console.log(
+                f"[SIM] Resume requested for {run_folder.name}: preserving current outputs and .dmp in place.\n",
+                "info",
             )
-        except Exception as exc:
-            self.console.log(f"[SIM] Previous-run archive failed for {run_folder}: {exc}\n", "err")
-            if batch:
-                self._batch_finished += 1
-                self._batch_failed += 1
-                self._record_batch_result("failed", in_path, f"previous-run archive failed: {exc}", run_folder=run_folder)
-                self._update_batch_progress()
-            return False
+        else:
+            try:
+                self._archive_previous_run_outputs(
+                    in_path,
+                    run_folder,
+                    fresh=(int(retry_count) == 0),
+                    include_dmp=not preserve_dmp,
+                )
+            except Exception as exc:
+                self.console.log(f"[SIM] Previous-run archive failed for {run_folder}: {exc}\n", "err")
+                if batch:
+                    self._batch_finished += 1
+                    self._batch_failed += 1
+                    self._record_batch_result("failed", in_path, f"previous-run archive failed: {exc}", run_folder=run_folder)
+                    self._update_batch_progress()
+                return False
         try:
             local_in_path, runtime_copy_counts, copied_execs = self._prepare_runtime_case_files(in_path, run_folder, batch=batch)
         except Exception as exc:
@@ -25953,10 +27321,29 @@ class SimulationTab(QWidget):
         found = list(found or [])
         self._startup_external_scan_worker = None
         self._startup_external_scan_thread = None
+        if not found:
+            return
+        msg = (
+            f"Penelope Studio found {len(found)} external penmain simulation(s) already running.\n\n"
+            "Do you want to link them into the Simulation tab for tracking?\n\n"
+            "Choose No to ignore them for this session."
+        )
+        choice = QMessageBox.question(
+            self,
+            "Link external simulations",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            self.console.log(
+                f"[SIM] Ignored {len(found)} external penmain process(es) found at startup.\n",
+                "info",
+            )
+            return
         for info in found:
             self._link_external_sim(info["pid"], info.get("cwd", ""))
-        if found:
-            self.console.log(f"[SIM] Auto-linked {len(found)} external penmain process(es) found at startup.\n", "ok")
+        self.console.log(f"[SIM] Linked {len(found)} external penmain process(es) found at startup.\n", "ok")
 
     def _on_startup_external_scan_error(self, err):
         self._startup_external_scan_worker = None
@@ -26017,6 +27404,7 @@ class SimulationTab(QWidget):
                 "runs": runs_data,
                 "queue": queue_data,
                 "batch_total": int(self._batch_total),
+                "use_dmp": bool(getattr(self, "chk_batch_use_dmp", None) and self.chk_batch_use_dmp.isChecked()),
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
             }
             self._sim_state_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -26060,6 +27448,8 @@ class SimulationTab(QWidget):
             return
         if choice != QMessageBox.StandardButton.Yes:
             return
+        if hasattr(self, "chk_batch_use_dmp"):
+            self.chk_batch_use_dmp.setChecked(bool(payload.get("use_dmp", False)))
         if queue:
             self._batch_queue = list(queue)
             self._batch_total = int(payload.get("batch_total", len(queue)) or len(queue))
@@ -27459,7 +28849,7 @@ class AnalysisLoadWorker(QObject):
 class AnalysisTab(QWidget):
     status_message = Signal(str)
     DOSE_HEADERS = [
-        "Case", "R (m)", "Body", "Component",
+        "Case", "Body",
         "Edep (eV)", "dE (eV)", "Edep (J)", "dE (J)", "Error (%)", "Mass (kg)",
         "Dose (Gy)", "dDose (Gy)", "Dose (eV/g)", "dDose (eV/g)",
         "N ref", "Time ref (s)", "Target Err (%)", "NSIMSH @5%", "Time @5% (s)",
@@ -27878,31 +29268,13 @@ class AnalysisTab(QWidget):
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
         chosen_path = Path(path)
-        config = None
-        if chosen_path.exists():
-            openpyxl = self._load_openpyxl()
-            if openpyxl is not None:
-                try:
-                    wb = openpyxl.load_workbook(chosen_path)
-                    config = self._read_dose_workbook_config(wb)
-                except Exception:
-                    config = None
-        else:
-            config = self._prompt_dose_workbook_config(existing=self._dose_workbook_config)
-            if config is None:
-                self._log_analysis("Dose workbook selection canceled: target BODY / R configuration is required for a new workbook.", "warn")
-                return
         self._dose_xlsx = chosen_path
         self._dose_xlsx_user_selected = True
-        self._dose_workbook_config = config
+        self._dose_workbook_config = None
         state = "existing" if self._dose_xlsx.exists() else "will be created on append"
         self._update_dose_xlsx_label(state)
         self.status_message.emit(f"Dose workbook selected: {self._dose_xlsx}")
-        summary = self._dose_workbook_config_summary()
-        if summary:
-            self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}; {summary}).", "info")
-        else:
-            self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}).", "info")
+        self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}).", "info")
         self._refresh_dose_columns()
 
     def _extract_source_info_from_in(self, folder):
@@ -29573,23 +30945,7 @@ class AnalysisTab(QWidget):
         changed = self._normalize_dose_sheet_headers(ws)
         if changed:
             self._log_analysis("Dose workbook headers were inserted/updated.", "warn")
-        config = self._read_dose_workbook_config(wb)
-        if config is None:
-            config = self._dose_workbook_config or self._prompt_dose_workbook_config()
-            if config is None:
-                self._log_analysis("Dose workbook setup canceled: target BODY / R configuration is required.", "warn")
-                return None, None
-            self._write_dose_workbook_config(wb, config)
-            self._log_analysis(
-                f"Dose workbook target configured: {self._dose_workbook_config_summary(config)}.",
-                "info",
-            )
-        else:
-            self._log_analysis(
-                f"Dose workbook target loaded: {self._dose_workbook_config_summary(config)}.",
-                "info",
-            )
-        self._dose_workbook_config = config
+        self._dose_workbook_config = self._read_dose_workbook_config(wb)
         self._update_dose_xlsx_label("existing" if path.exists() else "will be created on append")
         return wb, ws
 
@@ -29634,7 +30990,6 @@ class AnalysisTab(QWidget):
     def _apply_dose_number_formats(self, ws):
         headers = self._dose_header_map(ws)
         scientific_headers = (
-            "R (m)",
             "Edep (eV)",
             "dE (eV)",
             "Edep (J)",
@@ -29711,7 +31066,6 @@ class AnalysisTab(QWidget):
 
     def _dose_rows_for_current_results(self):
         case = self._workspace.name if self._workspace else ""
-        r_value = self._distance_r_m(self._dose_workbook_config)
         total_edep = 0.0
         total_dedep_sq = 0.0
         total_mass = 0.0
@@ -29733,9 +31087,7 @@ class AnalysisTab(QWidget):
             dedep_j = result["dedep"] * self.EV_TO_J
             rows.append([
                 case,
-                r_value,
                 f"Body {result['body_id']}",
-                result["component"],
                 result["edep"],
                 result["dedep"],
                 edep_j,
@@ -29770,9 +31122,7 @@ class AnalysisTab(QWidget):
         total_dedep_j = total_dedep * self.EV_TO_J
         rows.append([
             case,
-            r_value,
             "TOTAL",
-            "Total Dosage",
             total_edep,
             total_dedep,
             total_edep_j,
