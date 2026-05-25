@@ -583,6 +583,7 @@ PROJECT_CASE_FIELD_SPECS = [
     ("surface_count", "Surface count", ".geo"),
 ]
 PROJECT_CASE_FIELD_DEFAULTS = ["particle_type", "energy_type", "geo_file", "nsimsh"]
+DEFAULT_BATCH_FOLDER_TOKEN_KEYS = ("senerg", "spectr", "sposit", "scone")
 SHOW_PROJECT_VARIABLES_UI = False
 SHOW_PROJECT_CASE_NAME_UI = False
 
@@ -1536,6 +1537,55 @@ class WrappingButtonRow(QWidget):
         self._grid.setColumnStretch(col, 1)
         self._grid.invalidate()
         self.updateGeometry()
+
+
+class CornerToast(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("cornerToast")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowFlags(Qt.WindowType.SubWindow | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(
+            f"QFrame#cornerToast {{"
+            f" background:{P['bg2']}; color:{P['fg']};"
+            f" border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        self.setMinimumWidth(280)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(4)
+        self.lbl_title = QLabel("")
+        self.lbl_title.setStyleSheet(label_css(P["accent"], bold=True, size=10))
+        self.lbl_body = QLabel("")
+        self.lbl_body.setStyleSheet(label_css(P["fg"], size=9))
+        self.lbl_body.setWordWrap(True)
+        outer.addWidget(self.lbl_title)
+        outer.addWidget(self.lbl_body)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+
+    def show_toast(self, title, body="", timeout_ms=5000):
+        self.lbl_title.setText(str(title or "Notice"))
+        self.lbl_body.setText(str(body or ""))
+        self.adjustSize()
+        self._reposition()
+        self.raise_()
+        self.show()
+        self._timer.start(max(1200, int(timeout_ms or 5000)))
+
+    def _reposition(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.adjustSize()
+        margin = 18
+        width = max(self.minimumWidth(), self.sizeHint().width())
+        height = self.sizeHint().height()
+        x = max(margin, parent.width() - width - margin)
+        y = max(margin, parent.height() - height - margin)
+        self.setGeometry(x, y, width, height)
 
 
 def _inline_widget_group(*widgets, spacing=6, stretch_last=False):
@@ -17147,6 +17197,110 @@ def _scan_external_penmain_pids_snapshot(our_pids):
     return results
 
 
+def _pid_still_running(pid):
+    try:
+        pid = int(pid or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            wait = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return wait == 0x00000102  # WAIT_TIMEOUT -> still running
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _penmain_result_health(folder):
+    folder = Path(folder)
+    res_path = folder / "penmain-res.dat"
+    log_path = folder / "penmain.dat"
+    dump_files = sorted(p for p in folder.glob("*.dmp") if p.is_file())
+    dose_files = [name for name in ("3d-dose.dat", "x-dose.dat", "y-dose.dat", "z-dose.dat", "depth-dose.dat") if (folder / name).exists()]
+    data = {
+        "folder": str(folder),
+        "res_path": str(res_path),
+        "log_path": str(log_path),
+        "res_exists": res_path.exists(),
+        "log_exists": log_path.exists(),
+        "res_size": 0,
+        "log_size": 0,
+        "has_sim_time": False,
+        "has_showers": False,
+        "body_count": 0,
+        "has_end_marker": False,
+        "dump_files": [p.name for p in dump_files],
+        "dose_files": list(dose_files),
+        "incomplete": False,
+        "reason": "",
+        "status": "missing",
+    }
+    res_text = ""
+    log_text = ""
+    if res_path.exists():
+        try:
+            data["res_size"] = int(res_path.stat().st_size)
+            res_text = _decode_text_bytes(res_path.read_bytes())
+        except Exception:
+            res_text = ""
+    if log_path.exists():
+        try:
+            data["log_size"] = int(log_path.stat().st_size)
+            log_text = _decode_text_bytes(log_path.read_bytes())
+        except Exception:
+            log_text = ""
+    if res_text:
+        data["has_sim_time"] = bool(re.search(r"Simulation time\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?E[+\-]?\d+)\s*sec", res_text, re.IGNORECASE))
+        data["has_showers"] = bool(re.search(r"Simulated primary showers\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?(?:[EDed][+\-]?\d+)?)", res_text, re.IGNORECASE))
+        data["body_count"] = len(re.findall(
+            r"^\s*Body\s+\d+\s+\.+\s+[+\-]?\d+\.\d+E[+\-]\d+\s+\+-\s+[+\-]?\d+\.\d+E[+\-]\d+\s+eV",
+            res_text,
+            re.IGNORECASE | re.MULTILINE,
+        ))
+    if log_text:
+        data["has_end_marker"] = "***  END  ***" in log_text.upper()
+    if not data["res_exists"]:
+        data["status"] = "missing"
+        data["reason"] = "penmain-res.dat missing"
+        return data
+    if data["res_size"] <= 256 and not data["has_sim_time"] and not data["has_showers"] and data["body_count"] == 0:
+        data["incomplete"] = True
+        data["status"] = "header_only"
+        data["reason"] = "penmain-res.dat contains only the header"
+        return data
+    if (not data["has_sim_time"] or not data["has_showers"] or data["body_count"] == 0):
+        data["incomplete"] = True
+        data["status"] = "partial_results"
+        missing = []
+        if not data["has_sim_time"]:
+            missing.append("simulation time")
+        if not data["has_showers"]:
+            missing.append("simulated showers")
+        if data["body_count"] == 0:
+            missing.append("body results")
+        data["reason"] = "penmain-res.dat is missing " + ", ".join(missing)
+        return data
+    if data["log_exists"] and not data["has_end_marker"]:
+        data["incomplete"] = True
+        data["status"] = "truncated_log"
+        data["reason"] = "penmain.dat is truncated before END marker"
+        return data
+    data["status"] = "complete"
+    data["reason"] = "completed"
+    return data
+
+
 def _prepare_saved_sim_state_snapshot(state_path):
     path = Path(state_path)
     payload = {
@@ -17156,7 +17310,6 @@ def _prepare_saved_sim_state_snapshot(state_path):
         "empty": False,
         "queue": [],
         "alive_runs": [],
-        "finished_runs": [],
         "saved_at": "unknown",
         "parts": [],
     }
@@ -17170,13 +17323,20 @@ def _prepare_saved_sim_state_snapshot(state_path):
     queue = [Path(p) for p in state.get("queue", []) if p]
     queue = [p for p in queue if p.exists()]
     runs = state.get("runs", [])
-    alive_runs = [r for r in runs if isinstance(r, dict) and r.get("status") == "running" and r.get("pid", 0) > 0]
-    finished_runs = [r for r in runs if isinstance(r, dict) and r.get("status") != "running"]
+    alive_runs = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if run.get("status") != "running":
+            continue
+        pid = int(run.get("pid", 0) or 0)
+        if pid <= 0 or not _pid_still_running(pid):
+            continue
+        alive_runs.append(run)
     payload["queue"] = [str(p) for p in queue]
     payload["alive_runs"] = alive_runs
-    payload["finished_runs"] = finished_runs
     payload["saved_at"] = state.get("saved_at", "unknown")
-    if not queue and not alive_runs and not finished_runs:
+    if not queue and not alive_runs:
         payload["empty"] = True
         return payload
     parts = []
@@ -17184,8 +17344,6 @@ def _prepare_saved_sim_state_snapshot(state_path):
         parts.append(f"{len(queue)} queued run(s)")
     if alive_runs:
         parts.append(f"{len(alive_runs)} still-running process(es) by PID")
-    if finished_runs:
-        parts.append(f"{len(finished_runs)} finished run record(s)")
     payload["parts"] = parts
     payload["batch_total"] = int(state.get("batch_total", len(queue)) or 0)
     payload["use_dmp"] = bool(state.get("use_dmp", False))
@@ -17245,6 +17403,7 @@ class SimulationTab(QWidget):
     }
     IN_GLOBAL_KEYWORDS = {"TITLE", "NSIMSH", "TIME", "END"}
     status_message = Signal(str)
+    batch_notification = Signal(str, str)
     risk_assessment_requested = Signal()
     MAX_SIM_THREADS = 8
     MAX_BATCH_SIM_THREADS = 4
@@ -17368,6 +17527,17 @@ class SimulationTab(QWidget):
             return None
         return Path(self._project_root) / "batch_case_creation_log.json"
 
+    def _project_batch_edit_log_path(self):
+        if not self._project_root:
+            return None
+        return Path(self._project_root) / "batch_case_edit_log.json"
+
+    def _project_sim_anomaly_log_path(self):
+        if self._project_root:
+            return Path(self._project_root) / "simulation_run_anomalies.json"
+        root = self._workspace_folder()
+        return Path(root) / "simulation_run_anomalies.json" if root else None
+
     def _append_project_log_entry(self, path, schema, entry):
         if not path:
             return
@@ -17394,6 +17564,48 @@ class SimulationTab(QWidget):
         entries.append(entry)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _log_sim_run_anomaly(self, kind, run_folder, in_path=None, exit_code=None, health=None):
+        path = self._project_sim_anomaly_log_path()
+        if not path:
+            return
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "kind": str(kind or "anomaly"),
+            "project_root": self._project_root or "",
+            "run_folder": self._project_relative_path_text(run_folder),
+            "input_file": self._project_relative_path_text(in_path or ""),
+            "exit_code": exit_code,
+        }
+        if isinstance(health, dict):
+            record["health"] = {
+                "status": health.get("status", ""),
+                "reason": health.get("reason", ""),
+                "res_exists": bool(health.get("res_exists")),
+                "res_size": int(health.get("res_size", 0) or 0),
+                "log_exists": bool(health.get("log_exists")),
+                "log_size": int(health.get("log_size", 0) or 0),
+                "has_sim_time": bool(health.get("has_sim_time")),
+                "has_showers": bool(health.get("has_showers")),
+                "body_count": int(health.get("body_count", 0) or 0),
+                "has_end_marker": bool(health.get("has_end_marker")),
+                "dump_files": list(health.get("dump_files") or []),
+                "dose_files": list(health.get("dose_files") or []),
+            }
+        try:
+            self._append_project_log_entry(path, "penelope_studio_simulation_run_anomalies_v1", record)
+            self.console.log(f"[SIM] Simulation anomaly log updated: {path.name}\n", "info")
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not update simulation anomaly log: {exc}\n", "warn")
+
+    def _write_project_log_entries(self, path, schema, entries):
+        if not path:
+            return
+        payload = {
+            "schema": schema,
+            "entries": list(entries or []),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
     def _project_relative_path_text(self, path):
         if not path:
             return ""
@@ -17402,6 +17614,19 @@ class SimulationTab(QWidget):
             return str(target)
         try:
             return str(target.resolve().relative_to(Path(self._project_root).resolve()))
+        except Exception:
+            return str(target)
+
+    def _project_display_path_text(self, path):
+        if not path:
+            return ""
+        target = Path(path)
+        if not self._project_root:
+            return str(target)
+        try:
+            root = Path(self._project_root).resolve()
+            rel = str(target.resolve().relative_to(root)).replace("/", "\\")
+            return f"{root.name}\\{rel}" if rel else root.name
         except Exception:
             return str(target)
 
@@ -17419,12 +17644,20 @@ class SimulationTab(QWidget):
                 data["spectr_range_kev"] = [float(spectr_range[0]), float(spectr_range[1])]
             except Exception:
                 pass
+        if spec.get("spectr_last_kev") not in (None, ""):
+            try:
+                data["spectr_last_kev"] = float(spec.get("spectr_last_kev"))
+            except Exception:
+                pass
         sposit = spec.get("sposit")
         if sposit:
             data["sposit_cm"] = [str(v) for v in sposit]
         scone = spec.get("scone")
         if scone:
             data["scone_deg"] = [str(v) for v in scone]
+        folder_token_keys = [str(k or "").strip().lower() for k in list(spec.get("folder_token_keys") or []) if str(k or "").strip()]
+        if folder_token_keys:
+            data["folder_token_keys"] = folder_token_keys
         return data
 
     def _case_creation_log_record(
@@ -17493,7 +17726,8 @@ class SimulationTab(QWidget):
         )
         try:
             self._append_project_log_entry(path, "penelope_studio_case_creation_log_v1", record)
-            self.console.log(f"[SIM] Project case log updated: {path.name}\n", "info")
+            if not str(batch_id or "").strip():
+                self.console.log(f"[SIM] Project case log updated: {path.name}\n", "info")
         except Exception as exc:
             self.console.log(f"[SIM] Could not update project case log: {exc}\n", "warn")
 
@@ -17507,6 +17741,7 @@ class SimulationTab(QWidget):
         geo_path,
         workspace_geo_name,
         created_batch_records,
+        batch_label="",
     ):
         path = self._project_batch_case_creation_log_path()
         if not path:
@@ -17523,6 +17758,7 @@ class SimulationTab(QWidget):
             "geo_file": str(workspace_geo_name or ""),
             "case_count": len(created_batch_records or []),
             "cases": list(created_batch_records or []),
+            "batch_label": str(batch_label or ""),
         }
         try:
             self._append_project_log_entry(path, "penelope_studio_batch_case_creation_log_v1", entry)
@@ -20138,6 +20374,14 @@ class SimulationTab(QWidget):
     def _workspace_folder(self):
         return Path(self._workspace_root) if self._workspace_root else self._in_folder()
 
+    def _path_resolve_key(self, path):
+        if not path:
+            return ""
+        try:
+            return str(Path(path).resolve()).lower()
+        except Exception:
+            return str(Path(path)).lower()
+
     def _solo_run_folder_for_input(self, in_path):
         return Path(in_path).parent / "solo_case"
 
@@ -20145,7 +20389,8 @@ class SimulationTab(QWidget):
         folder = str(Path(folder))
         self._workspace_root = folder
         if hasattr(self, "lbl_workspace_root"):
-            self.lbl_workspace_root.setText(f"Case Root: {folder}")
+            self.lbl_workspace_root.setText(f"Case Root: {self._project_display_path_text(folder)}")
+            self.lbl_workspace_root.setToolTip(folder)
         self._refresh_workspace_root_choices(preferred=folder)
         if log_label:
             self.console.log(f"[SIM] {log_label}: {folder}\n", "info")
@@ -20159,6 +20404,10 @@ class SimulationTab(QWidget):
     def _project_batch_root_candidates_from_log(self):
         if not self._project_root:
             return []
+        try:
+            self._refresh_project_batch_entries_from_folders(display_root=self._workspace_folder())
+        except Exception:
+            pass
         path = self._project_batch_case_creation_log_path()
         if not path or not path.exists():
             return []
@@ -20187,6 +20436,142 @@ class SimulationTab(QWidget):
             if candidate and candidate.exists() and candidate.is_dir():
                 candidates.append(candidate)
         return candidates
+
+    def _batch_container_case_dirs(self, folder):
+        folder = Path(folder)
+        if not folder.exists() or not folder.is_dir():
+            return []
+        result = []
+        skip = self._BATCH_SKIP_FOLDER_NAMES
+        try:
+            children = sorted(folder.iterdir())
+        except OSError:
+            return []
+        for child in children:
+            if not child.is_dir():
+                continue
+            if child.name.startswith(".") or child.name.lower() in skip:
+                continue
+            if self._is_batch_workspace(child):
+                result.append(child)
+        return result
+
+    def _batch_root_matches_display_root(self, batch_root, display_root):
+        if not batch_root or not display_root:
+            return False
+        try:
+            Path(batch_root).resolve().relative_to(Path(display_root).resolve())
+            return True
+        except Exception:
+            return False
+
+    def _refresh_project_batch_entries_from_folders(self, display_root=None):
+        if not self._project_root:
+            return []
+        path = self._project_batch_case_creation_log_path()
+        existing_entries = [
+            entry for entry in self._read_project_log_entries(path)
+            if isinstance(entry, dict)
+        ]
+        existing_by_root = {}
+        for entry in existing_entries:
+            root_path = self._resolve_project_logged_path(entry.get("batch_root"))
+            key = self._path_resolve_key(root_path)
+            if key:
+                existing_by_root[key] = entry
+
+        scan_root = self._project_case_root_folder() or self._workspace_folder()
+        scan_root = Path(scan_root)
+        if not scan_root.exists() or not scan_root.is_dir():
+            return []
+
+        refreshed = []
+        skip = self._BATCH_SKIP_FOLDER_NAMES
+        for dirpath_str, dirnames, _ in os.walk(str(scan_root)):
+            dirpath = Path(dirpath_str)
+            dirnames[:] = sorted(d for d in dirnames if d.lower() not in skip and not d.startswith("."))
+            case_dirs = self._batch_container_case_dirs(dirpath)
+            if not case_dirs:
+                continue
+            if not (dirpath.name.lower().startswith("batch_") or len(case_dirs) >= 2):
+                continue
+            existing = dict(existing_by_root.get(self._path_resolve_key(dirpath), {}) or {})
+            logged_cases = {}
+            for record in list(existing.get("cases") or []):
+                if not isinstance(record, dict):
+                    continue
+                record_dir = self._resolve_project_logged_path(record.get("case_folder"))
+                key = self._path_resolve_key(record_dir)
+                if key:
+                    logged_cases[key] = dict(record)
+            cases = []
+            for case_dir in case_dirs:
+                key = self._path_resolve_key(case_dir)
+                record = dict(logged_cases.get(key, {}))
+                in_files = sorted(case_dir.glob("*.in"))
+                geo_files = sorted(case_dir.glob("*.geo"))
+                record["case_folder"] = self._project_relative_path_text(case_dir)
+                record["case_name"] = case_dir.name
+                record["in_file"] = in_files[0].name if in_files else str(record.get("in_file") or "")
+                if not str(record.get("geo_file") or "").strip() and geo_files:
+                    record["geo_file"] = geo_files[0].name
+                cases.append(record)
+            entry = existing
+            entry["project_root"] = self._project_root or ""
+            entry["batch_root"] = self._project_relative_path_text(dirpath)
+            entry["target_root"] = self._project_relative_path_text(dirpath.parent)
+            entry["case_count"] = len(cases)
+            entry["cases"] = cases
+            if not str(entry.get("batch_label") or "").strip():
+                name = dirpath.name
+                match_suffix = re.match(r"^batch_.+_\d{8}_\d{6}_(.+)$", name, re.IGNORECASE)
+                if match_suffix and match_suffix.group(1):
+                    entry["batch_label"] = match_suffix.group(1)
+                else:
+                    match_prefix = re.match(r"^(.*?)_batch_[^_]+_\d{8}_\d{6}$", name, re.IGNORECASE)
+                    entry["batch_label"] = match_prefix.group(1) if match_prefix and match_prefix.group(1) else ""
+            if not str(entry.get("timestamp") or "").strip():
+                try:
+                    entry["timestamp"] = datetime.fromtimestamp(dirpath.stat().st_mtime).isoformat(timespec="seconds")
+                except Exception:
+                    entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
+            source_stem = self._batch_source_stem_from_root_name(dirpath)
+            if source_stem:
+                instructions_root = self._project_instructions_folder() or self._instructions_root_path()
+                candidate_in = Path(instructions_root) / f"{source_stem}.in"
+                if candidate_in.exists():
+                    entry["source_in_path"] = self._project_relative_path_text(candidate_in)
+            if not str(entry.get("source_in_path") or "").strip() and cases:
+                first_in = str(cases[0].get("in_file") or "").strip()
+                if first_in:
+                    entry["source_in_path"] = self._project_relative_path_text(dirpath / case_dirs[0].name / first_in)
+            if not str(entry.get("geo_source_path") or "").strip() and cases:
+                first_geo = str(cases[0].get("geo_file") or "").strip()
+                if first_geo:
+                    entry["geo_source_path"] = self._project_relative_path_text(dirpath / case_dirs[0].name / first_geo)
+            if not str(entry.get("geo_file") or "").strip() and cases:
+                entry["geo_file"] = str(cases[0].get("geo_file") or "").strip()
+            refreshed.append(entry)
+
+        refreshed.sort(
+            key=lambda entry: (
+                Path(self._resolve_project_logged_path(entry.get("batch_root")) or scan_root).stat().st_mtime
+                if (self._resolve_project_logged_path(entry.get("batch_root")) or scan_root).exists()
+                else 0.0
+            ),
+            reverse=True,
+        )
+        try:
+            self._write_project_log_entries(path, "penelope_studio_batch_case_creation_log_v1", refreshed)
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not refresh batch case log from folders: {exc}\n", "warn")
+
+        display_root = Path(display_root) if display_root else self._workspace_folder()
+        filtered = [
+            entry for entry in refreshed
+            if self._batch_root_matches_display_root(self._resolve_project_logged_path(entry.get("batch_root")), display_root)
+        ]
+        return filtered or refreshed
 
     def _workspace_root_choice_label(self, folder):
         path = Path(folder)
@@ -20339,6 +20724,7 @@ class SimulationTab(QWidget):
             candidates.extend([project_root / "template", project_root.parent / "template"])
         else:
             candidates.append(case_root.parent / "template")
+        candidates.append(Path(__file__).resolve().parent / "template")
         for candidate in candidates:
             if candidate.exists() and candidate.is_dir():
                 return candidate
@@ -20390,6 +20776,10 @@ class SimulationTab(QWidget):
             target = Path(case_dir) / exe_path.name
             if self._safe_copy_file(exe_path, target, overwrite=True) or target.exists():
                 copied += 1
+            if key == "penmain":
+                data_file = exe_path.with_name("penmain.dat")
+                if data_file.exists() and data_file.is_file():
+                    self._safe_copy_file(data_file, Path(case_dir) / data_file.name, overwrite=True)
         return copied
 
     def _resolve_case_executable_path(self, raw_path):
@@ -20618,30 +21008,50 @@ class SimulationTab(QWidget):
             number = 0.0
         return f"{number:.2f}".rstrip("0").rstrip(".") or "0"
 
-    def _case_variant_source_tokens(self, spec):
+    def _case_variant_energy_token_text(self, value_kev):
+        try:
+            number_kev = float(str(value_kev or "0").strip().replace(",", "."))
+        except (TypeError, ValueError):
+            number_kev = 0.0
+        if abs(number_kev) < 5e-13:
+            number_kev = 0.0
+        if abs(number_kev) >= 1000.0:
+            value_mev = number_kev / 1000.0
+            return f"{self._case_variant_number_text(value_mev)}MeV"
+        return f"{self._case_variant_number_text(number_kev)}keV"
+
+    def _case_variant_source_tokens(self, spec, selected_keys=None):
+        selected = {str(key or "").strip().lower() for key in list(selected_keys or DEFAULT_BATCH_FOLDER_TOKEN_KEYS)}
         tokens = []
-        if spec.get("senerg_kev") not in (None, ""):
-            tokens.append(f"SENERG-{self._case_variant_number_text(spec.get('senerg_kev'))}keV")
+        if "senerg" in selected and spec.get("senerg_kev") not in (None, ""):
+            tokens.append(f"SENERG-{self._case_variant_energy_token_text(spec.get('senerg_kev'))}")
         spectr_range = spec.get("spectr_range") or ()
-        if len(spectr_range) == 2:
-            tokens.append(
-                "SPECTR-"
-                + self._case_variant_number_text(spectr_range[0])
-                + "_"
-                + self._case_variant_number_text(spectr_range[1])
-                + "keV"
-            )
+        spectr_last = spec.get("spectr_last_kev")
+        if "spectr" in selected and (spectr_last not in (None, "") or len(spectr_range) == 2):
+            energy_value = spectr_last if spectr_last not in (None, "") else spectr_range[1]
+            tokens.append("SPECTR-" + self._case_variant_energy_token_text(energy_value))
         sposit = spec.get("sposit") or ()
-        if len(sposit) == 3:
+        if "sposit" in selected and len(sposit) == 3:
             tokens.append("SPOSIT-" + "_".join(self._case_variant_number_text(v) for v in sposit))
         scone = spec.get("scone") or ()
-        if len(scone) == 3:
+        if "scone" in selected and len(scone) == 3:
             tokens.append("SCONE-" + "_".join(self._case_variant_number_text(v) for v in scone))
         return tokens
 
+    def _case_variant_base_name(self, value, fallback="case"):
+        text = self._workspace_safe_token(value, fallback or "case")
+        if not text:
+            return fallback or "case"
+        match = re.search(r"(?:(?<=.)_|(?<=.)-)(?=(?:SENERG|SPECTR|SPOSIT|SCONE)-)", text, re.IGNORECASE)
+        if match:
+            text = text[:match.start()]
+        text = text.strip("_-")
+        return text or (fallback or "case")
+
     def _case_variant_folder_name(self, base_name, spec):
-        parts = [self._workspace_safe_token(base_name, "case")]
-        for token in self._case_variant_source_tokens(spec):
+        parts = [self._case_variant_base_name(base_name, "case")]
+        selected_keys = list(spec.get("folder_token_keys") or DEFAULT_BATCH_FOLDER_TOKEN_KEYS)
+        for token in self._case_variant_source_tokens(spec, selected_keys):
             safe = self._workspace_safe_token(token, "")
             if safe:
                 parts.append(safe)
@@ -20649,9 +21059,30 @@ class SimulationTab(QWidget):
         return name or "case"
 
     def _case_variant_title(self, base_name, spec):
-        parts = [self._workspace_safe_token(base_name, "case")]
+        parts = [self._case_variant_base_name(base_name, "case")]
         parts.extend(self._case_variant_source_tokens(spec))
         return "_".join(part for part in parts if part) or "case"
+
+    def _resolved_case_variant_spec(self, base_text, spec, *, case_name, in_filename, geo_override_path="", mat_folder=""):
+        final_text = self._apply_case_variant_source_overrides(base_text, spec)
+        final_spec = self._case_spec_from_in_text(
+            case_name,
+            in_filename,
+            final_text,
+            geo_override_path=geo_override_path or "",
+            mat_folder=mat_folder or "",
+        )
+        if "case_name" in spec:
+            final_spec["case_name"] = self._case_variant_base_name(spec.get("case_name"), case_name or "case")
+        if "in_filename" in spec:
+            final_spec["in_filename"] = self._case_variant_in_filename(spec.get("in_filename"), case_name or "simulation")
+        if geo_override_path:
+            final_spec["geo_override_path"] = str(geo_override_path)
+        if mat_folder:
+            final_spec["mat_folder"] = str(mat_folder)
+        if "folder_token_keys" in spec:
+            final_spec["folder_token_keys"] = list(spec.get("folder_token_keys") or [])
+        return final_spec, final_text
 
     def _case_variant_in_filename(self, value, fallback_stem):
         raw = self._workspace_safe_token(value, fallback_stem or "simulation")
@@ -21078,9 +21509,10 @@ class SimulationTab(QWidget):
 
     def _case_spec_from_in_text(self, case_name, in_filename, text, geo_override_path="", mat_folder=""):
         defaults = self._source_defaults_from_text(text)
+        base_case_name = self._case_variant_base_name(case_name, "case")
         spec = {
-            "case_name": self._workspace_safe_token(case_name, "case"),
-            "in_filename": self._case_variant_in_filename(in_filename, case_name or "simulation"),
+            "case_name": base_case_name,
+            "in_filename": self._case_variant_in_filename(in_filename, base_case_name or "simulation"),
             "geo_override_path": str(geo_override_path or ""),
             "mat_folder": str(mat_folder or ""),
         }
@@ -21089,6 +21521,10 @@ class SimulationTab(QWidget):
         elif defaults["spectrum_lines"]:
             spec["spectr_lines"] = list(defaults["spectrum_lines"])
             spec["spectr_range"] = self._spectr_range_from_lines(defaults["spectrum_lines"])
+            try:
+                spec["spectr_last_kev"] = float(str(defaults["spectrum_lines"][-1].split()[0]).replace(",", "."))
+            except Exception:
+                pass
         if defaults["sposit"]:
             spec["sposit"] = list(defaults["sposit"])
         if defaults["scone"]:
@@ -21099,7 +21535,7 @@ class SimulationTab(QWidget):
         if not isinstance(record, dict):
             return None
         variant = dict(record.get("variant") or {})
-        case_name = str(variant.get("case_name") or record.get("case_name") or "case").strip()
+        case_name = self._case_variant_base_name(str(variant.get("case_name") or record.get("case_name") or "case").strip(), "case")
         in_filename = str(variant.get("in_filename") or record.get("in_file") or f"{case_name}.in").strip()
         case_dir = self._resolve_project_logged_path(record.get("case_folder"))
         geo_source_path = self._resolve_project_logged_path(record.get("geo_source_path"))
@@ -21107,7 +21543,7 @@ class SimulationTab(QWidget):
         mat_folder = case_dir if case_dir and case_dir.exists() and any(case_dir.glob("*.mat")) else None
         if variant:
             spec = {
-                "case_name": self._workspace_safe_token(case_name, "case"),
+                "case_name": case_name,
                 "in_filename": self._case_variant_in_filename(in_filename, case_name or "simulation"),
                 "geo_override_path": str(geo_override_path or ""),
                 "mat_folder": str(mat_folder or ""),
@@ -21119,12 +21555,17 @@ class SimulationTab(QWidget):
             spectr_range = variant.get("spectr_range_kev")
             if isinstance(spectr_range, (list, tuple)) and len(spectr_range) == 2:
                 spec["spectr_range"] = tuple(spectr_range)
+            if variant.get("spectr_last_kev") not in (None, ""):
+                spec["spectr_last_kev"] = variant.get("spectr_last_kev")
             sposit = variant.get("sposit_cm")
             if isinstance(sposit, (list, tuple)) and len(sposit) == 3:
                 spec["sposit"] = [str(v) for v in sposit]
             scone = variant.get("scone_deg")
             if isinstance(scone, (list, tuple)) and len(scone) == 3:
                 spec["scone"] = [str(v) for v in scone]
+            folder_token_keys = [str(k or "").strip().lower() for k in list(variant.get("folder_token_keys") or []) if str(k or "").strip()]
+            if folder_token_keys:
+                spec["folder_token_keys"] = folder_token_keys
             return spec
         if not case_dir or not case_dir.exists():
             return None
@@ -21139,6 +21580,146 @@ class SimulationTab(QWidget):
         except Exception:
             return None
         return self._case_spec_from_in_text(case_name, in_path.name, text, geo_override_path=geo_override_path or "", mat_folder=mat_folder or "")
+
+    def _batch_spec_value_text(self, spec, key):
+        if key == "senerg_kev":
+            value = spec.get("senerg_kev")
+            return f"{value} keV" if value not in (None, "") else "(unchanged)"
+        if key == "spectr":
+            if spec.get("spectr_range") and len(spec.get("spectr_range")) == 2:
+                low, high = spec.get("spectr_range")
+                return f"{self._case_variant_number_text(low)}-{self._case_variant_number_text(high)} keV"
+            if spec.get("spectr_file"):
+                return Path(str(spec.get("spectr_file"))).name
+            if spec.get("spectr_lines"):
+                return "inline spectrum"
+            return "(unchanged)"
+        if key == "sposit":
+            values = spec.get("sposit") or ()
+            if len(values) == 3:
+                return "(" + ", ".join(str(v) for v in values) + ")"
+            return "(unchanged)"
+        if key == "scone":
+            values = spec.get("scone") or ()
+            if len(values) == 3:
+                return "(" + ", ".join(str(v) for v in values) + ")"
+            return "(unchanged)"
+        if key == "geo_override_path":
+            value = str(spec.get("geo_override_path") or "").strip()
+            return Path(value).name if value else "(unchanged)"
+        if key == "mat_folder":
+            value = str(spec.get("mat_folder") or "").strip()
+            return Path(value).name if value else "(unchanged)"
+        return str(spec.get(key, ""))
+
+    def _batch_before_value_text(self, context, key):
+        if not context:
+            return "(new row)"
+        text = str(context.get("case_text") or "")
+        defaults = self._source_defaults_from_text(text)
+        if key == "senerg_kev":
+            if defaults.get("energy_type") == "SENERG" and defaults.get("energy_value") not in (None, ""):
+                try:
+                    if defaults.get("energy_unit") == "eV":
+                        return f"{float(defaults.get('energy_value')) / 1000.0:g} keV"
+                except Exception:
+                    pass
+                return f"{defaults.get('energy_value')} {defaults.get('energy_unit') or 'keV'}"
+            return "(unset)"
+        if key == "spectr":
+            lines = list(defaults.get("spectrum_lines") or [])
+            if lines:
+                rng = self._spectr_range_from_lines(lines)
+                if rng and len(rng) == 2:
+                    return f"{self._case_variant_number_text(rng[0])}-{self._case_variant_number_text(rng[1])} keV"
+                return "inline spectrum"
+            return "(unset)"
+        if key == "sposit":
+            values = defaults.get("sposit") or ()
+            if len(values) == 3:
+                return "(" + ", ".join(str(v) for v in values) + ")"
+            return "(unset)"
+        if key == "scone":
+            values = defaults.get("scone") or ()
+            if len(values) == 3:
+                return "(" + ", ".join(str(v) for v in values) + ")"
+            return "(unset)"
+        if key == "geo_override_path":
+            geo_path = context.get("geo_path")
+            return Path(geo_path).name if geo_path else "(unset)"
+        if key == "mat_folder":
+            mat_folder = context.get("mat_folder")
+            return Path(mat_folder).name if mat_folder else "(unset)"
+        return "(unset)"
+
+    def _build_batch_edit_change_records(self, row_contexts, edited_specs):
+        change_records = []
+        keys = ("senerg_kev", "spectr", "sposit", "scone", "geo_override_path", "mat_folder")
+        for idx, spec in enumerate(list(edited_specs or []), start=1):
+            context = row_contexts[idx - 1] if idx - 1 < len(row_contexts) else None
+            case_before = Path(context["case_dir"]).name if context else "(new row)"
+            case_after = str(spec.get("case_name") or case_before)
+            changes = []
+            for key in keys:
+                present = (
+                    key in spec
+                    or (key == "spectr" and (spec.get("spectr_file") or spec.get("spectr_lines")))
+                )
+                if not present:
+                    continue
+                before = self._batch_before_value_text(context, key)
+                after = self._batch_spec_value_text(spec, key)
+                changes.append({"field": key, "before": before, "after": after})
+            change_records.append(
+                {
+                    "row": idx,
+                    "case_before": case_before,
+                    "case_after": case_after,
+                    "changes": changes,
+                }
+            )
+        if len(edited_specs or []) < len(row_contexts or []):
+            for idx in range(len(edited_specs) + 1, len(row_contexts) + 1):
+                context = row_contexts[idx - 1]
+                change_records.append(
+                    {
+                        "row": idx,
+                        "case_before": Path(context["case_dir"]).name,
+                        "case_after": "(omitted in duplicate)",
+                        "changes": [{"field": "row", "before": "present", "after": "omitted"}],
+                    }
+                )
+        return change_records
+
+    def _batch_edit_change_summary_text(self, change_records):
+        lines = []
+        for record in list(change_records or []):
+            case_label = f"Case {record.get('row')}: {record.get('case_before')} -> {record.get('case_after')}"
+            lines.append(case_label)
+            for change in list(record.get("changes") or []):
+                field = str(change.get("field") or "").replace("_", " ")
+                lines.append(f"  {field}: {change.get('before')} -> {change.get('after')}")
+        return "\n".join(lines) if lines else "No selected changes."
+
+    def _log_project_batch_edit(self, mode, entry, source_in_path, batch_root, group_rel, change_records):
+        path = self._project_batch_edit_log_path()
+        if not path:
+            return
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "project_root": self._project_root or "",
+            "mode": str(mode or ""),
+            "group_rel": str(group_rel or ""),
+            "source_in_path": self._project_relative_path_text(source_in_path or ""),
+            "selected_batch_root": self._project_relative_path_text(self._resolve_project_logged_path((entry or {}).get("batch_root")) or ""),
+            "target_batch_root": self._project_relative_path_text(batch_root or ""),
+            "changes": list(change_records or []),
+        }
+        try:
+            self._append_project_log_entry(path, "penelope_studio_batch_case_edit_log_v1", payload)
+            self.console.log(f"[SIM] Project batch edit log updated: {path.name}\n", "info")
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not update batch edit log: {exc}\n", "warn")
 
     def _select_logged_case_record_dialog(self):
         if not self._project_root:
@@ -21191,12 +21772,14 @@ class SimulationTab(QWidget):
         if not self._project_root:
             QMessageBox.information(self, "Edit Batch", "Open a project first so Studio can read the batch creation log.")
             return None
-        entries = [
-            entry for entry in self._read_project_log_entries(self._project_batch_case_creation_log_path())
-            if isinstance(entry, dict)
-        ]
+        current_root = self._workspace_folder()
+        entries = self._refresh_project_batch_entries_from_folders(display_root=current_root)
         if not entries:
-            QMessageBox.information(self, "Edit Batch", "No project batch creation log entries were found.")
+            QMessageBox.information(
+                self,
+                "Edit Batch",
+                f"No batch folders were found under the current Case Root.\n\n{current_root}",
+            )
             return None
         dlg = QDialog(self)
         dlg.setModal(True)
@@ -21204,7 +21787,9 @@ class SimulationTab(QWidget):
         dlg.setMinimumWidth(820)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
-        hint = QLabel("Choose a previously created batch to edit or duplicate with block-based changes.")
+        hint = QLabel(
+            f"Choose a batch folder found under the current Case Root.\n\nCurrent root: {current_root}"
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(hint)
@@ -21213,7 +21798,7 @@ class SimulationTab(QWidget):
             f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
             f"QListWidget::item:selected {{ background:{P['sel']}; }}"
         )
-        for entry in reversed(entries):
+        for entry in entries:
             batch_root = str(entry.get("batch_root") or "")
             stamp = str(entry.get("timestamp") or "")
             count = int(entry.get("case_count", 0) or 0)
@@ -21417,6 +22002,9 @@ class SimulationTab(QWidget):
         case_count=3,
         seed_specs=None,
         allow_resource_overrides=False,
+        seed_checks_from_values=True,
+        include_batch_label=False,
+        seed_batch_label="",
         dialog_title="Create Batch Cases",
         intro_text=None,
     ):
@@ -21444,6 +22032,38 @@ class SimulationTab(QWidget):
         intro.setWordWrap(True)
         intro.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(intro)
+
+        batch_label_edit = None
+        if include_batch_label:
+            batch_label_row = QHBoxLayout()
+            batch_label_row.setContentsMargins(0, 0, 0, 0)
+            batch_label_row.setSpacing(6)
+            batch_label_row.addWidget(QLabel("Batch Label:"))
+            batch_label_edit = QLineEdit(str(seed_batch_label or ""))
+            batch_label_edit.setStyleSheet(entry_css())
+            batch_label_edit.setPlaceholderText("Optional label for the batch folder")
+            batch_label_row.addWidget(batch_label_edit, 1)
+            lay.addLayout(batch_label_row)
+
+        folder_tokens_box = QGroupBox("Include In Folder Name")
+        folder_tokens_box.setStyleSheet(group_css())
+        folder_tokens_lay = QHBoxLayout(folder_tokens_box)
+        folder_tokens_lay.setContentsMargins(8, 8, 8, 8)
+        folder_tokens_lay.setSpacing(10)
+        folder_token_checks = {}
+        for key, label in (
+            ("senerg", "SENERG"),
+            ("spectr", "SPECTR"),
+            ("sposit", "SPOSIT"),
+            ("scone", "SCONE"),
+        ):
+            chk = QCheckBox(label)
+            chk.setStyleSheet(checkbox_css())
+            chk.setChecked(True)
+            folder_tokens_lay.addWidget(chk)
+            folder_token_checks[key] = chk
+        folder_tokens_lay.addStretch()
+        lay.addWidget(folder_tokens_box)
 
         bulk_row = QHBoxLayout()
         bulk_row.setContentsMargins(0, 0, 0, 0)
@@ -21482,6 +22102,13 @@ class SimulationTab(QWidget):
         content_lay.setSpacing(5)
         rows = []
 
+        def current_folder_token_keys():
+            return [key for key, chk in folder_token_checks.items() if chk.isChecked()]
+
+        def refresh_all_previews():
+            for row in rows:
+                refresh_row_preview(row)
+
         def renumber_rows():
             for idx, row in enumerate(rows, start=1):
                 row["box"].setTitle(f"CASE {idx}")
@@ -21493,7 +22120,9 @@ class SimulationTab(QWidget):
                 if widget is not None:
                     widget.setChecked(bool(checked))
 
-        def propagate_line_value(source_edit, key):
+        def propagate_line_value(source_edit, key, check_key=None):
+            if check_key:
+                apply_check_state(check_key, True)
             value = source_edit.text()
             for row in rows:
                 target = row.get(key)
@@ -21508,6 +22137,15 @@ class SimulationTab(QWidget):
                     for idx, value in enumerate(values):
                         if idx < len(targets):
                             targets[idx].setText(value)
+
+        def propagate_list_index(source_edit, key, index, check_key=None):
+            if check_key:
+                apply_check_state(check_key, True)
+            value = source_edit.text()
+            for row in rows:
+                targets = row.get(key) or []
+                if index < len(targets) and targets[index] is not source_edit:
+                    targets[index].setText(value)
 
         def propagate_target_bundle(row):
             values = {
@@ -21529,6 +22167,16 @@ class SimulationTab(QWidget):
                     for idx, value in enumerate(values):
                         if idx < len(targets):
                             targets[idx].setText(value)
+
+        def propagate_named_value(source_edit, bucket, name, check_key=None):
+            if check_key:
+                apply_check_state(check_key, True)
+            value = source_edit.text()
+            for row in rows:
+                targets = row.get(bucket) or {}
+                target = targets.get(name)
+                if target is not None and target is not source_edit:
+                    target.setText(value)
 
         def remove_row(row):
             if len(rows) <= 1:
@@ -21565,10 +22213,14 @@ class SimulationTab(QWidget):
             spectr_inline_lbl.setVisible(chk_spectr.isChecked() and bool(row.get("spectr_seed_lines")) and not (spectr_path.text() or "").strip())
             row["lbl_sposit"].setVisible(chk_sposit.isChecked() and not target_mode)
             row["lbl_sposit_auto"].setVisible(target_mode)
-            row["btn_sposit_all"].setVisible(chk_sposit.isChecked())
+            for btn in row.get("btn_sposit_axis_all", []):
+                btn.setVisible(chk_sposit.isChecked() and not target_mode)
             for edit in sposit_edits:
                 edit.setVisible(chk_sposit.isChecked() and not target_mode)
-            row["btn_scone_all"].setVisible(chk_scone.isChecked())
+            for btn in row.get("btn_scone_direct_all", []):
+                btn.setVisible(chk_scone.isChecked() and direct_mode)
+            for btn in (row.get("btn_scone_target_all", {}) or {}).values():
+                btn.setVisible(chk_scone.isChecked() and not direct_mode)
             row["direct_wrapper"].setVisible(chk_scone.isChecked() and direct_mode)
             row["target_wrapper"].setVisible(chk_scone.isChecked() and not direct_mode)
             if allow_resource_overrides:
@@ -21604,6 +22256,7 @@ class SimulationTab(QWidget):
                         spec["scone"] = calc_scone
                     except ValueError:
                         pass
+            spec["folder_token_keys"] = current_folder_token_keys()
             row["lbl_preview"].setText(f"Folder preview: {self._case_variant_folder_name(row['case_name'].text(), spec)}")
 
         def choose_spectrum(row):
@@ -21710,31 +22363,30 @@ class SimulationTab(QWidget):
             details_lay.addWidget(btn_spectr_all, 0, 6)
             details_lay.addWidget(spectr_inline_lbl, 1, 4, 1, 3)
 
-            lbl_sposit = QLabel("SPOSIT X/Y/Z:")
-            btn_sposit_all = QPushButton("All")
-            btn_sposit_all.setStyleSheet(btn_css(P["bg2"], 48))
+            lbl_sposit = QLabel("SPOSIT:")
             sposit_seed = list(seed_spec.get("sposit") or defaults["sposit"])
             sposit_edits = []
+            sposit_axis_all_buttons = []
             details_lay.addWidget(lbl_sposit, 2, 0)
-            for idx in range(3):
+            for idx, axis in enumerate(("X", "Y", "Z")):
                 edit = QLineEdit(sposit_seed[idx] if idx < len(sposit_seed) else "")
                 edit.setStyleSheet(entry_css())
                 edit.setFixedWidth(68)
-                details_lay.addWidget(edit, 2, 1 + idx)
+                btn_axis_all = QPushButton(f"{axis} All")
+                btn_axis_all.setStyleSheet(btn_css(P["bg2"], 56))
+                details_lay.addWidget(edit, 2, 1 + idx * 2)
+                details_lay.addWidget(btn_axis_all, 2, 2 + idx * 2)
                 sposit_edits.append(edit)
-            details_lay.addWidget(btn_sposit_all, 2, 4)
+                sposit_axis_all_buttons.append(btn_axis_all)
             lbl_sposit_auto = QLabel("SPOSIT auto-calculated from target mode")
             lbl_sposit_auto.setStyleSheet(label_css(P["fg2"], size=8))
-            details_lay.addWidget(lbl_sposit_auto, 2, 5, 1, 2)
+            details_lay.addWidget(lbl_sposit_auto, 3, 3, 1, 4)
 
             cmb_scone_mode = QComboBox()
             cmb_scone_mode.addItems(["Angles", "Target + distance + beta/gamma"])
             cmb_scone_mode.setStyleSheet(combo_css())
-            btn_scone_all = QPushButton("All")
-            btn_scone_all.setStyleSheet(btn_css(P["bg2"], 48))
-            details_lay.addWidget(QLabel("SCONE mode:"), 3, 0)
-            details_lay.addWidget(cmb_scone_mode, 3, 1)
-            details_lay.addWidget(btn_scone_all, 3, 2)
+            details_lay.addWidget(QLabel("SCONE mode:"), 4, 0)
+            details_lay.addWidget(cmb_scone_mode, 4, 1, 1, 2)
 
             direct_widget = QWidget()
             direct_lay = QHBoxLayout(direct_widget)
@@ -21742,13 +22394,18 @@ class SimulationTab(QWidget):
             direct_lay.setSpacing(5)
             scone_seed = list(seed_spec.get("scone") or defaults["scone"])
             scone_direct_edits = []
+            scone_direct_all_buttons = []
             for idx, label in enumerate(("theta", "phi", "alpha")):
                 direct_lay.addWidget(QLabel(f"{label}:"))
                 edit = QLineEdit(scone_seed[idx] if idx < len(scone_seed) else "")
                 edit.setStyleSheet(entry_css())
                 edit.setFixedWidth(62)
+                btn_angle_all = QPushButton("All")
+                btn_angle_all.setStyleSheet(btn_css(P["bg2"], 44))
                 direct_lay.addWidget(edit)
+                direct_lay.addWidget(btn_angle_all)
                 scone_direct_edits.append(edit)
+                scone_direct_all_buttons.append(btn_angle_all)
             direct_lay.addStretch()
 
             target_widget = QWidget()
@@ -21759,13 +22416,18 @@ class SimulationTab(QWidget):
             target_keys = ("XA", "YA", "ZA", "R", "beta", "gamma", "alpha")
             target_labels = ("Target X", "Target Y", "Target Z", "Distance R", "beta", "gamma", "alpha")
             target_edits = {}
+            target_all_buttons = {}
             for idx, (key, label) in enumerate(zip(target_keys, target_labels)):
-                target_lay.addWidget(QLabel(label + ":"), idx // 4, (idx % 4) * 2)
+                target_lay.addWidget(QLabel(label + ":"), idx // 4, (idx % 4) * 3)
                 edit = QLineEdit("")
                 edit.setStyleSheet(entry_css())
                 edit.setFixedWidth(62)
-                target_lay.addWidget(edit, idx // 4, (idx % 4) * 2 + 1)
+                btn_target_all = QPushButton("All")
+                btn_target_all.setStyleSheet(btn_css(P["bg2"], 44))
+                target_lay.addWidget(edit, idx // 4, (idx % 4) * 3 + 1)
+                target_lay.addWidget(btn_target_all, idx // 4, (idx % 4) * 3 + 2)
                 target_edits[key] = edit
+                target_all_buttons[key] = btn_target_all
             scone_stack = QStackedWidget()
             direct_wrapper = QWidget()
             dw_lay = QVBoxLayout(direct_wrapper)
@@ -21777,7 +22439,7 @@ class SimulationTab(QWidget):
             tw_lay.addWidget(target_widget)
             scone_stack.addWidget(direct_wrapper)
             scone_stack.addWidget(target_wrapper)
-            details_lay.addWidget(scone_stack, 3, 3, 1, 4)
+            details_lay.addWidget(scone_stack, 4, 3, 1, 4)
 
             resource_block = QFrame()
             resource_block.setVisible(bool(allow_resource_overrides))
@@ -21846,20 +22508,21 @@ class SimulationTab(QWidget):
                 "btn_senerg_all": btn_senerg_all,
                 "btn_spectr": btn_spectr,
                 "btn_spectr_all": btn_spectr_all,
-                "btn_sposit_all": btn_sposit_all,
-                "btn_scone_all": btn_scone_all,
+                "btn_sposit_axis_all": sposit_axis_all_buttons,
+                "btn_scone_direct_all": scone_direct_all_buttons,
+                "btn_scone_target_all": target_all_buttons,
             }
 
             btn_remove.clicked.connect(lambda _=False, r=row: remove_row(r))
             btn_spectr.clicked.connect(lambda _=False, r=row: choose_spectrum(r))
-            btn_senerg_all.clicked.connect(lambda _=False, edit=e_senerg: propagate_line_value(edit, "senerg_edit"))
-            btn_spectr_all.clicked.connect(lambda _=False, edit=spectr_path: propagate_line_value(edit, "spectr_path"))
-            btn_sposit_all.clicked.connect(lambda _=False, edits=sposit_edits: propagate_triplet(edits, "sposit_edits"))
-            btn_scone_all.clicked.connect(
-                lambda _=False, r=row: (
-                    propagate_scone_direct(r["scone_direct_edits"]) if r["scone_mode"].currentIndex() == 0 else propagate_target_bundle(r)
-                )
-            )
+            btn_senerg_all.clicked.connect(lambda _=False, edit=e_senerg: propagate_line_value(edit, "senerg_edit", "senerg"))
+            btn_spectr_all.clicked.connect(lambda _=False, edit=spectr_path: propagate_line_value(edit, "spectr_path", "spectr"))
+            for idx, btn in enumerate(sposit_axis_all_buttons):
+                btn.clicked.connect(lambda _=False, edit=sposit_edits[idx], key_index=idx: propagate_list_index(edit, "sposit_edits", key_index, "sposit"))
+            for idx, btn in enumerate(scone_direct_all_buttons):
+                btn.clicked.connect(lambda _=False, edit=scone_direct_edits[idx], key_index=idx: propagate_list_index(edit, "scone_direct_edits", key_index, "scone"))
+            for target_key, btn in target_all_buttons.items():
+                btn.clicked.connect(lambda _=False, edit=target_edits[target_key], name=target_key: propagate_named_value(edit, "scone_target_edits", name, "scone"))
             if allow_resource_overrides:
                 btn_geo.clicked.connect(lambda _=False, r=row: choose_geo(r))
                 btn_mat.clicked.connect(lambda _=False, r=row: choose_mat_folder(r))
@@ -21874,14 +22537,15 @@ class SimulationTab(QWidget):
                 else:
                     widget.textChanged.connect(lambda _txt, r=row: refresh_row_preview(r))
 
-            if seed_spec.get("senerg_kev") not in (None, ""):
-                chk_senerg.setChecked(True)
-            if seed_spec.get("spectr_file") or seed_spec.get("spectr_lines"):
-                chk_spectr.setChecked(True)
-            if seed_spec.get("sposit"):
-                chk_sposit.setChecked(True)
-            if seed_spec.get("scone"):
-                chk_scone.setChecked(True)
+            if seed_checks_from_values:
+                if seed_spec.get("senerg_kev") not in (None, ""):
+                    chk_senerg.setChecked(True)
+                if seed_spec.get("spectr_file") or seed_spec.get("spectr_lines"):
+                    chk_spectr.setChecked(True)
+                if seed_spec.get("sposit"):
+                    chk_sposit.setChecked(True)
+                if seed_spec.get("scone"):
+                    chk_scone.setChecked(True)
             rows.append(row)
             refresh_row_preview(row)
 
@@ -21911,6 +22575,8 @@ class SimulationTab(QWidget):
         btn_all_spectr_off.clicked.connect(lambda: apply_check_state("spectr", False))
         btn_all_sposit_off.clicked.connect(lambda: apply_check_state("sposit", False))
         btn_all_scone_off.clicked.connect(lambda: apply_check_state("scone", False))
+        for chk in folder_token_checks.values():
+            chk.toggled.connect(lambda _checked=False: refresh_all_previews())
 
         add_row_bar = QHBoxLayout()
         add_row_bar.setContentsMargins(0, 0, 0, 0)
@@ -21970,9 +22636,17 @@ class SimulationTab(QWidget):
                     spec["spectr_file"] = path
                     spec["spectr_lines"] = lines
                     spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                    try:
+                        spec["spectr_last_kev"] = float(str(lines[-1].split()[0]).replace(",", "."))
+                    except Exception:
+                        pass
                 elif row.get("spectr_seed_lines"):
                     spec["spectr_lines"] = list(row["spectr_seed_lines"])
                     spec["spectr_range"] = self._spectr_range_from_lines(row["spectr_seed_lines"])
+                    try:
+                        spec["spectr_last_kev"] = float(str(row["spectr_seed_lines"][-1].split()[0]).replace(",", "."))
+                    except Exception:
+                        pass
                 else:
                     QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose a SPECTR file.")
                     return None
@@ -22031,10 +22705,16 @@ class SimulationTab(QWidget):
                     spec["geo_override_path"] = geo_override
                 if mat_folder:
                     spec["mat_folder"] = mat_folder
+            spec["folder_token_keys"] = current_folder_token_keys()
             specs.append(spec)
         if not specs:
             QMessageBox.warning(self, dialog_title, "No valid batch case rows were prepared.")
             return None
+        if include_batch_label:
+            return {
+                "specs": specs,
+                "batch_label": self._workspace_safe_token((batch_label_edit.text() or "").strip(), "") if batch_label_edit is not None else "",
+            }
         return specs
 
     def _workspace_name_from_files(self, in_path, geo_path):
@@ -22053,10 +22733,49 @@ class SimulationTab(QWidget):
                 return candidate
         raise FileExistsError(f"Could not find an unused workspace name for {base_dir}")
 
-    def _batch_workspace_container_name(self, in_path):
+    def _batch_workspace_container_name(self, in_path, batch_label=""):
         stem = self._workspace_safe_token(Path(in_path).stem, "batch")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"batch_{stem}_{stamp}"
+        base = f"batch_{stem}_{stamp}"
+        label = self._workspace_safe_token(batch_label, "")
+        if label:
+            return f"{base}_{label}"
+        return base
+
+    def _batch_source_stem_from_root_name(self, batch_root):
+        name = Path(str(batch_root or "")).name
+        match = re.match(r"^batch_(.+?)_\d{8}_\d{6}(?:_.+)?$", name, re.IGNORECASE)
+        if not match:
+            return ""
+        return self._workspace_safe_token(match.group(1), "")
+
+    def _resolve_batch_source_in_path(self, entry, case_infos=None):
+        case_infos = list(case_infos or [])
+        case_paths = set()
+        for info in case_infos:
+            try:
+                case_paths.add(str(Path(info.get("in_path")).resolve()).lower())
+            except Exception:
+                pass
+        source_in_path = self._resolve_project_logged_path((entry or {}).get("source_in_path"))
+        if source_in_path and Path(source_in_path).exists():
+            try:
+                source_key = str(Path(source_in_path).resolve()).lower()
+            except Exception:
+                source_key = str(Path(source_in_path)).lower()
+            if source_key not in case_paths:
+                return Path(source_in_path)
+        stem = self._batch_source_stem_from_root_name((entry or {}).get("batch_root"))
+        instructions_root = self._project_instructions_folder() or self._instructions_root_path()
+        if stem and instructions_root:
+            candidate = Path(instructions_root) / f"{stem}.in"
+            if candidate.exists():
+                return candidate
+        if source_in_path and Path(source_in_path).exists():
+            return Path(source_in_path)
+        if case_infos:
+            return Path(case_infos[0]["in_path"])
+        return None
 
     def _geo_alias_for_penelope(self, geo_path):
         name = Path(geo_path).name
@@ -22367,11 +23086,19 @@ class SimulationTab(QWidget):
         batch_id = ""
         try:
             if isinstance(case_choice, dict) and case_choice.get("mode") == "batch":
-                batch_specs = self._batch_case_variants_dialog(in_path, geo_path, case_choice.get("count") or 3)
-                if not batch_specs:
+                batch_data = self._batch_case_variants_dialog(
+                    in_path,
+                    geo_path,
+                    case_choice.get("count") or 3,
+                    include_batch_label=True,
+                    seed_batch_label="",
+                )
+                if not batch_data:
                     return
+                batch_specs = list(batch_data.get("specs") or [])
+                batch_label = str(batch_data.get("batch_label") or "")
                 batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
-                batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(in_path))
+                batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(in_path, batch_label))
                 batch_root.mkdir(parents=True, exist_ok=True)
                 for spec in batch_specs:
                     spec_geo_path = Path(spec.get("geo_override_path") or geo_path)
@@ -22384,10 +23111,17 @@ class SimulationTab(QWidget):
                         return
                     spec_workspace_geo_name = self._geo_alias_for_penelope(spec_geo_path)
                     spec_base_text = self._replace_geomfn_in_text(base_source_text, spec_workspace_geo_name)
-                    folder_name = self._case_variant_folder_name(spec["case_name"], spec)
+                    final_spec, batch_text = self._resolved_case_variant_spec(
+                        spec_base_text,
+                        spec,
+                        case_name=spec["case_name"],
+                        in_filename=spec["in_filename"],
+                        geo_override_path=str(spec_geo_path),
+                        mat_folder=str(spec_mat_folder),
+                    )
+                    folder_name = self._case_variant_folder_name(final_spec["case_name"], final_spec)
                     case_dir = self._unique_workspace_dir(batch_root / folder_name)
-                    batch_text = self._apply_case_variant_source_overrides(spec_base_text, spec)
-                    title_line = self._case_variant_title(spec["case_name"], spec)
+                    title_line = self._case_variant_title(final_spec["case_name"], final_spec)
                     batch_text, _ = self._replace_or_insert_line_in_text(
                         batch_text,
                         "TITLE",
@@ -22413,7 +23147,7 @@ class SimulationTab(QWidget):
                         spec_workspace_geo_name,
                         group_rel=group_rel,
                         source_in_path=in_path,
-                        spec=spec,
+                        spec=final_spec,
                         batch_id=batch_id,
                     )
                     batch_log_records.append(
@@ -22424,7 +23158,7 @@ class SimulationTab(QWidget):
                             spec_workspace_geo_name,
                             group_rel=group_rel,
                             source_in_path=in_path,
-                            spec=spec,
+                            spec=final_spec,
                             batch_id=batch_id,
                         )
                     )
@@ -22470,6 +23204,7 @@ class SimulationTab(QWidget):
                         geo_path,
                         workspace_geo_name,
                         batch_log_records,
+                        batch_label=batch_label,
                     )
                     self._set_workspace_root(batch_root, log_label="Case root (created batch)")
                     self.console.log(f"[SIM] Batch root ready: {batch_root}\n", "info")
@@ -22635,6 +23370,56 @@ class SimulationTab(QWidget):
             effective_execs=effective_execs or self._effective_executable_paths(),
         )
 
+    def _choose_batch_edit_mode(self, title="Edit Batch", summary_text=""):
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle(title)
+        dlg.resize(860, 620)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        intro = QLabel("Review the selected batch changes below, then choose whether to apply them in place or create a duplicated batch.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(intro)
+
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        preview.setPlainText(summary_text or "No selected changes.")
+        preview.setStyleSheet(
+            f"QPlainTextEdit {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; font-family:Consolas,'Courier New',monospace; }}"
+        )
+        lay.addWidget(preview, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        btn_inplace = QPushButton("Apply In Place")
+        btn_inplace.setStyleSheet(btn_css(width=132))
+        btn_duplicate = QPushButton("Duplicate With Changes")
+        btn_duplicate.setStyleSheet(btn_css(width=172))
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(btn_css(P["bg2"], 88))
+        buttons.addWidget(btn_inplace)
+        buttons.addWidget(btn_duplicate)
+        buttons.addWidget(btn_cancel)
+        lay.addLayout(buttons)
+
+        btn_inplace.clicked.connect(lambda: dlg.done(2))
+        btn_duplicate.clicked.connect(lambda: dlg.done(3))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        result = dlg.exec()
+        if result == 2:
+            return "inplace"
+        if result == 3:
+            return "duplicate"
+        return None
+
     def _edit_case_workspace(self):
         record = self._select_logged_case_record_dialog()
         if not record:
@@ -22733,122 +23518,208 @@ class SimulationTab(QWidget):
         if not case_infos:
             QMessageBox.warning(self, "Edit Batch", "The selected batch has no readable case folders.")
             return
-        source_in_path = self._resolve_project_logged_path(entry.get("source_in_path"))
+        source_in_path = self._resolve_batch_source_in_path(entry, case_infos)
         if not source_in_path or not Path(source_in_path).exists():
             source_in_path = Path(case_infos[0]["in_path"])
-        try:
-            source_text = _decode_text_bytes(Path(source_in_path).read_bytes())
-        except Exception as exc:
-            QMessageBox.warning(self, "Edit Batch", f"Could not read the source .in file.\n\n{exc}")
-            return
-        fallback_geo = self._resolve_project_logged_path(entry.get("geo_source_path"))
-        if not fallback_geo or not Path(fallback_geo).exists():
-            fallback_geo = self._resolve_geom_path_for_text(
-                source_text,
-                [self._project_geometry_folder(), Path(source_in_path).parent, case_infos[0]["case_dir"]],
+
+        row_contexts = []
+        seed_specs = []
+        for info in case_infos:
+            case_dir = Path(info["case_dir"])
+            in_path = Path(info["in_path"])
+            in_name = str(info["in_name"] or in_path.name)
+            try:
+                case_text = _decode_text_bytes(in_path.read_bytes())
+            except Exception as exc:
+                QMessageBox.warning(self, "Edit Batch", f"Could not read the case input file.\n\n{in_path}\n\n{exc}")
+                return
+            geo_path = self._resolve_geom_path_for_text(
+                case_text,
+                [case_dir, self._project_geometry_folder(), in_path.parent],
             )
-        edit_result = self._sim_block_case_batch_edit_dialog(
+            if not geo_path:
+                geo_files = sorted(case_dir.glob("*.geo"))
+                geo_path = geo_files[0] if geo_files else None
+            mat_folder = case_dir if any(case_dir.glob("*.mat")) else (self._project_materials_folder() or in_path.parent)
+            seed_specs.append(
+                self._case_spec_from_in_text(
+                    case_dir.name,
+                    in_name,
+                    case_text,
+                    geo_override_path=str(geo_path or ""),
+                    mat_folder=str(mat_folder or ""),
+                )
+            )
+            row_contexts.append(
+                {
+                    "case_dir": case_dir,
+                    "in_path": in_path,
+                    "in_name": in_name,
+                    "case_text": case_text,
+                    "geo_path": geo_path,
+                    "mat_folder": mat_folder,
+                }
+            )
+
+        base_geo_path = next((ctx.get("geo_path") for ctx in row_contexts if ctx.get("geo_path")), None)
+        if not base_geo_path:
+            QMessageBox.warning(self, "Edit Batch", "The source geometry file for this batch could not be found.")
+            return
+
+        edited_specs = self._batch_case_variants_dialog(
             source_in_path,
-            source_text,
-            geo_folder=Path(fallback_geo).parent if fallback_geo else self._project_geometry_folder(),
-            mat_folder=self._project_materials_folder() or case_infos[0]["case_dir"],
+            base_geo_path,
+            case_count=len(seed_specs),
+            seed_specs=seed_specs,
+            allow_resource_overrides=True,
+            seed_checks_from_values=False,
+            include_batch_label=True,
+            seed_batch_label=str(entry.get("batch_label") or ""),
             dialog_title="Edit Batch",
-            intro_text="Edit the shared PENELOPE input blocks for this batch. The selected block changes will be applied to every case in the batch, either in place or into a duplicated batch.",
+            intro_text=(
+                "Review the current batch rows below. Only the checked values in each row will be changed. "
+                "Use the per-field All buttons when you want to propagate just that one value across every case."
+            ),
         )
-        if not edit_result:
+        if not edited_specs:
             return
-        changes = self._collect_sim_block_edit_changes(source_text, edit_result["edited_text"])
-        if not any(changes.values()):
-            QMessageBox.information(self, "Edit Batch", "No block changes were made.")
+        edited_specs_list = list(edited_specs.get("specs") or [])
+        batch_label = str(edited_specs.get("batch_label") or "")
+
+        change_records = self._build_batch_edit_change_records(row_contexts, edited_specs_list)
+        mode = self._choose_batch_edit_mode("Edit Batch", self._batch_edit_change_summary_text(change_records))
+        if not mode:
             return
+        if mode == "inplace" and len(edited_specs_list) != len(row_contexts):
+            QMessageBox.warning(
+                self,
+                "Edit Batch",
+                "Apply In Place requires the same number of rows as the existing batch.\n\n"
+                "If you want to add or remove case rows, use Duplicate With Changes.",
+            )
+            return
+
         batch_id = ""
         group_rel = str(entry.get("group_rel") or "")
         batch_root = None
-        if edit_result["mode"] == "duplicate":
+        if mode == "duplicate":
             target_info = self._case_creation_target_root(source_in_path)
             if target_info is None:
                 return
             _case_root, target_root, group_rel = target_info
             batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
-            batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path))
+            batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label))
             batch_root.mkdir(parents=True, exist_ok=True)
+
         created_records = []
         last_case_dir = None
         last_result = None
         try:
-            for info in case_infos:
-                case_dir = Path(info["case_dir"])
-                in_path = Path(info["in_path"])
-                in_name = str(info["in_name"] or in_path.name)
-                try:
-                    case_text = _decode_text_bytes(in_path.read_bytes())
-                except Exception:
-                    case_text = source_text
-                updated_case_text = self._apply_sim_block_edit_changes_to_text(case_text, changes)
-                target_case_dir = case_dir if edit_result["mode"] == "inplace" else self._unique_workspace_dir(batch_root / case_dir.name)
+            for idx, spec in enumerate(edited_specs_list):
+                context = row_contexts[idx] if idx < len(row_contexts) else row_contexts[0]
+                case_dir = Path(context["case_dir"])
+                in_path = Path(context["in_path"])
+                if mode == "inplace":
+                    in_name = str(context["in_name"] or in_path.name)
+                else:
+                    in_name = self._case_variant_in_filename(spec.get("in_filename") or context["in_name"], spec.get("case_name") or case_dir.name)
+                case_text = str(context["case_text"] or "")
+                geo_source = spec.get("geo_override_path") or context.get("geo_path") or base_geo_path
+                if not geo_source:
+                    raise FileNotFoundError(f"Missing geometry file for {spec.get('case_name', case_dir.name)}.")
+                spec_geo_path = Path(geo_source)
+                if not spec_geo_path.exists():
+                    raise FileNotFoundError(f"Missing geometry file for {spec.get('case_name', case_dir.name)}:\n{spec_geo_path}")
+                spec_mat_folder = Path(spec.get("mat_folder") or context.get("mat_folder") or self._project_materials_folder() or in_path.parent)
+                if spec.get("mat_folder") and not spec_mat_folder.exists():
+                    raise FileNotFoundError(f"Missing materials folder for {spec.get('case_name', case_dir.name)}:\n{spec_mat_folder}")
+                spec_geo_name = self._geo_alias_for_penelope(spec_geo_path)
+                base_text = self._replace_geomfn_in_text(case_text, spec_geo_name)
+                final_spec, updated_case_text = self._resolved_case_variant_spec(
+                    base_text,
+                    spec,
+                    case_name=spec.get("case_name") or case_dir.name,
+                    in_filename=in_name,
+                    geo_override_path=str(spec_geo_path),
+                    mat_folder=str(spec_mat_folder),
+                )
+                updated_case_text, _ = self._replace_or_insert_line_in_text(
+                    updated_case_text,
+                    "TITLE",
+                    f"TITLE  {self._case_variant_title(final_spec['case_name'], final_spec)}",
+                    before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
+                )
+                target_case_dir = case_dir if mode == "inplace" else self._unique_workspace_dir(batch_root / self._case_variant_folder_name(final_spec["case_name"], final_spec))
                 result = self._write_case_from_edited_text(
                     target_case_dir,
-                    in_name,
+                    final_spec["in_filename"] if mode != "inplace" else in_name,
                     updated_case_text,
                     source_in_path=in_path,
                     case_source_dir=case_dir,
-                    geo_folder=edit_result.get("geo_folder"),
-                    mat_folder=edit_result.get("mat_folder"),
-                    fallback_geo_path=fallback_geo,
+                    geo_folder=spec_geo_path.parent,
+                    mat_folder=spec_mat_folder,
+                    fallback_geo_path=spec_geo_path,
                 )
                 last_case_dir = target_case_dir
                 last_result = result
-                if edit_result["mode"] == "duplicate" and self._project_root:
-                    geo_path = self._resolve_geom_path_for_text(
-                        result["workspace_text"],
-                        [target_case_dir, edit_result.get("geo_folder"), self._project_geometry_folder(), case_dir],
+                if mode == "duplicate" and self._project_root:
+                    self._log_project_case_creation(
+                        target_case_dir,
+                        result,
+                        spec_geo_path,
+                        spec_geo_name,
+                        group_rel=group_rel,
+                        source_in_path=source_in_path,
+                        spec=final_spec,
+                        batch_id=batch_id,
                     )
-                    if geo_path:
-                        self._log_project_case_creation(
+                    created_records.append(
+                        self._case_creation_log_record(
                             target_case_dir,
                             result,
-                            geo_path,
-                            self._current_geom_filename_from_text(result["workspace_text"]),
+                            spec_geo_path,
+                            spec_geo_name,
                             group_rel=group_rel,
                             source_in_path=source_in_path,
+                            spec=final_spec,
                             batch_id=batch_id,
                         )
-                        created_records.append(
-                            self._case_creation_log_record(
-                                target_case_dir,
-                                result,
-                                geo_path,
-                                self._current_geom_filename_from_text(result["workspace_text"]),
-                                group_rel=group_rel,
-                                source_in_path=source_in_path,
-                                batch_id=batch_id,
-                            )
-                        )
+                    )
         except Exception as exc:
             QMessageBox.warning(self, "Edit Batch", str(exc))
             return
-        if edit_result["mode"] == "duplicate" and self._project_root and last_result and created_records:
-            self._log_project_batch_creation(
+        if mode == "duplicate" and self._project_root and last_result and created_records:
+                self._log_project_batch_creation(
                 batch_id,
                 group_rel,
                 batch_root.parent if batch_root else None,
                 batch_root,
                 source_in_path,
-                fallback_geo,
-                self._current_geom_filename_from_text(last_result["workspace_text"]),
+                base_geo_path,
+                self._geo_alias_for_penelope(base_geo_path),
                 created_records,
+                batch_label=batch_label,
             )
         if last_case_dir and last_result:
             self._in_path = str(last_result["workspace_in_path"])
             self._run_folder = last_case_dir
             self.editor.setPlainText(last_result["workspace_text"])
             self.lbl_in_path.setText(last_result["workspace_in_path"].name)
-            self._set_workspace_root(batch_root if edit_result["mode"] == "duplicate" and batch_root else last_case_dir, log_label="Case root (edited batch)")
+            self._set_workspace_root(batch_root if mode == "duplicate" and batch_root else last_case_dir, log_label="Case root (edited batch)")
+        if self._project_root:
+            self._log_project_batch_edit(
+                mode,
+                entry,
+                source_in_path,
+                batch_root if mode == "duplicate" else self._resolve_project_logged_path(entry.get("batch_root")),
+                group_rel,
+                change_records,
+            )
         self.console.log(
-            f"[SIM] Batch {'duplicated with changes' if edit_result['mode'] == 'duplicate' else 'updated in place'}: {len(case_infos)} case(s)\n",
+            f"[SIM] Batch {'duplicated with changes' if mode == 'duplicate' else 'updated in place'}: {len(edited_specs_list)} case(s)\n",
             "ok",
         )
-        self.status_message.emit("Batch updated" if edit_result["mode"] == "inplace" else "Batch duplicated with changes")
+        self.status_message.emit("Batch updated" if mode == "inplace" else "Batch duplicated with changes")
 
     def _duplicate_case_workspace(self):
         record = self._select_logged_case_record_dialog()
@@ -22925,17 +23796,24 @@ class SimulationTab(QWidget):
                 return
             spec_geo_name = self._geo_alias_for_penelope(spec_geo_path)
             base_text = self._replace_geomfn_in_text(source_text, spec_geo_name)
-            case_text = self._apply_case_variant_source_overrides(base_text, spec)
+            final_spec, case_text = self._resolved_case_variant_spec(
+                base_text,
+                spec,
+                case_name=spec["case_name"],
+                in_filename=spec["in_filename"],
+                geo_override_path=str(spec_geo_path),
+                mat_folder=str(spec_mat_folder),
+            )
             case_text, _ = self._replace_or_insert_line_in_text(
                 case_text,
                 "TITLE",
-                f"TITLE  {self._case_variant_title(spec['case_name'], spec)}",
+                f"TITLE  {self._case_variant_title(final_spec['case_name'], final_spec)}",
                 before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
             )
-            case_dir = self._unique_workspace_dir(target_root / self._case_variant_folder_name(spec["case_name"], spec))
+            case_dir = self._unique_workspace_dir(target_root / self._case_variant_folder_name(final_spec["case_name"], final_spec))
             result = self._write_case_workspace(
                 case_dir,
-                in_filename=spec["in_filename"],
+                in_filename=final_spec["in_filename"],
                 in_text=case_text,
                 geo_path=spec_geo_path,
                 workspace_geo_name=spec_geo_name,
@@ -22952,7 +23830,7 @@ class SimulationTab(QWidget):
                 spec_geo_name,
                 group_rel=group_rel,
                 source_in_path=source_in_path,
-                spec=spec,
+                spec=final_spec,
             )
         if created_dirs:
             self.console.log(f"[SIM] Duplicated {len(created_dirs)} case(s) from {source_case_dir.name}\n", "ok")
@@ -22962,7 +23840,13 @@ class SimulationTab(QWidget):
         entry = self._select_logged_batch_entry_dialog()
         if not entry:
             return
-        source_in_path = self._resolve_project_logged_path(entry.get("source_in_path"))
+        case_infos = self._collect_logged_batch_case_infos(entry)
+        if not case_infos:
+            QMessageBox.warning(self, "Duplicate Batch", "The selected batch has no readable case folders.")
+            return
+        source_in_path = self._resolve_batch_source_in_path(entry, case_infos)
+        if (not source_in_path or not source_in_path.exists()) and case_infos:
+            source_in_path = Path(case_infos[0]["in_path"])
         if not source_in_path or not source_in_path.exists():
             QMessageBox.warning(self, "Duplicate Batch", "The original source .in file for this batch could not be found.")
             return
@@ -22971,34 +23855,66 @@ class SimulationTab(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Duplicate Batch", f"Could not read the source .in file.\n\n{exc}")
             return
-        batch_case_records = [case for case in list(entry.get("cases") or []) if isinstance(case, dict)]
-        batch_specs = [self._case_variant_spec_from_log_record(case) for case in batch_case_records]
-        batch_specs = [spec for spec in batch_specs if spec]
-        if not batch_specs:
+        row_contexts = []
+        seed_specs = []
+        for info in case_infos:
+            case_dir = Path(info["case_dir"])
+            in_path = Path(info["in_path"])
+            in_name = str(info["in_name"] or in_path.name)
+            try:
+                case_text = _decode_text_bytes(in_path.read_bytes())
+            except Exception as exc:
+                QMessageBox.warning(self, "Duplicate Batch", f"Could not read the case input file.\n\n{in_path}\n\n{exc}")
+                return
+            geo_path = self._resolve_geom_path_for_text(
+                case_text,
+                [case_dir, self._project_geometry_folder(), in_path.parent],
+            )
+            if not geo_path:
+                geo_files = sorted(case_dir.glob("*.geo"))
+                geo_path = geo_files[0] if geo_files else None
+            mat_folder = case_dir if any(case_dir.glob("*.mat")) else (self._project_materials_folder() or in_path.parent)
+            seed_specs.append(
+                self._case_spec_from_in_text(
+                    case_dir.name,
+                    in_name,
+                    case_text,
+                    geo_override_path=str(geo_path or ""),
+                    mat_folder=str(mat_folder or ""),
+                )
+            )
+            row_contexts.append(
+                {
+                    "case_dir": case_dir,
+                    "in_path": in_path,
+                    "in_name": in_name,
+                    "case_text": case_text,
+                    "geo_path": geo_path,
+                    "mat_folder": mat_folder,
+                }
+            )
+        if not seed_specs:
             QMessageBox.warning(self, "Duplicate Batch", "Could not reconstruct the batch case settings.")
             return
-        base_geo_path = self._resolve_project_logged_path(entry.get("geo_source_path"))
-        if not base_geo_path or not Path(base_geo_path).exists():
-            first_case_dir = self._resolve_project_logged_path(batch_case_records[0].get("case_folder")) if batch_case_records else None
-            geo_file = str(entry.get("geo_file") or "").strip()
-            if first_case_dir and geo_file:
-                candidate = first_case_dir / geo_file
-                if candidate.exists():
-                    base_geo_path = candidate
+        base_geo_path = next((ctx.get("geo_path") for ctx in row_contexts if ctx.get("geo_path")), None)
         if not base_geo_path or not Path(base_geo_path).exists():
             QMessageBox.warning(self, "Duplicate Batch", "The source geometry file for this batch could not be found.")
             return
-        edited_specs = self._batch_case_variants_dialog(
+        batch_data = self._batch_case_variants_dialog(
             source_in_path,
             base_geo_path,
-            case_count=len(batch_specs),
-            seed_specs=batch_specs,
+            case_count=len(seed_specs),
+            seed_specs=seed_specs,
             allow_resource_overrides=True,
+            include_batch_label=True,
+            seed_batch_label=str(entry.get("batch_label") or ""),
             dialog_title="Duplicate Batch",
             intro_text="Review the copied batch rows below. You can change any source values, geometry, materials, add more rows, or remove rows before creating the duplicated batch.",
         )
-        if not edited_specs:
+        if not batch_data:
             return
+        edited_specs = list(batch_data.get("specs") or [])
+        batch_label = str(batch_data.get("batch_label") or "")
         target_info = self._case_creation_target_root(source_in_path)
         if target_info is None:
             return
@@ -23016,38 +23932,48 @@ class SimulationTab(QWidget):
             QMessageBox.warning(self, "Duplicate Batch", str(exc))
             return
         batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
-        batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path))
+        batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label))
         batch_root.mkdir(parents=True, exist_ok=True)
         created_dirs = []
         batch_log_records = []
         default_mat_folder = source_in_path.parent
-        for spec in edited_specs:
-            spec_geo_path = Path(spec.get("geo_override_path") or base_geo_path)
+        for idx, spec in enumerate(edited_specs):
+            context = row_contexts[idx] if idx < len(row_contexts) else row_contexts[0]
+            base_case_text = str(context.get("case_text") or source_text)
+            context_in_path = Path(context.get("in_path") or source_in_path)
+            spec_geo_path = Path(spec.get("geo_override_path") or context.get("geo_path") or base_geo_path)
             if not spec_geo_path.exists():
                 QMessageBox.warning(self, "Duplicate Batch", f"Missing geometry file for {spec.get('case_name', 'case')}:\n{spec_geo_path}")
                 return
-            spec_mat_folder = Path(spec.get("mat_folder") or default_mat_folder)
+            spec_mat_folder = Path(spec.get("mat_folder") or context.get("mat_folder") or default_mat_folder)
             if spec.get("mat_folder") and not spec_mat_folder.exists():
                 QMessageBox.warning(self, "Duplicate Batch", f"Missing materials folder for {spec.get('case_name', 'case')}:\n{spec_mat_folder}")
                 return
             spec_geo_name = self._geo_alias_for_penelope(spec_geo_path)
-            base_text = self._replace_geomfn_in_text(source_text, spec_geo_name)
-            case_text = self._apply_case_variant_source_overrides(base_text, spec)
+            base_text = self._replace_geomfn_in_text(base_case_text, spec_geo_name)
+            final_spec, case_text = self._resolved_case_variant_spec(
+                base_text,
+                spec,
+                case_name=spec["case_name"],
+                in_filename=spec["in_filename"],
+                geo_override_path=str(spec_geo_path),
+                mat_folder=str(spec_mat_folder),
+            )
             case_text, _ = self._replace_or_insert_line_in_text(
                 case_text,
                 "TITLE",
-                f"TITLE  {self._case_variant_title(spec['case_name'], spec)}",
+                f"TITLE  {self._case_variant_title(final_spec['case_name'], final_spec)}",
                 before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
             )
-            case_dir = self._unique_workspace_dir(batch_root / self._case_variant_folder_name(spec["case_name"], spec))
+            case_dir = self._unique_workspace_dir(batch_root / self._case_variant_folder_name(final_spec["case_name"], final_spec))
             result = self._write_case_workspace(
                 case_dir,
-                in_filename=spec["in_filename"],
+                in_filename=final_spec["in_filename"],
                 in_text=case_text,
                 geo_path=spec_geo_path,
                 workspace_geo_name=spec_geo_name,
                 template_dir=template_dir,
-                mat_sources=[source_in_path.parent, spec_mat_folder],
+                mat_sources=[context_in_path.parent, spec_mat_folder],
                 required_refs=required_refs,
                 effective_execs=effective_execs,
             )
@@ -23059,7 +23985,7 @@ class SimulationTab(QWidget):
                 spec_geo_name,
                 group_rel=group_rel,
                 source_in_path=source_in_path,
-                spec=spec,
+                spec=final_spec,
                 batch_id=batch_id,
             )
             batch_log_records.append(
@@ -23070,7 +23996,7 @@ class SimulationTab(QWidget):
                     spec_geo_name,
                     group_rel=group_rel,
                     source_in_path=source_in_path,
-                    spec=spec,
+                    spec=final_spec,
                     batch_id=batch_id,
                 )
             )
@@ -23084,6 +24010,7 @@ class SimulationTab(QWidget):
                 base_geo_path,
                 self._geo_alias_for_penelope(base_geo_path),
                 batch_log_records,
+                batch_label=batch_label,
             )
             self._set_workspace_root(batch_root, log_label="Case root (duplicated batch)")
             self.console.log(f"[SIM] Duplicated batch created: {len(created_dirs)} case(s) under {batch_root}\n", "ok")
@@ -23092,10 +24019,12 @@ class SimulationTab(QWidget):
     def _write_case_workspace(self, case_dir, in_filename, in_text, geo_path, workspace_geo_name, template_dir, mat_sources, required_refs, effective_execs):
         case_dir = Path(case_dir)
         case_dir.mkdir(parents=True, exist_ok=True)
-        if template_dir.exists() and template_dir.is_dir():
+        template_dir = Path(template_dir) if template_dir else None
+        if template_dir and template_dir.exists() and template_dir.is_dir():
             self._copy_workspace_tree(template_dir, case_dir)
         else:
-            self.console.log(f"[SIM] Template folder not found, continuing without it: {template_dir}\n", "warn")
+            if template_dir:
+                self.console.log(f"[SIM] Template folder not found, continuing without it: {template_dir}\n", "warn")
         workspace_in_path = case_dir / in_filename
         workspace_text = str(in_text or "")
         workspace_in_path.write_bytes(_encode_text_bytes(workspace_text))
@@ -26413,6 +27342,84 @@ class SimulationTab(QWidget):
         except Exception:
             return None
 
+    def _job_properties_from_text(self, text):
+        text = text or ""
+        info = {
+            "resume": "",
+            "dumpto": "",
+            "dumpp_raw": "",
+            "dumpp_sec": None,
+            "has_explicit_dumpp": False,
+        }
+        match = re.search(r"^\s*RESUME\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            info["resume"] = match.group(1).strip()
+        match = re.search(r"^\s*DUMPTO\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            info["dumpto"] = match.group(1).strip()
+        match = re.search(r"^\s*DUMPP\s+([^\s\[]+)", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            info["dumpp_raw"] = match.group(1).strip()
+            info["dumpp_sec"] = self._float_from_text_value(info["dumpp_raw"])
+            info["has_explicit_dumpp"] = True
+        return info
+
+    def _in_file_job_properties(self, in_path):
+        return self._job_properties_from_text(self._in_file_text(in_path))
+
+    def _run_safe_stop_capability(self, run):
+        if not run:
+            return False, "run not found", None
+        job = run.get("job_props")
+        if not isinstance(job, dict):
+            job = self._in_file_job_properties(run.get("path", ""))
+            run["job_props"] = job
+        dumpto = str(job.get("dumpto") or "").strip()
+        dumpp_sec = job.get("dumpp_sec")
+        has_explicit_dumpp = bool(job.get("has_explicit_dumpp"))
+        if not dumpto:
+            return False, "no DUMPTO configured", None
+        if not has_explicit_dumpp or dumpp_sec is None or dumpp_sec <= 0:
+            return False, "no periodic DUMPP checkpoint configured", None
+        return True, f"next dump checkpoint in up to {self._fmt_duration(dumpp_sec)}", float(dumpp_sec)
+
+    def _request_safe_stop(self, run, kill_all=False):
+        supported, reason, dumpp_sec = self._run_safe_stop_capability(run)
+        if not supported:
+            return False
+        if run.get("safe_stop_requested"):
+            return True
+        run["cancelled_by_user"] = True
+        if kill_all:
+            run["cancelled_by_kill_all"] = True
+        run["safe_stop_requested"] = True
+        run["safe_stop_triggered"] = False
+        run["safe_stop_dumpp_sec"] = dumpp_sec
+        detail = f"waiting for safe dump checkpoint ({reason})"
+        self._update_sim_run(run["proc"], "waiting safe stop", detail)
+        self.console.log(
+            f"[SIM] Safe stop requested for {run['path'].name}: {reason}. "
+            "Studio will stop the process after the next PENELOPE dump checkpoint.\n",
+            "info",
+        )
+        return True
+
+    def _complete_safe_stop_after_checkpoint(self, run):
+        if not run or run.get("safe_stop_triggered"):
+            return
+        proc = run.get("proc")
+        if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        run["safe_stop_triggered"] = True
+        self._snapshot_active_dmps_before_kill(run)
+        summary = self._killed_run_summary(run)
+        self._update_sim_run(proc, "stopping at dump checkpoint", summary)
+        self.console.log(
+            f"[SIM] Safe stop checkpoint reached for {run['path'].name}; stopping now.\n",
+            "warn",
+        )
+        QTimer.singleShot(250, lambda p=proc: self._kill_process_tree(p))
+
     def _penmain_res_showers(self, folder):
         path = Path(folder) / "penmain-res.dat"
         if not path.exists():
@@ -26436,11 +27443,17 @@ class SimulationTab(QWidget):
         target = self._float_from_text_value(target_text)
         result = self._penmain_res_showers(in_path.parent)
         has_dmp = any(in_path.parent.glob("*.dmp"))
+        dmp_health = self._current_dmp_health(in_path.parent) if has_dmp else {"state": "missing", "count": 0}
         if target is None:
             return "restart", "NSIMSH could not be parsed"
         if result is None:
             dmp_note = "dmp present" if has_dmp else "no dmp"
             if has_dmp:
+                if dmp_health.get("state") != "present":
+                    return "restart", (
+                        f"Use dmp on: .dmp exists but is not complete "
+                        f"({dmp_health.get('state', 'invalid')}); starting normally without resume"
+                    )
                 return "resume", f"Use dmp on: no penmain-res.dat shower count; .dmp exists, starting normally with dump preserved (NSIMSH={target_text})"
             return "restart", f"Use dmp on: no penmain-res.dat shower count; starting normally ({dmp_note}, NSIMSH={target_text})"
         tolerance = max(1.0, abs(target) * 1e-9)
@@ -26450,6 +27463,11 @@ class SimulationTab(QWidget):
             return "skip", f"Use dmp on: result showers exceed NSIMSH ({result:.6g}>{target:.6g}); skipping and preserving files"
         if not has_dmp:
             return "restart", f"Use dmp on: NSIMSH exceeds result ({target:.6g}>{result:.6g}) but no .dmp is present; starting normally"
+        if dmp_health.get("state") != "present":
+            return "restart", (
+                f"Use dmp on: NSIMSH exceeds result, but the .dmp file is not complete "
+                f"({dmp_health.get('state', 'invalid')}); starting normally"
+            )
         return "resume", f"Use dmp on: NSIMSH exceeds result and .dmp exists ({result:.6g}->{target:.6g}); resuming"
 
     def _source_summary_from_text(self, text):
@@ -26595,8 +27613,8 @@ class SimulationTab(QWidget):
         hint.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(hint)
         lst = QListWidget()
-        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.AlwaysOn)
-        lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.AlwaysOn)
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         lst.setStyleSheet(
             f"QListWidget {{ background:{P['bg']}; color:{P['fg']};"
             f" border:1px solid {P['border']}; border-radius:4px; font-size:10px; }}"
@@ -26822,11 +27840,18 @@ class SimulationTab(QWidget):
                 f"from the configured path. No action needed.\n\n{msg}",
             ))
         if not self._batch_queue and self._active_batch_count() == 0 and self._batch_total:
+            batch_message = (
+                f"{self._batch_finished}/{self._batch_total} finished"
+                f" | skipped {self._batch_skipped}"
+                f" | completed {self._batch_completed}"
+                f" | failed {self._batch_failed}"
+            )
             self.console.log(
-                f"[SIM] Batch run complete: {self._batch_finished}/{self._batch_total} finished, {self._batch_skipped} skipped, {self._batch_completed} completed, {self._batch_failed} failed.\n",
+                f"[SIM] Batch run complete: {batch_message}.\n",
                 "ok" if self._batch_failed == 0 else "warn",
             )
-            self.status_message.emit(f"Batch complete: {self._batch_finished}/{self._batch_total}, skipped {self._batch_skipped}, completed {self._batch_completed}, failed {self._batch_failed}")
+            self.status_message.emit(f"Batch complete: {batch_message}")
+            self.batch_notification.emit("Batch complete", batch_message)
             self._update_batch_progress(done=True)
             self._batch_total = 0
             self._clear_runs_on_next_launch = True
@@ -26910,6 +27935,131 @@ class SimulationTab(QWidget):
             self.console.log("[SIM] Preserved .dmp file(s) in case for resume.\n", "info")
         return len(output_files)
 
+    def _resume_dmp_backup_root(self, run_folder):
+        return Path(run_folder) / "dmps" / "resume_backups"
+
+    def _snapshot_resume_dmps(self, run_folder, in_path):
+        run_folder = Path(run_folder)
+        dmp_files = sorted(p for p in run_folder.glob("*.dmp") if p.is_file())
+        if not dmp_files:
+            return None, 0
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        nsimsh_raw = self._in_file_nsimsh(in_path)
+        nsimsh_safe = re.sub(r"[^A-Za-z0-9+._-]", "", str(nsimsh_raw)).strip("._-") or "unknown"
+        backup_dir = self._resume_dmp_backup_root(run_folder) / f"{stamp}_N{nsimsh_safe}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for dmp in dmp_files:
+            copied += int(self._copy_if_present_to_archive(dmp, backup_dir))
+        if copied:
+            self.console.log(
+                f"[SIM] Resume safeguard: copied {copied} .dmp file(s) to {backup_dir} before relaunch.\n",
+                "info",
+            )
+            return backup_dir, copied
+        return None, 0
+
+    def _snapshot_active_dmps_before_kill(self, run):
+        if not run:
+            return
+        run_folder = Path(run.get("run_folder", run["path"].parent))
+        if not any(run_folder.glob("*.dmp")):
+            return
+        try:
+            backup_dir, copied = self._snapshot_resume_dmps(run_folder, run.get("path", run_folder / "unknown.in"))
+        except Exception as exc:
+            self.console.log(
+                f"[SIM] Pre-kill .dmp safeguard failed for {run_folder.name}: {exc}\n",
+                "warn",
+            )
+            return
+        if copied and backup_dir:
+            run["prekill_dmp_backup_dir"] = str(backup_dir)
+            self.console.log(
+                f"[SIM] Pre-kill safeguard saved {copied} .dmp file(s) for {run_folder.name}.\n",
+                "info",
+            )
+
+    def _latest_resume_dmp_backup_dir(self, run_folder):
+        root = self._resume_dmp_backup_root(run_folder)
+        if not root.exists():
+            return None
+        dirs = [p for p in root.iterdir() if p.is_dir()]
+        if not dirs:
+            return None
+        dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return dirs[0]
+
+    def _restore_resume_dmp_backup(self, run_folder, preferred_dir=None):
+        run_folder = Path(run_folder)
+        backup_dir = Path(preferred_dir) if preferred_dir else self._latest_resume_dmp_backup_dir(run_folder)
+        if not backup_dir or not backup_dir.exists():
+            return 0, None
+        restored = 0
+        for src in sorted(backup_dir.glob("*.dmp")):
+            if not src.is_file():
+                continue
+            shutil.copy2(src, run_folder / src.name)
+            restored += 1
+        if restored:
+            self.console.log(
+                f"[SIM] Restored {restored} .dmp file(s) from safeguard backup {backup_dir}.\n",
+                "warn",
+            )
+            return restored, backup_dir
+        return 0, None
+
+    def _current_dmp_health(self, run_folder):
+        run_folder = Path(run_folder)
+        dmp_files = sorted(p for p in run_folder.glob("*.dmp") if p.is_file())
+        if not dmp_files:
+            return {"state": "missing", "count": 0}
+        if any(p.stat().st_size == 0 for p in dmp_files):
+            return {"state": "empty", "count": len(dmp_files)}
+        valid = 0
+        truncated = 0
+        for dmp in dmp_files:
+            info = self._dump_file_health(dmp)
+            if info.get("has_end_marker") and info.get("title"):
+                valid += 1
+            else:
+                truncated += 1
+        if valid == 0:
+            return {"state": "truncated", "count": len(dmp_files), "truncated": truncated}
+        return {"state": "present", "count": len(dmp_files)}
+
+    def _recover_interrupted_resume_dump(self, run):
+        if not run:
+            return
+        run_folder = Path(run.get("run_folder", run["path"].parent))
+        health = self._current_dmp_health(run_folder)
+        backup_dir = (
+            run.get("prekill_dmp_backup_dir")
+            or run.get("resume_dmp_backup_dir")
+            or self._latest_resume_dmp_backup_dir(run_folder)
+        )
+        if health.get("state") in {"missing", "empty", "truncated"} and backup_dir:
+            if health.get("count", 0):
+                try:
+                    self._quarantine_corrupt_dmps(run_folder)
+                except Exception as exc:
+                    self.console.log(
+                        f"[SIM] Could not quarantine interrupted .dmp file(s) in {run_folder}: {exc}\n",
+                        "warn",
+                    )
+            restored, used_dir = self._restore_resume_dmp_backup(run_folder, backup_dir)
+            if restored:
+                self.console.log(
+                    f"[SIM] Interrupted DMP run recovered from backup after user stop: {used_dir}\n",
+                    "warn",
+                )
+                return
+        if backup_dir:
+            self.console.log(
+                f"[SIM] Interrupted DMP run kept current .dmp file(s); safeguard backup remains available in {backup_dir}.\n",
+                "info",
+            )
+
     def _quarantine_corrupt_dmps(self, run_folder):
         run_folder = Path(run_folder)
         dmp_files = sorted(p for p in run_folder.glob("*.dmp") if p.is_file())
@@ -26926,7 +28076,7 @@ class SimulationTab(QWidget):
         )
         return len(dmp_files)
 
-    def _start_sim_process(self, in_path, run_folder, batch=False, retry_count=0, launch_generation=None, preserve_dmp=False, launch_note=""):
+    def _start_sim_process(self, in_path, run_folder, batch=False, retry_count=0, launch_generation=None, preserve_dmp=False, launch_note="", restored_backup_attempt=False):
         in_path = Path(in_path)
         run_folder = Path(run_folder)
         if launch_generation is not None and int(launch_generation) != int(self._launch_generation):
@@ -26946,11 +28096,19 @@ class SimulationTab(QWidget):
                 self._record_batch_result("failed", in_path, "duplicate active case", run_folder=run_folder)
                 self._update_batch_progress()
             return False
+        resume_backup_dir = None
         if preserve_dmp:
             self.console.log(
                 f"[SIM] Resume requested for {run_folder.name}: preserving current outputs and .dmp in place.\n",
                 "info",
             )
+            try:
+                resume_backup_dir, _resume_backup_count = self._snapshot_resume_dmps(run_folder, in_path)
+            except Exception as exc:
+                self.console.log(
+                    f"[SIM] Resume safeguard backup failed for {run_folder.name}: {exc}\n",
+                    "warn",
+                )
         else:
             try:
                 self._archive_previous_run_outputs(
@@ -26967,6 +28125,21 @@ class SimulationTab(QWidget):
                     self._record_batch_result("failed", in_path, f"previous-run archive failed: {exc}", run_folder=run_folder)
                     self._update_batch_progress()
                 return False
+        run_folder_text = str(run_folder)
+        if len(run_folder_text) > 235:
+            message = (
+                f"Run folder path is too long for penmain.exe ({len(run_folder_text)} characters):\n{run_folder}\n\n"
+                "Shorten the batch/case folder name and try again."
+            )
+            self.console.log(f"[SIM] {message}\n", "err")
+            if batch:
+                self._batch_finished += 1
+                self._batch_failed += 1
+                self._record_batch_result("failed", in_path, "run folder path too long", run_folder=run_folder)
+                self._update_batch_progress()
+            else:
+                QMessageBox.critical(self, "Run Simulation", message)
+            return False
         try:
             local_in_path, runtime_copy_counts, copied_execs = self._prepare_runtime_case_files(in_path, run_folder, batch=batch)
         except Exception as exc:
@@ -26983,6 +28156,7 @@ class SimulationTab(QWidget):
         geo_name = self._in_file_geom_filename(in_path) if batch else (self._current_geom_filename() or "?")
         nsim = self._in_file_nsimsh(in_path) if batch else self._current_nsimsh()
         source = self._in_file_source_summary(in_path) if batch else self._source_summary_from_text(self._get_text())
+        job_props = self._in_file_job_properties(local_in_path)
         proc = QProcess(self)
         proc.setProperty("batch", bool(batch))
         item = QListWidgetItem(self._sim_run_text(in_path, nsim, geo_name, source, "starting", launch_note, run_folder))
@@ -26996,11 +28170,19 @@ class SimulationTab(QWidget):
             "nsim": nsim,
             "geo": geo_name,
             "source": source,
+            "job_props": job_props,
             "latest": launch_note,
             "batch": bool(batch),
             "finished": False,
             "retry_count": int(retry_count),
             "dump_corrupt": False,
+            "resume_dmp_mode": bool(preserve_dmp),
+            "resume_dmp_backup_dir": str(resume_backup_dir) if resume_backup_dir else "",
+            "restored_backup_attempt": bool(restored_backup_attempt),
+            "prekill_dmp_backup_dir": "",
+            "safe_stop_requested": False,
+            "safe_stop_triggered": False,
+            "safe_stop_dumpp_sec": None,
             "launch_generation": launch_generation,
             "cancelled_by_kill_all": False,
             "cancelled_by_user": False,
@@ -27106,16 +28288,32 @@ class SimulationTab(QWidget):
         if proc.state() == QProcess.ProcessState.NotRunning:
             self.console.log("[SIM] Selected simulation is not running.\n", "warn")
             return
+        if self._request_safe_stop(run, kill_all=False):
+            self._update_sim_run_button()
+            return
         run["cancelled_by_user"] = True
         summary = self._killed_run_summary(run)
         self._update_sim_run(proc, "stopping by user", summary)
+        self._snapshot_active_dmps_before_kill(run)
         self._kill_process_tree(proc)
         self.console.log(f"[SIM] Killed selected run: {run['path'].name} - {summary}.\n", "warn")
         self._update_sim_run_button()
 
     def _kill_process_tree(self, proc):
         pid = int(proc.processId()) if proc is not None else 0
+        if proc is not None:
+            try:
+                proc.terminate()
+                if proc.waitForFinished(4000):
+                    return True
+            except Exception:
+                pass
         if sys.platform.startswith("win") and pid > 0:
+            killer = QProcess(self)
+            killer.start("taskkill", ["/PID", str(pid), "/T"])
+            killer.waitForFinished(4000)
+            if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
+                return True
             killer = QProcess(self)
             killer.start("taskkill", ["/PID", str(pid), "/T", "/F"])
             if killer.waitForFinished(5000):
@@ -27131,17 +28329,25 @@ class SimulationTab(QWidget):
         self._batch_total = 0
         self._reset_batch_result_buckets()
         killed = 0
+        safe_requested = 0
         for run in list(self._sim_runs):
             proc = run["proc"]
             if proc.state() != QProcess.ProcessState.NotRunning:
+                if self._request_safe_stop(run, kill_all=True):
+                    safe_requested += 1
+                    continue
                 run["cancelled_by_kill_all"] = True
                 run["cancelled_by_user"] = True
                 self._update_sim_run(proc, "stopping by user", self._killed_run_summary(run))
+                self._snapshot_active_dmps_before_kill(run)
                 self._kill_process_tree(proc)
                 killed += 1
-        if killed:
+        if killed or safe_requested:
             self._kill_all_pending = True
-            self.console.log(f"[SIM] Kill All requested: terminated {killed} active run(s) and cleared queued runs.\n", "warn")
+            self.console.log(
+                f"[SIM] Kill All requested: terminated {killed} active run(s), requested safe checkpoint stop for {safe_requested} run(s), and cleared queued runs.\n",
+                "warn",
+            )
             self._update_sim_run_button()
         else:
             self._kill_all_pending = True
@@ -27387,6 +28593,10 @@ class SimulationTab(QWidget):
             for run in self._sim_runs:
                 proc = run.get("proc")
                 alive = proc is not None and proc.state() != QProcess.ProcessState.NotRunning
+                if not alive:
+                    continue
+                if run.get("finished") or run.get("cancelled_by_user") or run.get("cancelled_by_kill_all"):
+                    continue
                 runs_data.append({
                     "path": str(run.get("path", "")),
                     "run_folder": str(run.get("run_folder", "")),
@@ -27396,10 +28606,14 @@ class SimulationTab(QWidget):
                     "batch": bool(run.get("batch", False)),
                     "external": bool(run.get("external", False)),
                     "pid": int(proc.processId()) if proc is not None and alive else 0,
-                    "status": "running" if alive else "finished",
+                    "status": "running",
                     "latest": str(run.get("latest", "")),
                 })
             queue_data = [str(p) for p in self._batch_queue]
+            state_path = self._sim_state_path()
+            if not runs_data and not queue_data:
+                state_path.unlink(missing_ok=True)
+                return
             state = {
                 "runs": runs_data,
                 "queue": queue_data,
@@ -27407,7 +28621,7 @@ class SimulationTab(QWidget):
                 "use_dmp": bool(getattr(self, "chk_batch_use_dmp", None) and self.chk_batch_use_dmp.isChecked()),
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
             }
-            self._sim_state_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
+            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except Exception:
             pass  # state save is best-effort
 
@@ -27425,10 +28639,9 @@ class SimulationTab(QWidget):
             return
         queue = [Path(p) for p in payload.get("queue", []) if p]
         alive_runs = list(payload.get("alive_runs", []) or [])
-        finished_runs = list(payload.get("finished_runs", []) or [])
         saved_at = payload.get("saved_at", "unknown")
         parts = list(payload.get("parts", []) or [])
-        if not queue and not alive_runs and not finished_runs:
+        if not queue and not alive_runs:
             state_path.unlink(missing_ok=True)
             return
         msg = (
@@ -27464,16 +28677,6 @@ class SimulationTab(QWidget):
             linked += 1
         if linked:
             self.console.log(f"[SIM] Linked {linked} previously running process(es) by PID.\n", "ok")
-        for r in finished_runs:
-            path_str = r.get("path", "")
-            folder_str = r.get("run_folder", Path(path_str).parent if path_str else "")
-            nsim = r.get("nsim", "?")
-            geo = r.get("geo", "?")
-            label = f"recovered-finished | {Path(folder_str).name} | {Path(path_str).name} | N {nsim} | GEO {geo}"
-            item = QListWidgetItem(label)
-            item.setForeground(QColor(P["fg2"]))
-            item.setToolTip(str(folder_str))
-            self.sim_runs_list.addItem(item)
         state_path.unlink(missing_ok=True)
 
     def _on_startup_restore_state_error(self, err):
@@ -27627,6 +28830,9 @@ class SimulationTab(QWidget):
 
     def _sim_run_folder_label(self, path, run_folder=None):
         folder = Path(run_folder) if run_folder is not None else Path(path).parent
+        display = self._project_display_path_text(folder)
+        if display and display != str(folder):
+            return display
         workspace = folder.name
         parent = folder.parent.name
         if parent:
@@ -27717,6 +28923,14 @@ class SimulationTab(QWidget):
 
     def _killed_run_summary(self, run):
         value = run.get("last_shower") if run else None
+        if run and run.get("safe_stop_triggered"):
+            if value is None:
+                return "safely stopped at dump checkpoint"
+            return f"safely stopped at dump checkpoint after {float(value):.2f} showers"
+        if run and run.get("safe_stop_requested"):
+            if value is None:
+                return "safe stop requested before shower count"
+            return f"safe stop requested at {float(value):.2f} showers"
         if value is None:
             return "stopped by user before shower count"
         return f"stopped by user at {float(value):.2f} showers"
@@ -27730,6 +28944,10 @@ class SimulationTab(QWidget):
             run["dump_corrupt"] = True
         if run:
             self._remember_last_shower_from_output(run, text)
+            if run.get("safe_stop_requested") and not run.get("safe_stop_triggered"):
+                if self._extract_last_shower_value(text) is not None:
+                    self._complete_safe_stop_after_checkpoint(run)
+                    return
         latest = self._last_process_line(text)
         if latest:
             if run and run.get("cancelled_by_user"):
@@ -27746,6 +28964,10 @@ class SimulationTab(QWidget):
             run["dump_corrupt"] = True
         if run:
             self._remember_last_shower_from_output(run, text)
+            if run.get("safe_stop_requested") and not run.get("safe_stop_triggered"):
+                if self._extract_last_shower_value(text) is not None:
+                    self._complete_safe_stop_after_checkpoint(run)
+                    return
         latest = self._last_process_line(text)
         if latest:
             if run and run.get("cancelled_by_user"):
@@ -27757,7 +28979,10 @@ class SimulationTab(QWidget):
         kind = "ok" if code == 0 else "err"
         run = self._find_sim_run(proc)
         is_batch = bool(run.get("batch")) if run else bool(proc.property("batch"))
+        run_folder = Path(run.get("run_folder", run["path"].parent)) if run else None
+        result_health = _penmain_result_health(run_folder) if run_folder else None
         if run and run.get("cancelled_by_kill_all"):
+            self._recover_interrupted_resume_dump(run)
             if not run.get("finished"):
                 run["finished"] = True
                 if is_batch:
@@ -27781,6 +29006,7 @@ class SimulationTab(QWidget):
             self._maybe_report_kill_all_cleared()
             return
         if run and run.get("cancelled_by_user"):
+            self._recover_interrupted_resume_dump(run)
             if not run.get("finished"):
                 run["finished"] = True
                 if is_batch:
@@ -27802,6 +29028,44 @@ class SimulationTab(QWidget):
             if is_batch:
                 self._start_next_batch_sims()
             return
+        if run and run.get("dump_corrupt") and run.get("resume_dmp_mode") and not run.get("restored_backup_attempt"):
+            run_folder = Path(run.get("run_folder", run["path"].parent))
+            backup_dir = run.get("resume_dmp_backup_dir") or self._latest_resume_dmp_backup_dir(run_folder)
+            if backup_dir:
+                run["finished"] = True
+                try:
+                    moved = self._quarantine_corrupt_dmps(run_folder)
+                except Exception as exc:
+                    moved = 0
+                    self.console.log(
+                        f"[SIM] Failed to quarantine corrupted dump in {run_folder}: {exc}\n", "err"
+                    )
+                restored, used_dir = self._restore_resume_dmp_backup(run_folder, backup_dir)
+                if restored:
+                    self._update_sim_run(proc, "restoring backup dmp", f"restored {restored} dmp file(s)")
+                    self._update_sim_run_button()
+                    self.console.log(
+                        f"[SIM] Retrying {run_folder.name} from safeguarded dump backup after corruption was detected"
+                        f"{f' ({used_dir})' if used_dir else ''}; quarantined {moved} current .dmp file(s).\n",
+                        "warn",
+                    )
+                    QTimer.singleShot(
+                        0,
+                        lambda p=Path(run["path"]), f=run_folder, b=is_batch,
+                               r=int(run.get("retry_count", 0)),
+                               g=int(run.get("launch_generation", self._launch_generation)):
+                            self._start_sim_process(
+                                p,
+                                f,
+                                batch=b,
+                                retry_count=r,
+                                launch_generation=g,
+                                preserve_dmp=True,
+                                launch_note="restored backup dmp",
+                                restored_backup_attempt=True,
+                            ),
+                    )
+                    return
         if run and run.get("dump_corrupt") and int(run.get("retry_count", 0)) < 1:
             run_folder = Path(run.get("run_folder", run["path"].parent))
             choice = self._dump_corrupt_user_dialog(run_folder, run["path"])
@@ -27861,6 +29125,17 @@ class SimulationTab(QWidget):
                         geo_name=run.get("geo"),
                         source=run.get("source"),
                     )
+                elif result_health and result_health.get("incomplete"):
+                    self._batch_failed += 1
+                    self._record_batch_result(
+                        "failed",
+                        run["path"],
+                        f"incomplete results: {result_health.get('reason', 'unknown')}",
+                        run_folder=run.get("run_folder"),
+                        nsim=run.get("nsim"),
+                        geo_name=run.get("geo"),
+                        source=run.get("source"),
+                    )
                 elif code == 0:
                     self._batch_completed += 1
                     self._record_batch_result(
@@ -27883,13 +29158,24 @@ class SimulationTab(QWidget):
                         geo_name=run.get("geo"),
                         source=run.get("source"),
                     )
-        final_status = "failed bad dmp" if run and run.get("dump_corrupt") else f"finished exit {code}"
-        final_kind = "err" if run and run.get("dump_corrupt") else kind
+        incomplete = bool(result_health and result_health.get("incomplete"))
+        final_status = (
+            "failed bad dmp" if run and run.get("dump_corrupt")
+            else "incomplete result" if incomplete
+            else f"finished exit {code}"
+        )
+        final_kind = "err" if (run and run.get("dump_corrupt")) or incomplete else kind
         self._update_sim_run(proc, final_status)
         self._update_sim_run_button()
         name = run["path"].parent.name if run else "simulation"
         if run and run.get("dump_corrupt"):
             self.console.log(f"[SIM] Finished {name} - corrupted dump remained after retry.\n", final_kind)
+        elif incomplete:
+            self.console.log(
+                f"[SIM] Finished {name} - incomplete results detected: {result_health.get('reason', 'unknown')}.\n",
+                "warn",
+            )
+            self._log_sim_run_anomaly("incomplete_result", run_folder, run.get("path") if run else None, exit_code=code, health=result_health)
         else:
             self.console.log(f"[SIM] Finished {name} - exit {code}\n", kind)
         self._save_sim_state()
@@ -27902,35 +29188,44 @@ class SimulationTab(QWidget):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _try_read_dump_title(dmp_path):
-        """Attempt to read the title from the first Fortran unformatted record of
-        a PENELOPE dump file.  Returns the stripped string or None on any failure.
-
-        Fortran unformatted record layout:
-            [4-byte record-length header] [data bytes] [4-byte record-length trailer]
-        PENELOPE writes the 65-char title as the very first record.
-        """
+    def _dump_file_health(dmp_path):
+        dmp_path = Path(dmp_path)
+        info = {
+            "path": str(dmp_path),
+            "exists": dmp_path.exists(),
+            "size": 0,
+            "title": None,
+            "has_end_marker": False,
+            "line_count": 0,
+            "status": "missing",
+        }
+        if not dmp_path.exists() or not dmp_path.is_file():
+            return info
         try:
-            with open(dmp_path, "rb") as fh:
-                hdr = fh.read(4)
-                if len(hdr) < 4:
-                    return None
-                # Try little-endian (Windows gfortran/ifort default)
-                rec_len = int.from_bytes(hdr, "little")
-                if not (30 <= rec_len <= 200):
-                    rec_len = int.from_bytes(hdr, "big")
-                    if not (30 <= rec_len <= 200):
-                        return None
-                data = fh.read(rec_len)
-                if len(data) != rec_len:
-                    return None
-                candidate = data.decode("latin-1", errors="replace").strip()
-                # Accept only if it looks like a printable ASCII title
-                if candidate and all(32 <= ord(c) < 127 or c == "\t" for c in candidate):
-                    return candidate
+            info["size"] = int(dmp_path.stat().st_size)
+            text = _decode_text_bytes(dmp_path.read_bytes())
         except Exception:
-            pass
-        return None
+            info["status"] = "unreadable"
+            return info
+        lines = [line.rstrip("\r") for line in text.replace("\r\n", "\n").split("\n")]
+        info["line_count"] = len(lines)
+        stripped = [line.strip() for line in lines if line.strip()]
+        if len(stripped) >= 2:
+            info["title"] = stripped[1][:65].strip() or None
+        info["has_end_marker"] = any("*** END ***" in line.upper() for line in stripped[-5:])
+        if info["size"] == 0:
+            info["status"] = "empty"
+        elif info["title"] and info["has_end_marker"]:
+            info["status"] = "complete"
+        elif info["title"]:
+            info["status"] = "truncated"
+        else:
+            info["status"] = "invalid"
+        return info
+
+    @staticmethod
+    def _try_read_dump_title(dmp_path):
+        return SimulationTab._dump_file_health(dmp_path).get("title")
 
     def _gather_dump_diagnostics(self, run_folder, in_path):
         """Return a dict describing the dmp files and .in title for the dialog."""
@@ -27949,9 +29244,13 @@ class SimulationTab(QWidget):
                 mtime   = datetime.datetime.fromtimestamp(stat.st_mtime).strftime(
                     "%Y-%m-%d %H:%M"
                 )
+                dump_info = self._dump_file_health(dmp)
                 if stat.st_size == 0:
                     status = "empty (0 B)"
                     empty_count += 1
+                elif not dump_info.get("has_end_marker"):
+                    status = f"{size_kb:.1f} KB (missing *** END ***)"
+                    partial_count += 1
                 else:
                     status = f"{size_kb:.1f} KB"
                     partial_count += 1
@@ -28710,13 +30009,14 @@ def _analysis_geo_sha256(path):
 
 class AnalysisLoadWorker(QObject):
     """Worker that loads all analysis data for a folder off the main thread."""
-    finished = Signal(dict)
-    error    = Signal(str)
+    finished = Signal(object)
+    error    = Signal(object)
 
     def __init__(self, folder, geo_body_for_result_id_fn, matching_in_token_fn, extract_source_fn,
-                 body_geometry_summary_fn, estimate_all_body_masses_fn, body_geometry_type_fn):
+                 body_geometry_summary_fn, estimate_all_body_masses_fn, body_geometry_type_fn, serial=None):
         super().__init__()
         self._folder = Path(folder)
+        self._serial = serial
         self._geo_body_for_result_id    = geo_body_for_result_id_fn
         self._matching_in_token         = matching_in_token_fn
         self._extract_source_info       = extract_source_fn
@@ -28727,7 +30027,9 @@ class AnalysisLoadWorker(QObject):
     def run(self):
         try:
             folder = self._folder
-            result = {"folder": str(folder)}
+            result = {"folder": str(folder), "serial": self._serial}
+            health = _penmain_result_health(folder)
+            result["result_health"] = health
 
             # --- material densities (folder → parent → grandparent) ---
             mat_densities = {}
@@ -28802,6 +30104,8 @@ class AnalysisLoadWorker(QObject):
             if res_path.exists():
                 text = _decode_text_bytes(res_path.read_bytes())
                 summary_bits = _analysis_summary_lines(text, source_info)
+                if health.get("incomplete"):
+                    summary_bits.insert(0, f"Incomplete run: {health.get('reason')}")
                 mt = re.search(r"Simulation time\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?E[+\-]?\d+)\s*sec", text, re.IGNORECASE)
                 ms = re.search(r"Simulated primary showers\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?E[+\-]?\d+)", text, re.IGNORECASE)
                 if mt:
@@ -28843,17 +30147,19 @@ class AnalysisLoadWorker(QObject):
             self.finished.emit(result)
         except Exception:
             import traceback
-            self.error.emit(traceback.format_exc())
+            self.error.emit({"serial": self._serial, "error": traceback.format_exc()})
 
 
 class AnalysisTab(QWidget):
     status_message = Signal(str)
     DOSE_HEADERS = [
-        "Case", "Body",
-        "Edep (eV)", "dE (eV)", "Edep (J)", "dE (J)", "Error (%)", "Mass (kg)",
-        "Dose (Gy)", "dDose (Gy)", "Dose (eV/g)", "dDose (eV/g)",
+        "Case", "Body", "Component",
+        "Edep (eV)", "dE (eV)", "Mass (kg)",
+        "Dose (eV/g)", "dDose (eV/g)",
+        "Edep (J)", "dE (J)", "Error (%)",
+        "Dose (Gy)", "dDose (Gy)",
         "N ref", "Time ref (s)", "Target Err (%)", "NSIMSH @5%", "Time @5% (s)",
-        "Quality", "Geometry Type", "Geometry",
+        "Quality", "Geometry Type",
     ]
     DOSE_CONFIG_SHEET = "__DOSE_CONFIG__"
     EV_TO_J = 1.602176634e-19
@@ -28862,6 +30168,7 @@ class AnalysisTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._project_root = None
         self._workspace = None
         self._multi_root = None
         self._dose_xlsx = None
@@ -29045,9 +30352,9 @@ class AnalysisTab(QWidget):
 
         top = QFrame()
         top.setStyleSheet(f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:6px; }}")
-        top_lay = QHBoxLayout(top)
+        top_lay = QVBoxLayout(top)
         top_lay.setContentsMargins(8, 6, 8, 6)
-        top_lay.setSpacing(8)
+        top_lay.setSpacing(6)
         workspace_widget, self.lbl_workspace = make_help_label(
             "Case:",
             "Completed case selected for analysis and append operations.",
@@ -29055,13 +30362,30 @@ class AnalysisTab(QWidget):
             return_label=True,
         )
         self.lbl_workspace.setStyleSheet(label_css(P["fg2"]))
+        self.lbl_workspace.setWordWrap(True)
+        self.lbl_workspace.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        top_lay.addWidget(workspace_widget)
+        top_row = QWidget()
+        top_row_lay = QHBoxLayout(top_row)
+        top_row_lay.setContentsMargins(0, 0, 0, 0)
+        top_row_lay.setSpacing(8)
         self.cmb_analysis_workspace = QComboBox()
         self.cmb_analysis_workspace.setStyleSheet(combo_dropdown_css())
         self.cmb_analysis_workspace.setMinimumWidth(260)
+        self.cmb_analysis_workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.cmb_analysis_workspace.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_analysis_workspace.setMinimumContentsLength(26)
+        try:
+            self.cmb_analysis_workspace.view().setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        except Exception:
+            pass
         self.cmb_analysis_workspace.setToolTip(
             "Completed cases found under Case Root.\n"
             "Primary runs (own .geo + .mat) are shown normally.\n"
             "Split-run subfolders are shown with ↳ when 'Include splits' is checked."
+        )
+        self.cmb_analysis_workspace.currentIndexChanged.connect(
+            lambda _idx: self.cmb_analysis_workspace.setToolTip(str(self.cmb_analysis_workspace.currentData() or ""))
         )
         btn_workspace = QPushButton("Open")
         btn_workspace.setStyleSheet(btn_css(width=70))
@@ -29074,14 +30398,17 @@ class AnalysisTab(QWidget):
         btn_reload.clicked.connect(lambda: self._load_workspace(self._workspace) if self._workspace else None)
         btn_3d_dose = QPushButton("3D Dose...")
         btn_3d_dose.setStyleSheet(btn_css(width=96))
-        btn_3d_dose.setToolTip("Generate a MATLAB helper script for one or more 3d-dose.dat files from the current case.")
+        btn_3d_dose.setToolTip(
+            "Create either a case-specific MATLAB 3D dose script in the current case folder "
+            "or a reusable browser script in a chosen cases/root folder."
+        )
         btn_3d_dose.clicked.connect(self._export_matlab_3d_dose_script)
-        top_lay.addWidget(workspace_widget)
-        top_lay.addWidget(self.cmb_analysis_workspace, stretch=1)
-        top_lay.addWidget(btn_workspace)
-        top_lay.addWidget(btn_browse_workspace)
-        top_lay.addWidget(btn_reload)
-        top_lay.addWidget(btn_3d_dose)
+        top_row_lay.addWidget(self.cmb_analysis_workspace, stretch=1)
+        top_row_lay.addWidget(btn_workspace)
+        top_row_lay.addWidget(btn_browse_workspace)
+        top_row_lay.addWidget(btn_reload)
+        top_row_lay.addWidget(btn_3d_dose)
+        top_lay.addWidget(top_row)
         root.addWidget(top)
 
         target_row = QFrame()
@@ -29165,14 +30492,12 @@ class AnalysisTab(QWidget):
             "Mass (kg)", "Dose (Gy)", "dDose (Gy)", "Dose (eV/g)", "dDose (eV/g)",
             "N ref", "Time ref", "Target %", "NSIMSH target", "Time target",
         ])
-        self.tbl_bodies.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.tbl_bodies.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.tbl_bodies.setColumnWidth(0, 44)
-        for col in range(2, 17):
-            self.tbl_bodies.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self._configure_body_table_columns()
         self.tbl_bodies.verticalHeader().setVisible(False)
         self.tbl_bodies.setAlternatingRowColors(False)
         self.tbl_bodies.setWordWrap(False)
+        self.tbl_bodies.setMinimumWidth(0)
+        self.tbl_bodies.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tbl_bodies.setStyleSheet(
             f"QTableWidget {{ background:{P['bg']}; alternate-background-color:{P['bg']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; gridline-color:{P['border']}; }}"
             f"QTableWidget::item {{ background:{P['bg']}; color:{P['fg']}; }}"
@@ -29183,6 +30508,39 @@ class AnalysisTab(QWidget):
         splitter.addWidget(right)
         splitter.setSizes([220, 980])
         root.addWidget(splitter, stretch=1)
+
+    def _configure_body_table_columns(self):
+        if not hasattr(self, "tbl_bodies"):
+            return
+        header = self.tbl_bodies.horizontalHeader()
+        widths = {
+            0: 44,
+            2: 96,
+            3: 96,
+            4: 96,
+            5: 96,
+            6: 78,
+            7: 96,
+            8: 96,
+            9: 104,
+            10: 104,
+            11: 110,
+            12: 92,
+            13: 92,
+            14: 86,
+            15: 108,
+            16: 104,
+        }
+        header.setMinimumSectionSize(36)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tbl_bodies.setColumnWidth(1, 280)
+        for col, width in widths.items():
+            if col == 1:
+                continue
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.tbl_bodies.setColumnWidth(col, width)
 
     def _show_help(self):
         show_help_dialog(
@@ -29204,7 +30562,8 @@ class AnalysisTab(QWidget):
               <li>Mass is estimated from geometry volume and material density when the needed information is available.</li>
               <li>Dose is reported both as <b>Gy</b> and <b>eV/g</b>. Gy uses <code>D = E / m</code> after converting eV to joules with <code>1.602176634e-19</code>; eV/g uses deposited energy directly over mass in grams.</li>
               <li>The table includes body rows and a total row for the selected case.</li>
-              <li><b>3D Dose...</b> writes a MATLAB helper script for one or more selected <code>3d-dose*.dat</code> files so you can sum maps and inspect X/Y/Z profiles plus XY/XZ/YZ slices quickly.</li>
+              <li><b>3D Dose...</b> now offers two MATLAB helpers: a case-specific script saved inside the current case folder, or a reusable browser script saved at a chosen cases/root folder.</li>
+              <li>The browser script can either open one chosen case interactively or scan subfolders recursively and save PNG plots beside each <code>3d-dose*.dat</code>.</li>
             </ul>
             <h3>Excel Output</h3>
             <ul>
@@ -29490,7 +30849,7 @@ class AnalysisTab(QWidget):
                 return
             root = Path(folder)
             self._multi_root = root
-            self.lbl_multi_root.setText(f"Case Root: {root}")
+            self._set_multi_root_label(root)
         self._log_analysis(f"Scanning for split groups under: {root}", "info")
         QApplication.processEvents()
         self._split_groups = self._scan_split_groups_validated(root)
@@ -29612,7 +30971,7 @@ class AnalysisTab(QWidget):
         if not folder:
             return
         self._multi_root = Path(folder)
-        self.lbl_multi_root.setText(f"Case Root: {self._multi_root}")
+        self._set_multi_root_label(self._multi_root)
         self._refresh_analysis_workspace_candidates()
         self.status_message.emit(f"Analysis case root selected: {self._multi_root}")
         self._log_analysis(f"Multi-append case root selected: {self._multi_root}", "info")
@@ -29708,13 +31067,16 @@ class AnalysisTab(QWidget):
 
     def apply_project_context(self, project_root, project_meta=None):
         root = Path(project_root)
+        self._project_root = str(root)
         meta = dict(project_meta or {})
         folders = dict(meta.get("folders") or {})
         analysis_root = root / folders.get("analysis", PROJECT_DIR_ANALYSIS)
-        instructions_root = root / folders.get("instructions", PROJECT_DIR_INSTRUCTIONS)
-        self._multi_root = instructions_root if instructions_root.exists() else root
+        cases_root = root / folders.get("cases", PROJECT_DIR_CASES)
+        self._multi_root = cases_root if cases_root.exists() else root
         if hasattr(self, "lbl_multi_root"):
-            self.lbl_multi_root.setText(f"Case Root: {self._multi_root}")
+            rel = self._analysis_workspace_display_text(self._multi_root).replace("Case:\n", "").replace("\\\n", "\\")
+            self.lbl_multi_root.setText(f"Case Root: {rel}")
+            self.lbl_multi_root.setToolTip(str(self._multi_root))
         if (not self._dose_xlsx_user_selected) and analysis_root.exists():
             default_xlsx = analysis_root / "dose_analysis.xlsx"
             if default_xlsx.exists():
@@ -29752,13 +31114,71 @@ class AnalysisTab(QWidget):
                     and (folder / "penmain-res.dat").exists()
                     and any(folder.glob("*.geo"))
                     and any(folder.glob("*.mat"))
+                    and not _penmain_result_health(folder).get("incomplete")
                 )
             ]
         # Relaxed: only penmain-res.dat required — .geo/.mat resolved at load time
         return [
             folder for folder in sorted(iterator)
-            if folder.is_dir() and (folder / "penmain-res.dat").exists()
+            if (
+                folder.is_dir()
+                and (folder / "penmain-res.dat").exists()
+                and not _penmain_result_health(folder).get("incomplete")
+            )
         ]
+
+    def _analysis_workspace_display_text(self, folder):
+        folder = Path(folder)
+        if self._project_root:
+            try:
+                root = Path(self._project_root).resolve()
+                rel = str(folder.resolve().relative_to(root)).replace("/", "\\")
+                rel = f"{root.name}\\{rel}" if rel else root.name
+            except Exception:
+                rel = str(folder)
+        else:
+            root = self._multi_root or folder.parent
+            try:
+                rel = str(folder.relative_to(root))
+            except Exception:
+                rel = str(folder)
+        rel = rel.replace("/", "\\")
+        rel_wrapped = rel.replace("\\", "\\\n")
+        return f"Case:\n{rel_wrapped}"
+
+    def _set_workspace_label(self, folder=None, text=None):
+        if text is not None:
+            self.lbl_workspace.setText(str(text))
+            self.lbl_workspace.setToolTip(str(text))
+            return
+        if folder is None:
+            self.lbl_workspace.setText("Case:")
+            self.lbl_workspace.setToolTip("")
+            return
+        folder = Path(folder)
+        label = self._analysis_workspace_display_text(folder)
+        self.lbl_workspace.setText(label)
+        self.lbl_workspace.setToolTip(str(folder))
+
+    def _set_multi_root_label(self, root=None):
+        if not hasattr(self, "lbl_multi_root"):
+            return
+        if not root:
+            self.lbl_multi_root.setText("Case Root: none")
+            self.lbl_multi_root.setToolTip("")
+            return
+        root = Path(root)
+        if self._project_root:
+            try:
+                proj = Path(self._project_root).resolve()
+                rel = str(root.resolve().relative_to(proj)).replace("/", "\\")
+                display = f"{proj.name}\\{rel}" if rel else proj.name
+            except Exception:
+                display = str(root)
+        else:
+            display = str(root)
+        self.lbl_multi_root.setText(f"Case Root: {display}")
+        self.lbl_multi_root.setToolTip(str(root))
 
     def _refresh_analysis_workspace_candidates(self):
         if not hasattr(self, "cmb_analysis_workspace"):
@@ -29788,10 +31208,12 @@ class AnalysisTab(QWidget):
             if is_split:
                 label = "↳  " + label
             self.cmb_analysis_workspace.addItem(label, str(folder))
+            self.cmb_analysis_workspace.setItemData(self.cmb_analysis_workspace.count() - 1, str(folder), Qt.ItemDataRole.ToolTipRole)
         if self._workspace:
             idx = self.cmb_analysis_workspace.findData(str(self._workspace))
             if idx >= 0:
                 self.cmb_analysis_workspace.setCurrentIndex(idx)
+                self.cmb_analysis_workspace.setToolTip(str(self._workspace))
 
     def _open_selected_analysis_workspace(self):
         if not hasattr(self, "cmb_analysis_workspace"):
@@ -29821,10 +31243,10 @@ class AnalysisTab(QWidget):
 
         self._log_analysis(f"Loading case: {folder}", "info")
         self._workspace = folder
-        self.lbl_workspace.setText("Case: loading…")
+        self._set_workspace_label(text="Case: loading…")
         if self._multi_root is None:
             self._multi_root = folder.parent
-            self.lbl_multi_root.setText(f"Case Root: {self._multi_root}")
+            self._set_multi_root_label(self._multi_root)
         self._refresh_analysis_workspace_candidates()
         if self._dose_xlsx is None:
             default_xlsx = folder / "dose_analysis.xlsx"
@@ -29848,16 +31270,13 @@ class AnalysisTab(QWidget):
             self._body_geometry_summary,
             self._estimate_all_body_masses_kg,
             self._body_geometry_type,
+            serial=serial,
         )
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(
-            lambda data, f=folder, t=thread, s=serial: self._on_workspace_loaded(data, f, t, s)
-        )
-        worker.error.connect(
-            lambda err, t=thread, s=serial: self._on_workspace_load_error(err, t, s)
-        )
+        worker.finished.connect(self._on_workspace_loaded_payload, Qt.ConnectionType.QueuedConnection)
+        worker.error.connect(self._on_workspace_load_error_payload, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -29865,7 +31284,12 @@ class AnalysisTab(QWidget):
         self._analysis_load_worker = worker
         thread.start()
 
-    def _on_workspace_loaded(self, data, folder, thread, serial=None):
+    def _on_workspace_loaded_payload(self, data):
+        data = dict(data or {})
+        folder = Path(data.get("folder") or self._workspace or Path.cwd())
+        self._on_workspace_loaded(data, folder, data.get("serial"))
+
+    def _on_workspace_loaded(self, data, folder, serial=None):
         # Discard results from a superseded load — a newer _load_workspace call
         # has already started (higher serial) so applying this stale payload
         # would silently overwrite fresher data.
@@ -29902,7 +31326,7 @@ class AnalysisTab(QWidget):
 
         self._populate_file_list(folder)
         self._refresh_dose_columns()
-        self.lbl_workspace.setText(f"Case: {folder.name}")
+        self._set_workspace_label(folder)
         self.status_message.emit(f"Analysis case: {folder.name}")
         if self._body_results:
             available_masses = sum(1 for result in self._body_results if result.get("mass") not in ("", None))
@@ -29910,14 +31334,23 @@ class AnalysisTab(QWidget):
         self._log_analysis(f"Case ready: {folder.name}; body rows={len(self._body_results)}.", "ok")
         QTimer.singleShot(0, _clear_all_override_cursors)
 
-    def _on_workspace_load_error(self, err, thread, serial=None):
+    def _on_workspace_load_error_payload(self, payload):
+        if isinstance(payload, dict):
+            err = str(payload.get("error", "") or "")
+            serial = payload.get("serial")
+        else:
+            err = str(payload or "")
+            serial = None
+        self._on_workspace_load_error(err, serial)
+
+    def _on_workspace_load_error(self, err, serial=None):
         if serial is not None and serial != self._analysis_load_serial:
             _clear_all_override_cursors()
             return
         _clear_all_override_cursors()
         self._log_analysis(f"Case load error: {err}", "err")
         self.summary.setPlainText(f"Load error:\n{err[:500]}")
-        self.lbl_workspace.setText("Case: load failed")
+        self._set_workspace_label(text="Case: load failed")
         QTimer.singleShot(0, _clear_all_override_cursors)
 
     def _populate_file_list(self, folder):
@@ -30021,12 +31454,38 @@ class AnalysisTab(QWidget):
             f"Use 3D Dose... to generate a MATLAB helper script for profiles and XY/XZ/YZ scatter views."
         )
 
-    def _build_matlab_3d_dose_script(self, dose_paths):
+    def _strip_3d_dose_headers_in_place(self, path):
+        path = Path(path)
+        text = _decode_text_bytes(path.read_bytes())
+        lines = text.splitlines()
+        numeric_lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        if not numeric_lines:
+            raise ValueError(f"No numeric 3D dose rows found in {path}")
+        path.write_text("\n".join(numeric_lines) + "\n", encoding="utf-8")
+        return path
+
+    def _build_matlab_3d_dose_script(self, dose_paths, script_dir=None):
         dose_paths = [Path(path) for path in dose_paths]
+        script_dir = Path(script_dir) if script_dir else None
         file_rows = []
         for idx, path in enumerate(dose_paths, start=1):
-            safe_name = path.name.replace("'", "''")
-            file_rows.append(f"S{idx} = load('{safe_name}');")
+            ref_path = path
+            if script_dir:
+                try:
+                    ref_path = Path(os.path.relpath(path, script_dir))
+                except Exception:
+                    ref_path = path.name
+            safe_name = str(ref_path).replace("\\", "/").replace("'", "''")
+            file_rows.extend(
+                [
+                    f"fid{idx} = fopen('{safe_name}', 'rt');",
+                    f"if fid{idx} < 0, error('Could not open {safe_name}'); end",
+                    f"cols{idx} = textscan(fid{idx}, '%f%f%f%f%f%f%f%f', 'CommentStyle', '#', 'CollectOutput', true, 'MultipleDelimsAsOne', true, 'Delimiter', {{' ', '\\t'}});",
+                    f"fclose(fid{idx});",
+                    f"S{idx} = cols{idx}{{1}};",
+                    f"if isempty(S{idx}), error('No numeric rows found in {safe_name}'); end",
+                ]
+            )
         dose_rows = []
         sum_rows = ["doseT = zeros(size(x));"]
         legend_rows = []
@@ -30051,11 +31510,14 @@ class AnalysisTab(QWidget):
             "z = S1(:,3);\n\n"
             + "\n".join(dose_rows) + "\n"
             + "\n".join(sum_rows) + "\n\n"
-            "% Target slice centres and half-thickness tolerance (cm)\n"
+            "% Target slice centres and tolerances (cm) - edit these to match your target\n"
             "xT = 0.0;\n"
             "yT = 0.0;\n"
             "zT = 0.0;\n"
             "d = 0.5;\n\n"
+            "tol_xy = 0.5;\n"
+            "tol_xz = 0.3;\n"
+            "tol_yz = 0.3;\n\n"
             "ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
             "iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
             "iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n\n"
@@ -30074,57 +31536,319 @@ class AnalysisTab(QWidget):
             "xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Z');\n"
             f"legend({', '.join(legend_rows)}); grid on; hold off;\n\n"
             "pause\n\n"
-            "tol_xy = d;\n"
             "i_xy = find((abs(z - zT) < tol_xy) .* (doseT > 1e-10));\n"
             "scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
             "colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Dose distribution on XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n\n"
             "pause\n\n"
-            "tol_xz = d;\n"
             "i_xz = find((abs(y - yT) < tol_xz) .* (doseT > 1e-10));\n"
             "scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
             "colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Dose distribution on XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n\n"
             "pause\n\n"
-            "tol_yz = d;\n"
             "i_yz = find((abs(x - xT) < tol_yz) .* (doseT > 1e-10));\n"
             "scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
             "colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Dose distribution on YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
         )
 
-    def _export_matlab_3d_dose_script(self):
-        if not self._workspace:
-            QMessageBox.information(self, "3D Dose", "Open an Analysis case first.")
-            return
-        start_dir = str(Path(self._workspace))
-        default_selected = []
-        current = getattr(self, "_analysis_selected_file", None)
-        if current and current.exists() and current.name.lower().startswith("3d-dose") and current.suffix.lower() == ".dat":
-            default_selected = [str(current)]
-        paths, _ = QFileDialog.getOpenFileNames(
+    def _build_matlab_3d_dose_browser_script(self):
+        return (
+            "% Auto-generated by Penelope Studio\n"
+            "% Create interactive plots for one selected case folder, or scan a root\n"
+            "% recursively and save PNG plots beside each 3d-dose*.dat case.\n\n"
+            "rootDir = fileparts(mfilename('fullpath'));\n"
+            "modeChoice = menu('PENELOPE 3D Dose', ...\n"
+            "    'Choose case folder and plot interactively', ...\n"
+            "    'Scan subfolders and save PNG plots', ...\n"
+            "    'Cancel');\n"
+            "if modeChoice == 0 || modeChoice == 3\n"
+            "    return;\n"
+            "end\n\n"
+            "% Target slice centres and tolerances (cm) - edit these to match your target\n"
+            "xT = 0.0;\n"
+            "yT = 0.0;\n"
+            "zT = 0.0;\n"
+            "d = 0.5;\n\n"
+            "tol_xy = 0.5;\n"
+            "tol_xz = 0.3;\n"
+            "tol_yz = 0.3;\n\n"
+            "if modeChoice == 1\n"
+            "    caseDir = uigetdir(rootDir, 'Select case folder containing 3d-dose data');\n"
+            "    if isequal(caseDir, 0)\n"
+            "        return;\n"
+            "    end\n"
+            "    files = dir(fullfile(caseDir, '3d-dose*.dat'));\n"
+            "    if isempty(files)\n"
+            "        error(['No 3d-dose*.dat file found in ', caseDir]);\n"
+            "    end\n"
+            "    [~, order] = sort({files.name});\n"
+            "    files = files(order);\n"
+            "    for k = 1:numel(files)\n"
+            "        dosePath = fullfile(caseDir, files(k).name);\n"
+            "        fid = fopen(dosePath, 'rt');\n"
+            "        if fid < 0\n"
+            "            error(['Could not open ', dosePath]);\n"
+            "        end\n"
+            "        cols = textscan(fid, '%f%f%f%f%f%f%f%f', 'CommentStyle', '#', 'CollectOutput', true, 'MultipleDelimsAsOne', true, 'Delimiter', {' ', '\\t'});\n"
+            "        fclose(fid);\n"
+            "        Scur = cols{1};\n"
+            "        if isempty(Scur)\n"
+            "            error(['No numeric rows found in ', dosePath]);\n"
+            "        end\n"
+            "        if k == 1\n"
+            "            x = Scur(:,1);\n"
+            "            y = Scur(:,2);\n"
+            "            z = Scur(:,3);\n"
+            "            dose1 = Scur(:,4);\n"
+            "            doseT = zeros(size(x));\n"
+            "        end\n"
+            "        doseT = doseT + Scur(:,4);\n"
+            "    end\n"
+            "    ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
+            "    iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
+            "    iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n\n"
+            "    plot(x(ix), dose1(ix), '.'); hold on;\n"
+            "    plot(x(ix), doseT(ix), 'k*');\n"
+            "    xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along X');\n"
+            "    legend('dose1', 'total'); grid on; hold off;\n\n"
+            "    pause\n\n"
+            "    plot(y(iy), dose1(iy), '.'); hold on;\n"
+            "    plot(y(iy), doseT(iy), 'k*');\n"
+            "    xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Y');\n"
+            "    legend('dose1', 'total'); grid on; hold off;\n\n"
+            "    pause\n\n"
+            "    plot(z(iz), dose1(iz), '.'); hold on;\n"
+            "    plot(z(iz), doseT(iz), 'k*');\n"
+            "    xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Z');\n"
+            "    legend('dose1', 'total'); grid on; hold off;\n\n"
+            "    pause\n\n"
+            "    i_xy = find((abs(z - zT) < tol_xy) .* (doseT > 1e-10));\n"
+            "    scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
+            "    colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Dose distribution on XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n\n"
+            "    pause\n\n"
+            "    i_xz = find((abs(y - yT) < tol_xz) .* (doseT > 1e-10));\n"
+            "    scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
+            "    colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Dose distribution on XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n\n"
+            "    pause\n\n"
+            "    i_yz = find((abs(x - xT) < tol_yz) .* (doseT > 1e-10));\n"
+            "    scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
+            "    colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Dose distribution on YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
+            "else\n"
+            "    scanRoot = uigetdir(rootDir, 'Select root folder to scan recursively for 3d-dose data');\n"
+            "    if isequal(scanRoot, 0)\n"
+            "        return;\n"
+            "    end\n"
+            "    allDirs = regexp(genpath(scanRoot), pathsep, 'split');\n"
+            "    processed = 0;\n"
+            "    for dIdx = 1:numel(allDirs)\n"
+            "        caseDir = allDirs{dIdx};\n"
+            "        if isempty(caseDir)\n"
+            "            continue;\n"
+            "        end\n"
+            "        lowerDir = lower(caseDir);\n"
+            "        if ~isempty(strfind(lowerDir, [filesep 'previous_runs'])) || ~isempty(strfind(lowerDir, [filesep 'dmps'])) || ~isempty(strfind(lowerDir, '_3d_dose_header_backup_'))\n"
+            "            continue;\n"
+            "        end\n"
+            "        files = dir(fullfile(caseDir, '3d-dose*.dat'));\n"
+            "        if isempty(files)\n"
+            "            continue;\n"
+            "        end\n"
+            "        [~, order] = sort({files.name});\n"
+            "        files = files(order);\n"
+            "        try\n"
+            "            clear x y z dose1 doseT ix iy iz i_xy i_xz i_yz;\n"
+            "            for k = 1:numel(files)\n"
+            "                dosePath = fullfile(caseDir, files(k).name);\n"
+            "                fid = fopen(dosePath, 'rt');\n"
+            "                if fid < 0\n"
+            "                    error(['Could not open ', dosePath]);\n"
+            "                end\n"
+            "                cols = textscan(fid, '%f%f%f%f%f%f%f%f', 'CommentStyle', '#', 'CollectOutput', true, 'MultipleDelimsAsOne', true, 'Delimiter', {' ', '\\t'});\n"
+            "                fclose(fid);\n"
+            "                Scur = cols{1};\n"
+            "                if isempty(Scur)\n"
+            "                    error(['No numeric rows found in ', dosePath]);\n"
+            "                end\n"
+            "                if k == 1\n"
+            "                    x = Scur(:,1);\n"
+            "                    y = Scur(:,2);\n"
+            "                    z = Scur(:,3);\n"
+            "                    dose1 = Scur(:,4);\n"
+            "                    doseT = zeros(size(x));\n"
+            "                end\n"
+            "                doseT = doseT + Scur(:,4);\n"
+            "            end\n"
+            "            if numel(files) == 1\n"
+            "                [~, doseStem, ~] = fileparts(files(1).name);\n"
+            "            else\n"
+            "                doseStem = '3d-dose_sum';\n"
+            "            end\n"
+            "            ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
+            "            iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
+            "            iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n"
+            "            i_xy = find((abs(z - zT) < tol_xy) .* (doseT > 1e-10));\n"
+            "            i_xz = find((abs(y - yT) < tol_xz) .* (doseT > 1e-10));\n"
+            "            i_yz = find((abs(x - xT) < tol_yz) .* (doseT > 1e-10));\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            plot(x(ix), dose1(ix), '.'); hold on; plot(x(ix), doseT(ix), 'k*');\n"
+            "            xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along X'); legend('dose1', 'total'); grid on; hold off;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_profile_x.png'])); close(fig);\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            plot(y(iy), dose1(iy), '.'); hold on; plot(y(iy), doseT(iy), 'k*');\n"
+            "            xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Y'); legend('dose1', 'total'); grid on; hold off;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_profile_y.png'])); close(fig);\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            plot(z(iz), dose1(iz), '.'); hold on; plot(z(iz), doseT(iz), 'k*');\n"
+            "            xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Z'); legend('dose1', 'total'); grid on; hold off;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_profile_z.png'])); close(fig);\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
+            "            colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Dose distribution on XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_xy.png'])); close(fig);\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
+            "            colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Dose distribution on XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_xz.png'])); close(fig);\n"
+            "            fig = figure('Visible', 'off');\n"
+            "            scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
+            "            colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Dose distribution on YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
+            "            saveas(fig, fullfile(caseDir, [doseStem, '_yz.png'])); close(fig);\n"
+            "            processed = processed + 1;\n"
+            "            disp(['Saved 3D dose plots for ', caseDir]);\n"
+            "        catch ME\n"
+            "            disp(['Failed to process ', caseDir, ': ', ME.message]);\n"
+            "        end\n"
+            "    end\n"
+            "    disp(['Processed case folders: ', num2str(processed)]);\n"
+            "end\n"
+        )
+
+    def _safe_matlab_script_stem(self, value):
+        stem = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "dose_analysis")).strip("_")
+        stem = re.sub(r"_+", "_", stem)
+        if not stem:
+            stem = "dose_analysis"
+        if not re.match(r"^[A-Za-z]", stem):
+            stem = f"ps_{stem}"
+        return stem
+
+    def _safe_matlab_script_path(self, path):
+        path = Path(path)
+        safe_stem = self._safe_matlab_script_stem(path.stem)
+        return path.with_name(f"{safe_stem}.m")
+
+    def _case_3d_dose_files(self, folder, selected_path=None):
+        folder = Path(folder)
+        selected = Path(selected_path) if selected_path else None
+        if selected and selected.exists() and selected.parent == folder and selected.name.lower().startswith("3d-dose") and selected.suffix.lower() == ".dat":
+            return [selected]
+        return sorted(path for path in folder.glob("3d-dose*.dat") if path.is_file())
+
+    def _default_case_3d_dose_script_path(self, folder):
+        folder = Path(folder)
+        return self._safe_matlab_script_path(folder / f"{self._safe_matlab_script_stem(folder.name)}_3d_dose_analysis.m")
+
+    def _default_browser_3d_dose_script_path(self, root):
+        root = Path(root)
+        return self._safe_matlab_script_path(root / f"{self._safe_matlab_script_stem(root.name)}_3d_dose_browser.m")
+
+    def _collect_3d_dose_case_groups(self, root):
+        root = Path(root)
+        groups = {}
+        if not root.exists():
+            return []
+        for path in sorted(root.rglob("3d-dose*.dat")):
+            if not path.is_file():
+                continue
+            lowered_parts = {part.lower() for part in path.parts}
+            if "previous_runs" in lowered_parts or "dmps" in lowered_parts:
+                continue
+            groups.setdefault(path.parent, []).append(path)
+        return [
+            (folder, sorted(paths))
+            for folder, paths in sorted(groups.items(), key=lambda item: str(item[0]).lower())
+        ]
+
+    def _create_matlab_3d_dose_browser_script(self):
+        start_dir = str(self._multi_root or self._workspace or Path.cwd())
+        root_str = QFileDialog.getExistingDirectory(
             self,
-            "Select 3D dose files",
+            "Select cases or batch root for the MATLAB 3D dose browser script",
             start_dir,
-            "3D dose files (3d-dose*.dat);;DAT files (*.dat);;All files (*.*)",
         )
-        if not paths:
-            paths = default_selected
-        if not paths:
+        if not root_str:
             return
-        default_name = f"{Path(self._workspace).name}_3d_dose_analysis.m"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save MATLAB 3D dose script",
-            str(Path(self._workspace) / default_name),
-            "MATLAB script (*.m);;All files (*.*)",
-        )
-        if not save_path:
+        root = Path(root_str)
+        groups = self._collect_3d_dose_case_groups(root)
+        if not groups:
+            QMessageBox.information(self, "3D Dose", f"No 3d-dose*.dat files were found under:\n{root}")
             return
-        out_path = Path(save_path)
-        if not out_path.suffix:
-            out_path = out_path.with_suffix(".m")
-        script_text = self._build_matlab_3d_dose_script(paths)
+        stripped = 0
+        for _case_folder, dose_files in groups:
+            for path in dose_files:
+                self._strip_3d_dose_headers_in_place(path)
+                stripped += 1
+        out_path = self._default_browser_3d_dose_script_path(root)
+        script_text = self._build_matlab_3d_dose_browser_script()
         out_path.write_text(script_text, encoding="utf-8")
-        self._log_analysis(f"MATLAB 3D dose script written: {out_path}", "ok")
-        self.summary.setPlainText(f"MATLAB helper script saved:\n{out_path}\n\nDose files:\n" + "\n".join(paths))
+        self._log_analysis(
+            f"3D dose browser script written: {out_path} (prepared {stripped} 3d-dose file(s) under {root})",
+            "ok",
+        )
+        self.summary.setPlainText(
+            f"3D dose browser script saved:\n{out_path}\n\n"
+            f"Root:\n{root}\n\n"
+            f"Prepared 3d-dose files: {stripped}\n"
+            "Run the script in MATLAB. It can either open one chosen case folder interactively or scan subfolders recursively and save PNG plots beside each 3d-dose.dat."
+        )
+        QMessageBox.information(
+            self,
+            "3D Dose",
+            f"3D dose browser script saved:\n{out_path}\n\n"
+            f"Prepared {stripped} 3d-dose file(s) under:\n{root}",
+        )
+
+    def _create_matlab_3d_dose_case_script(self):
+        if not self._workspace:
+            QMessageBox.information(self, "3D Dose", "Open an Analysis case first for a case-specific script.")
+            return
+        folder = Path(self._workspace)
+        paths = self._case_3d_dose_files(folder, getattr(self, "_analysis_selected_file", None))
+        if not paths:
+            QMessageBox.information(self, "3D Dose", f"No 3d-dose*.dat files were found in:\n{folder}")
+            return
+        prepared = [self._strip_3d_dose_headers_in_place(path) for path in paths]
+        out_path = self._default_case_3d_dose_script_path(folder)
+        script_text = self._build_matlab_3d_dose_script(prepared, out_path.parent)
+        out_path.write_text(script_text, encoding="utf-8")
+        self._log_analysis(f"Case 3D dose script written: {out_path}", "ok")
+        self.summary.setPlainText(
+            f"Case 3D dose script saved:\n{out_path}\n\n"
+            "Prepared files:\n"
+            + "\n".join(str(path) for path in prepared)
+        )
+        QMessageBox.information(
+            self,
+            "3D Dose",
+            f"Case 3D dose script saved:\n{out_path}\n\nPrepared {len(prepared)} 3d-dose file(s).",
+        )
+
+    def _export_matlab_3d_dose_script(self):
+        if not self._workspace and not self._multi_root:
+            QMessageBox.information(self, "3D Dose", "Open an Analysis case or select a Case Root first.")
+            return
+        mode_box = QMessageBox(self)
+        mode_box.setWindowTitle("3D Dose")
+        mode_box.setText("Choose which MATLAB 3D dose helper to create.")
+        btn_browser = mode_box.addButton("Create Dose Browser", QMessageBox.ButtonRole.AcceptRole)
+        btn_case = mode_box.addButton("Create Case Script", QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = mode_box.addButton(QMessageBox.StandardButton.Cancel)
+        mode_box.setDefaultButton(btn_browser)
+        mode_box.exec()
+        clicked = mode_box.clickedButton()
+        if clicked is btn_browser:
+            self._create_matlab_3d_dose_browser_script()
+            return
+        if clicked is btn_case:
+            self._create_matlab_3d_dose_case_script()
 
     def _load_material_densities(self, folder):
         """Load material densities from *folder*, falling back to ancestor
@@ -30774,12 +32498,22 @@ class AnalysisTab(QWidget):
     def _update_dose_xlsx_label(self, state_text):
         if not self._dose_xlsx:
             self.lbl_dose_xlsx.setText("Dose workbook: none selected")
+            self.lbl_dose_xlsx.setToolTip("")
             return
+        display_path = str(self._dose_xlsx)
+        if self._project_root:
+            try:
+                root = Path(self._project_root).resolve()
+                rel = str(Path(self._dose_xlsx).resolve().relative_to(root)).replace("/", "\\")
+                display_path = f"{root.name}\\{rel}" if rel else root.name
+            except Exception:
+                display_path = str(self._dose_xlsx)
         summary = self._dose_workbook_config_summary()
         if summary:
-            self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} ({state_text}; {summary})")
+            self.lbl_dose_xlsx.setText(f"Dose workbook: {display_path} ({state_text}; {summary})")
         else:
-            self.lbl_dose_xlsx.setText(f"Dose workbook: {self._dose_xlsx} ({state_text})")
+            self.lbl_dose_xlsx.setText(f"Dose workbook: {display_path} ({state_text})")
+        self.lbl_dose_xlsx.setToolTip(str(self._dose_xlsx))
 
     def _prompt_dose_workbook_config(self, existing=None):
         if not self._workspace or not self._geo_body_defs:
@@ -31088,16 +32822,17 @@ class AnalysisTab(QWidget):
             rows.append([
                 case,
                 f"Body {result['body_id']}",
+                result.get("component", ""),
                 result["edep"],
                 result["dedep"],
+                mass,
+                result.get("dose_ev_g", ""),
+                result.get("ddose_ev_g", ""),
                 edep_j,
                 dedep_j,
                 result["error"],
-                mass,
                 result.get("dose", ""),
                 result.get("ddose", ""),
-                result.get("dose_ev_g", ""),
-                result.get("ddose_ev_g", ""),
                 n_ref,
                 t_ref,
                 target_err,
@@ -31105,7 +32840,6 @@ class AnalysisTab(QWidget):
                 t_target,
                 "",
                 result.get("geometry_type", ""),
-                result.get("geometry", ""),
             ])
         total_dedep = total_dedep_sq ** 0.5
         total_error = abs(total_dedep / total_edep * 100.0) if total_edep else ""
@@ -31123,16 +32857,17 @@ class AnalysisTab(QWidget):
         rows.append([
             case,
             "TOTAL",
+            "",
             total_edep,
             total_dedep,
+            total_mass_value,
+            total_dose_ev_g,
+            total_ddose_ev_g,
             total_edep_j,
             total_dedep_j,
             total_error,
-            total_mass_value,
             total_dose,
             total_ddose,
-            total_dose_ev_g,
-            total_ddose_ev_g,
             n_ref_total,
             t_ref_total,
             target_err,
@@ -31140,7 +32875,6 @@ class AnalysisTab(QWidget):
             t_target_total,
             "",
             "Total",
-            "Sum of body rows",
         ])
         return case, rows
 
@@ -31491,6 +33225,10 @@ class AnalysisTab(QWidget):
         text = _decode_text_bytes(path.read_bytes())
         src_info = self._extract_source_info_from_in(path.parent)
         summary_bits = _analysis_summary_lines(text, src_info)
+        health = _penmain_result_health(path.parent)
+        if health.get("incomplete"):
+            summary_bits.insert(0, f"Incomplete run: {health.get('reason')}")
+            self._log_analysis(f"Incomplete penmain-res detected in {path.parent.name}: {health.get('reason')}", "warn")
         mt = re.search(r"Simulation time\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?E[+\-]?\d+)\s*sec", text, re.IGNORECASE)
         ms = re.search(r"Simulated primary showers\s*\.{2,}\s*([+\-]?\d+(?:\.\d+)?E[+\-]?\d+)", text, re.IGNORECASE)
         if mt:
@@ -32353,7 +34091,7 @@ class AnalysisTab(QWidget):
                     return
                 root = Path(folder)
                 self._multi_root = root
-                self.lbl_multi_root.setText(f"Case Root: {self._multi_root}")
+                self._set_multi_root_label(self._multi_root)
             folders = self._analysis_candidate_folders(root)
             selected_folders = self._select_completed_folders_for_combination(folders)
             if selected_folders is None:
@@ -33152,7 +34890,7 @@ class AnalysisTab(QWidget):
         export_dir = common_parent
         # Set workspace to the combine output folder so Append can export directly.
         self._workspace = export_dir
-        self.lbl_workspace.setText(f"Case: {self._workspace.name}  (combined)")
+        self._set_workspace_label(text=f"{self._analysis_workspace_display_text(self._workspace)}  (combined)")
         # Bump the load serial so any still-pending background _load_workspace
         # thread is treated as stale and won't overwrite these combined results.
         self._analysis_load_serial += 1
@@ -33329,7 +35067,7 @@ class AnalysisTab(QWidget):
         finally:
             self._workspace = previous_workspace if previous_workspace and previous_workspace.exists() else self._workspace
             if self._workspace and self._workspace.exists():
-                self.lbl_workspace.setText(f"Case: {self._workspace}")
+                self._set_workspace_label(self._workspace)
             self._dose_xlsx = xlsx_path
             self._dose_xlsx_user_selected = True
             self._update_dose_xlsx_label("locked")
@@ -33388,6 +35126,7 @@ class PenelopeStudio(QMainWindow):
         self._pending_startup_files = {"geo_file": geo_file, "in_file": in_file}
         self._post_launch_startup_done = False
         self._project_tree_refresh_pending = False
+        self._corner_toast = None
         self._startup_report("Loading saved settings", "Restoring executable paths, spectrum database, and recent project root.")
         self._load_app_settings()
 
@@ -33396,6 +35135,8 @@ class PenelopeStudio(QMainWindow):
         self._build_menus()
         self._startup_report("Building status bar", "Preparing the bottom status area and startup message.")
         self._build_statusbar()
+        self._corner_toast = CornerToast(self)
+        self.sim_tab.batch_notification.connect(self._show_corner_toast)
 
         # Load files if given
         files_detail = []
@@ -35079,6 +36820,21 @@ class PenelopeStudio(QMainWindow):
         self.setStatusBar(sb)
         sb.showMessage(f"PENELOPE Simulation Studio {APP_VERSION} - ready")
 
+    def _show_corner_toast(self, title, body=""):
+        if self._corner_toast is None:
+            self._corner_toast = CornerToast(self)
+        self._corner_toast.show_toast(title, body)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._corner_toast is not None and self._corner_toast.isVisible():
+            self._corner_toast._reposition()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._corner_toast is not None and self._corner_toast.isVisible():
+            self._corner_toast._reposition()
+
     def _open_settings(self):
         dlg = SettingsDialog(
             self._configured_runtime_path("gview2d"),
@@ -35131,7 +36887,7 @@ class PenelopeStudio(QMainWindow):
         if self.analysis_tab._multi_root is None and root_hint.exists():
             self.analysis_tab._multi_root = root_hint
             if hasattr(self.analysis_tab, "lbl_multi_root"):
-                self.analysis_tab.lbl_multi_root.setText(f"Case Root: {self.analysis_tab._multi_root}")
+                self.analysis_tab._set_multi_root_label(self.analysis_tab._multi_root)
             self.analysis_tab._refresh_analysis_workspace_candidates()
 
         if self.analysis_tab._workspace is None and (sim_folder / "penmain-res.dat").exists():
