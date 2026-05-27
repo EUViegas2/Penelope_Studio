@@ -42,6 +42,7 @@ import re
 import io
 import json
 import math
+import time
 import difflib
 import hashlib
 import unicodedata
@@ -1315,6 +1316,8 @@ def make_help_label(text, hint="", style=None, return_label=False):
     label = QLabel(text)
     if style:
         label.setStyleSheet(style)
+    label.setMinimumWidth(0)
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     hint = str(hint or "").strip()
     if not hint:
         return (label, label) if return_label else label
@@ -1322,6 +1325,8 @@ def make_help_label(text, hint="", style=None, return_label=False):
     info.setStyleSheet(label_css(P["fg2"], bold=True, size=8))
     info.setFixedWidth(12)
     box = QWidget()
+    box.setMinimumWidth(0)
+    box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
     lay = QHBoxLayout(box)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(4)
@@ -17269,7 +17274,8 @@ def _penmain_result_health(folder):
             re.IGNORECASE | re.MULTILINE,
         ))
     if log_text:
-        data["has_end_marker"] = "***  END  ***" in log_text.upper()
+        upper_log = log_text.upper()
+        data["has_end_marker"] = ("***  END  ***" in upper_log) or ("*** END ***" in upper_log)
     if not data["res_exists"]:
         data["status"] = "missing"
         data["reason"] = "penmain-res.dat missing"
@@ -17292,7 +17298,6 @@ def _penmain_result_health(folder):
         data["reason"] = "penmain-res.dat is missing " + ", ".join(missing)
         return data
     if data["log_exists"] and not data["has_end_marker"]:
-        data["incomplete"] = True
         data["status"] = "truncated_log"
         data["reason"] = "penmain.dat is truncated before END marker"
         return data
@@ -17634,7 +17639,7 @@ class SimulationTab(QWidget):
         if not isinstance(spec, dict):
             return {}
         data = {}
-        for key in ("case_name", "in_filename", "senerg_kev", "spectr_file"):
+        for key in ("case_name", "in_filename", "senerg_kev", "spectr_file", "spectr_db_label"):
             value = spec.get(key, "")
             if str(value or "").strip():
                 data[key] = value
@@ -17655,6 +17660,9 @@ class SimulationTab(QWidget):
         scone = spec.get("scone")
         if scone:
             data["scone_deg"] = [str(v) for v in scone]
+        calc_values = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), spec.get("scone"))
+        if calc_values:
+            data["source_target_calc"] = dict(calc_values)
         folder_token_keys = [str(k or "").strip().lower() for k in list(spec.get("folder_token_keys") or []) if str(k or "").strip()]
         if folder_token_keys:
             data["folder_token_keys"] = folder_token_keys
@@ -19367,7 +19375,7 @@ class SimulationTab(QWidget):
                 self,
                 "Choose spectrum file",
                 str(self._in_folder()),
-                "Spectrum data (*.dat *.txt);;All files (*.*)",
+                "Spectrum data (*.dat *.txt *.xlsx *.xlsm);;All files (*.*)",
             )
             if path:
                 e_path.setText(path)
@@ -19511,10 +19519,9 @@ class SimulationTab(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         x, y, z = [(edit.text() or "0.0").strip() for edit in edits]
-        self._replace_source_attribute(
-            ("SPOSIT",),
-            [f"SPOSIT {x} {y} {z}                    [Coordinates of the source]"],
-        )
+        updated = self._rewrite_source_position_and_cone_text(self._get_text(), sposit=[x, y, z])
+        self._set_text(updated)
+        self._update_sim_action_labels()
         self.console.log("[SIM] SPOSIT updated.\n", "ok")
 
     def _cmd_edit_scone(self):
@@ -19545,10 +19552,9 @@ class SimulationTab(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         theta, phi, alpha = [(edit.text() or "0").strip() for edit in edits]
-        self._replace_source_attribute(
-            ("SCONE",),
-            [f"SCONE  {theta} {phi} {alpha}                       [Conical beam; theta phi alpha in deg]"],
-        )
+        updated = self._rewrite_source_position_and_cone_text(self._get_text(), scone=[theta, phi, alpha])
+        self._set_text(updated)
+        self._update_sim_action_labels()
         self.console.log("[SIM] SCONE updated.\n", "ok")
 
     def _cmd_edit_material_name(self, occurrence):
@@ -20465,6 +20471,89 @@ class SimulationTab(QWidget):
         except Exception:
             return False
 
+    def _case_root_matches_display_root(self, case_root, display_root):
+        if not case_root or not display_root:
+            return False
+        try:
+            Path(case_root).resolve().relative_to(Path(display_root).resolve())
+            return True
+        except Exception:
+            return False
+
+    def _refresh_project_case_entries_from_folders(self, display_root=None):
+        if not self._project_root:
+            return []
+        path = self._project_case_creation_log_path()
+        existing_entries = [
+            entry for entry in self._read_project_log_entries(path)
+            if isinstance(entry, dict)
+        ]
+        existing_by_root = {}
+        for entry in existing_entries:
+            case_path = self._resolve_project_logged_path(entry.get("case_folder"))
+            key = self._path_resolve_key(case_path)
+            if key:
+                existing_by_root[key] = entry
+
+        scan_root = self._project_case_root_folder() or self._workspace_folder()
+        scan_root = Path(scan_root)
+        if not scan_root.exists() or not scan_root.is_dir():
+            return []
+
+        refreshed = []
+        skip = self._BATCH_SKIP_FOLDER_NAMES
+        for dirpath_str, dirnames, filenames in os.walk(str(scan_root)):
+            dirpath = Path(dirpath_str)
+            dirnames[:] = sorted(d for d in dirnames if d.lower() not in skip and not d.startswith("."))
+            if dirpath.name.startswith(".") or dirpath.name.lower() in skip:
+                continue
+            in_files = sorted(dirpath.glob("*.in"))
+            if not in_files:
+                continue
+            existing = dict(existing_by_root.get(self._path_resolve_key(dirpath), {}) or {})
+            geo_files = sorted(dirpath.glob("*.geo"))
+            entry = existing
+            entry["project_root"] = self._project_root or ""
+            entry["case_folder"] = self._project_relative_path_text(dirpath)
+            entry["case_name"] = dirpath.name
+            entry["in_file"] = in_files[0].name
+            if geo_files:
+                entry["geo_file"] = geo_files[0].name
+                if not str(entry.get("geo_source_path") or "").strip():
+                    entry["geo_source_path"] = self._project_relative_path_text(dirpath / geo_files[0].name)
+            if not str(entry.get("timestamp") or "").strip():
+                try:
+                    entry["timestamp"] = datetime.fromtimestamp(dirpath.stat().st_mtime).isoformat(timespec="seconds")
+                except Exception:
+                    entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
+            if "group_rel" not in entry or not str(entry.get("group_rel") or "").strip():
+                try:
+                    rel_parent = dirpath.parent.resolve().relative_to(scan_root.resolve())
+                    entry["group_rel"] = "" if str(rel_parent) == "." else str(rel_parent).replace("/", "\\")
+                except Exception:
+                    entry["group_rel"] = str(existing.get("group_rel") or "")
+            refreshed.append(entry)
+
+        refreshed.sort(
+            key=lambda entry: (
+                Path(self._resolve_project_logged_path(entry.get("case_folder")) or scan_root).stat().st_mtime
+                if (self._resolve_project_logged_path(entry.get("case_folder")) or scan_root).exists()
+                else 0.0
+            ),
+            reverse=True,
+        )
+        try:
+            self._write_project_log_entries(path, "penelope_studio_case_creation_log_v1", refreshed)
+        except Exception as exc:
+            self.console.log(f"[SIM] Could not refresh case creation log from folders: {exc}\n", "warn")
+
+        display_root = Path(display_root) if display_root else self._workspace_folder()
+        filtered = [
+            entry for entry in refreshed
+            if self._case_root_matches_display_root(self._resolve_project_logged_path(entry.get("case_folder")), display_root)
+        ]
+        return filtered or refreshed
+
     def _refresh_project_batch_entries_from_folders(self, display_root=None):
         if not self._project_root:
             return []
@@ -21048,6 +21137,38 @@ class SimulationTab(QWidget):
         text = text.strip("_-")
         return text or (fallback or "case")
 
+    def _case_variant_label_and_number(self, value, fallback_label="case", fallback_number=None):
+        base = self._case_variant_base_name(value, fallback_label or "case")
+        match = re.match(r"^(.*?)(?:[_-])case(\d+)$", base, re.IGNORECASE)
+        if match:
+            label = self._workspace_safe_token(match.group(1), fallback_label or "case")
+            try:
+                number = int(match.group(2))
+            except Exception:
+                number = fallback_number
+        else:
+            label = self._workspace_safe_token(base, fallback_label or "case")
+            number = fallback_number
+        if number not in (None, ""):
+            try:
+                number = int(number)
+            except Exception:
+                number = fallback_number
+        if not label:
+            label = fallback_label or "case"
+        return label, number
+
+    def _case_variant_name_from_label(self, label_prefix, case_number=None, fallback_label="case"):
+        label = self._workspace_safe_token(label_prefix, fallback_label or "case")
+        if not label:
+            label = fallback_label or "case"
+        if case_number not in (None, ""):
+            try:
+                return f"{label}_case{int(case_number)}"
+            except Exception:
+                pass
+        return label
+
     def _case_variant_folder_name(self, base_name, spec):
         parts = [self._case_variant_base_name(base_name, "case")]
         selected_keys = list(spec.get("folder_token_keys") or DEFAULT_BATCH_FOLDER_TOKEN_KEYS)
@@ -21072,14 +21193,59 @@ class SimulationTab(QWidget):
             geo_override_path=geo_override_path or "",
             mat_folder=mat_folder or "",
         )
-        if "case_name" in spec:
-            final_spec["case_name"] = self._case_variant_base_name(spec.get("case_name"), case_name or "case")
-        if "in_filename" in spec:
-            final_spec["in_filename"] = self._case_variant_in_filename(spec.get("in_filename"), case_name or "simulation")
+        fallback_label, fallback_number = self._case_variant_label_and_number(case_name, case_name or "case", None)
+        label_prefix = spec.get("case_label_prefix")
+        if label_prefix in (None, "") and "case_name" in spec:
+            label_prefix, parsed_number = self._case_variant_label_and_number(spec.get("case_name"), fallback_label or "case", fallback_number)
+            if spec.get("case_number") in (None, ""):
+                fallback_number = parsed_number
+        if label_prefix in (None, ""):
+            label_prefix = fallback_label or "case"
+        case_number = spec.get("case_number", fallback_number)
+        final_case_name = self._case_variant_name_from_label(label_prefix, case_number, fallback_label or "case")
+        final_spec["case_label_prefix"] = self._workspace_safe_token(label_prefix, fallback_label or "case")
+        if case_number not in (None, ""):
+            try:
+                final_spec["case_number"] = int(case_number)
+            except Exception:
+                pass
+        final_spec["case_name"] = final_case_name
+        final_spec["in_filename"] = self._case_variant_in_filename(f"{final_case_name}.in", final_case_name or "simulation")
         if geo_override_path:
             final_spec["geo_override_path"] = str(geo_override_path)
         if mat_folder:
             final_spec["mat_folder"] = str(mat_folder)
+        if spec.get("senerg_kev") not in (None, ""):
+            final_spec["senerg_kev"] = str(spec.get("senerg_kev")).strip()
+            final_spec.pop("spectr_lines", None)
+            final_spec.pop("spectr_file", None)
+            final_spec.pop("spectr_range", None)
+            final_spec.pop("spectr_last_kev", None)
+        elif spec.get("spectr_lines"):
+            final_spec["spectr_lines"] = list(spec.get("spectr_lines") or [])
+            if spec.get("spectr_file") not in (None, ""):
+                final_spec["spectr_file"] = str(spec.get("spectr_file")).strip()
+            if spec.get("spectr_db_label") not in (None, ""):
+                final_spec["spectr_db_label"] = str(spec.get("spectr_db_label")).strip()
+            if spec.get("spectr_range"):
+                final_spec["spectr_range"] = tuple(spec.get("spectr_range"))
+            else:
+                final_spec["spectr_range"] = self._spectr_range_from_lines(final_spec["spectr_lines"])
+            if spec.get("spectr_last_kev") not in (None, ""):
+                final_spec["spectr_last_kev"] = spec.get("spectr_last_kev")
+            else:
+                try:
+                    final_spec["spectr_last_kev"] = float(str(final_spec["spectr_lines"][-1].split()[0]).replace(",", "."))
+                except Exception:
+                    pass
+            final_spec.pop("senerg_kev", None)
+        if spec.get("sposit") and len(list(spec.get("sposit") or [])) == 3:
+            final_spec["sposit"] = [str(v) for v in list(spec.get("sposit") or [])[:3]]
+        if spec.get("scone") and len(list(spec.get("scone") or [])) == 3:
+            final_spec["scone"] = [str(v) for v in list(spec.get("scone") or [])[:3]]
+        calc_values = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), final_spec.get("scone"))
+        if calc_values:
+            final_spec["source_target_calc"] = dict(calc_values)
         if "folder_token_keys" in spec:
             final_spec["folder_token_keys"] = list(spec.get("folder_token_keys") or [])
         return final_spec, final_text
@@ -21434,6 +21600,7 @@ class SimulationTab(QWidget):
             "spectrum_lines": [],
             "sposit": ["0.0", "0.0", "0.0"],
             "scone": ["0", "0", "0"],
+            "source_target_calc": None,
         }
 
         match = re.search(r"^\s*SKPAR\s+(\S+)", text or "", re.IGNORECASE | re.MULTILINE)
@@ -21485,6 +21652,12 @@ class SimulationTab(QWidget):
             vals = match.group(1).split()[:3]
             if len(vals) == 3:
                 defaults["scone"] = vals
+        calc_values = self._parse_source_target_calc_metadata(text)
+        if calc_values is None:
+            calc_values = self._source_target_calc_defaults_from_direct(defaults["sposit"], defaults["scone"])
+        else:
+            calc_values = self._sync_source_target_calc_to_direct(calc_values, defaults["scone"])
+        defaults["source_target_calc"] = calc_values
         return defaults
 
     def _read_project_log_entries(self, path):
@@ -21510,12 +21683,20 @@ class SimulationTab(QWidget):
     def _case_spec_from_in_text(self, case_name, in_filename, text, geo_override_path="", mat_folder=""):
         defaults = self._source_defaults_from_text(text)
         base_case_name = self._case_variant_base_name(case_name, "case")
+        label_prefix, case_number = self._case_variant_label_and_number(base_case_name, Path(in_filename).stem if in_filename else "case", None)
+        resolved_case_name = self._case_variant_name_from_label(label_prefix, case_number, label_prefix or "case")
         spec = {
-            "case_name": base_case_name,
-            "in_filename": self._case_variant_in_filename(in_filename, base_case_name or "simulation"),
+            "case_name": resolved_case_name,
+            "case_label_prefix": label_prefix,
+            "in_filename": self._case_variant_in_filename(in_filename, resolved_case_name or "simulation"),
             "geo_override_path": str(geo_override_path or ""),
             "mat_folder": str(mat_folder or ""),
         }
+        if case_number not in (None, ""):
+            try:
+                spec["case_number"] = int(case_number)
+            except Exception:
+                pass
         if defaults["energy_type"] == "SENERG":
             spec["senerg_kev"] = defaults["energy_value"] if defaults["energy_unit"] == "keV" else str(float(defaults["energy_value"]) * 1000.0)
         elif defaults["spectrum_lines"]:
@@ -21525,6 +21706,9 @@ class SimulationTab(QWidget):
                 spec["spectr_last_kev"] = float(str(defaults["spectrum_lines"][-1].split()[0]).replace(",", "."))
             except Exception:
                 pass
+        calc_values = self._normalize_source_target_calc(defaults.get("source_target_calc"))
+        if calc_values:
+            spec["source_target_calc"] = dict(calc_values)
         if defaults["sposit"]:
             spec["sposit"] = list(defaults["sposit"])
         if defaults["scone"]:
@@ -21536,6 +21720,7 @@ class SimulationTab(QWidget):
             return None
         variant = dict(record.get("variant") or {})
         case_name = self._case_variant_base_name(str(variant.get("case_name") or record.get("case_name") or "case").strip(), "case")
+        label_prefix, case_number = self._case_variant_label_and_number(case_name, "case", None)
         in_filename = str(variant.get("in_filename") or record.get("in_file") or f"{case_name}.in").strip()
         case_dir = self._resolve_project_logged_path(record.get("case_folder"))
         geo_source_path = self._resolve_project_logged_path(record.get("geo_source_path"))
@@ -21543,15 +21728,23 @@ class SimulationTab(QWidget):
         mat_folder = case_dir if case_dir and case_dir.exists() and any(case_dir.glob("*.mat")) else None
         if variant:
             spec = {
-                "case_name": case_name,
+                "case_name": self._case_variant_name_from_label(label_prefix, case_number, label_prefix or "case"),
+                "case_label_prefix": label_prefix,
                 "in_filename": self._case_variant_in_filename(in_filename, case_name or "simulation"),
                 "geo_override_path": str(geo_override_path or ""),
                 "mat_folder": str(mat_folder or ""),
             }
+            if case_number not in (None, ""):
+                try:
+                    spec["case_number"] = int(case_number)
+                except Exception:
+                    pass
             if str(variant.get("senerg_kev", "")).strip():
                 spec["senerg_kev"] = str(variant.get("senerg_kev")).strip()
             if str(variant.get("spectr_file", "")).strip():
                 spec["spectr_file"] = str(variant.get("spectr_file")).strip()
+            if str(variant.get("spectr_db_label", "")).strip():
+                spec["spectr_db_label"] = str(variant.get("spectr_db_label")).strip()
             spectr_range = variant.get("spectr_range_kev")
             if isinstance(spectr_range, (list, tuple)) and len(spectr_range) == 2:
                 spec["spectr_range"] = tuple(spectr_range)
@@ -21563,6 +21756,9 @@ class SimulationTab(QWidget):
             scone = variant.get("scone_deg")
             if isinstance(scone, (list, tuple)) and len(scone) == 3:
                 spec["scone"] = [str(v) for v in scone]
+            calc_values = self._sync_source_target_calc_to_direct(variant.get("source_target_calc"), spec.get("scone"))
+            if calc_values:
+                spec["source_target_calc"] = dict(calc_values)
             folder_token_keys = [str(k or "").strip().lower() for k in list(variant.get("folder_token_keys") or []) if str(k or "").strip()]
             if folder_token_keys:
                 spec["folder_token_keys"] = folder_token_keys
@@ -21725,12 +21921,14 @@ class SimulationTab(QWidget):
         if not self._project_root:
             QMessageBox.information(self, "Edit Case", "Open a project first so Studio can read the case creation log.")
             return None
-        entries = [
-            entry for entry in self._read_project_log_entries(self._project_case_creation_log_path())
-            if isinstance(entry, dict)
-        ]
+        current_root = self._workspace_folder()
+        entries = self._refresh_project_case_entries_from_folders(display_root=current_root)
         if not entries:
-            QMessageBox.information(self, "Edit Case", "No project case creation log entries were found.")
+            QMessageBox.information(
+                self,
+                "Edit Case",
+                f"No case folders were found under the current Case Root.\n\n{current_root}",
+            )
             return None
         dlg = QDialog(self)
         dlg.setModal(True)
@@ -21738,7 +21936,9 @@ class SimulationTab(QWidget):
         dlg.setMinimumWidth(760)
         dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
         lay = QVBoxLayout(dlg)
-        hint = QLabel("Choose a previously created case to edit or duplicate with block-based changes.")
+        hint = QLabel(
+            f"Choose a case folder found under the current Case Root.\n\nCurrent root: {current_root}"
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet(label_css(P["fg2"], size=9))
         lay.addWidget(hint)
@@ -21747,7 +21947,7 @@ class SimulationTab(QWidget):
             f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
             f"QListWidget::item:selected {{ background:{P['sel']}; }}"
         )
-        for entry in reversed(entries):
+        for entry in entries:
             case_name = str(entry.get("case_name") or "?")
             stamp = str(entry.get("timestamp") or "")
             case_folder = str(entry.get("case_folder") or "")
@@ -22063,6 +22263,10 @@ class SimulationTab(QWidget):
             folder_tokens_lay.addWidget(chk)
             folder_token_checks[key] = chk
         folder_tokens_lay.addStretch()
+        folder_tokens_note = QLabel("These naming tokens apply to every row only for folder/file naming. They do not change the source values by themselves.")
+        folder_tokens_note.setWordWrap(True)
+        folder_tokens_note.setStyleSheet(label_css(P["fg2"], size=8))
+        folder_tokens_lay.addWidget(folder_tokens_note, stretch=1)
         lay.addWidget(folder_tokens_box)
 
         bulk_row = QHBoxLayout()
@@ -22109,10 +22313,31 @@ class SimulationTab(QWidget):
             for row in rows:
                 refresh_row_preview(row)
 
-        def renumber_rows():
-            for idx, row in enumerate(rows, start=1):
-                row["box"].setTitle(f"CASE {idx}")
-                row["hdr_case"].setText(f"CASE {idx}")
+        def refresh_row_headers():
+            for row in rows:
+                number = row.get("case_number")
+                title = f"CASE {number}" if number not in (None, "") else "CASE"
+                row["box"].setTitle(title)
+                row["hdr_case"].setText(title)
+
+        def next_case_number():
+            numbers = []
+            for row in rows:
+                try:
+                    numbers.append(int(row.get("case_number")))
+                except Exception:
+                    continue
+            return (max(numbers) + 1) if numbers else 1
+
+        def update_row_identity(row):
+            label_seed = row.get("label_fallback") or Path(in_path).stem or "case"
+            label_text = self._workspace_safe_token((row["case_label"].text() or "").strip(), label_seed)
+            case_number = row.get("case_number")
+            case_name = self._case_variant_name_from_label(label_text, case_number, label_seed)
+            row["computed_case_name"] = case_name
+            row["computed_in_filename"] = self._case_variant_in_filename(f"{case_name}.in", case_name or label_seed)
+            row["in_name"].setText(row["computed_in_filename"])
+            row["case_number_display"].setText(str(case_number if case_number not in (None, "") else ""))
 
         def apply_check_state(key, checked):
             for row in rows:
@@ -22178,6 +22403,62 @@ class SimulationTab(QWidget):
                 if target is not None and target is not source_edit:
                     target.setText(value)
 
+        def row_spectrum_summary(row):
+            kind = str(row.get("spectr_source_kind") or "file").strip().lower()
+            if kind == "database":
+                label = self._normalize_spectrum_label(row.get("spectr_db_label") or "")
+                return f"Database spectrum: {label}" if label else "Choose a spectrum from the database"
+            path = (row["spectr_path"].text() or "").strip()
+            if path:
+                return Path(path).name
+            if row.get("spectr_seed_lines"):
+                return "Using existing inline SPECTR block from source case"
+            return "No spectrum selected"
+
+        def row_spectrum_lines(row, validate=False):
+            kind = str(row.get("spectr_source_kind") or "file").strip().lower()
+            if kind == "database":
+                label = self._normalize_spectrum_label(row.get("spectr_db_label") or "")
+                if label:
+                    try:
+                        entry = next(entry for entry in self._load_spectrum_database() if entry["label"] == label)
+                        lines = self._spectr_lines_from_database_rows(entry["rows"])
+                        return lines, label, ""
+                    except StopIteration:
+                        if validate:
+                            raise ValueError("The selected database spectrum was not found.")
+                    except ValueError:
+                        if validate:
+                            raise
+                seed_lines = list(row.get("spectr_seed_lines") or [])
+                return seed_lines, label, ""
+            path = (row["spectr_path"].text() or "").strip()
+            if path:
+                try:
+                    lines = self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
+                    return lines, "", path
+                except Exception:
+                    if validate:
+                        raise
+            seed_lines = list(row.get("spectr_seed_lines") or [])
+            return seed_lines, "", path
+
+        def propagate_spectrum_source(row):
+            apply_check_state("spectr", True)
+            source_kind = str(row.get("spectr_source_kind") or "file").strip().lower()
+            source_path = (row["spectr_path"].text() or "").strip()
+            source_db_label = str(row.get("spectr_db_label") or "").strip()
+            for target_row in rows:
+                if target_row is row:
+                    continue
+                target_row["spectr_source_kind"] = source_kind
+                target_row["spectr_db_label"] = source_db_label
+                if source_kind == "database":
+                    target_row["spectr_path"].setText("")
+                else:
+                    target_row["spectr_path"].setText(source_path)
+                refresh_row_preview(target_row)
+
         def remove_row(row):
             if len(rows) <= 1:
                 QMessageBox.information(dlg, dialog_title, "At least one case row must remain.")
@@ -22185,9 +22466,101 @@ class SimulationTab(QWidget):
             rows.remove(row)
             row["box"].setParent(None)
             row["box"].deleteLater()
-            renumber_rows()
+            refresh_row_headers()
+
+        def _row_effective_folder_spec(row):
+            seed_spec = dict(row.get("seed_spec") or {})
+            spec = {}
+            for key in (
+                "senerg_kev",
+                "spectr_file",
+                "spectr_db_label",
+                "spectr_lines",
+                "spectr_range",
+                "spectr_last_kev",
+                "sposit",
+                "scone",
+                "source_target_calc",
+            ):
+                value = seed_spec.get(key)
+                if isinstance(value, list):
+                    spec[key] = list(value)
+                elif isinstance(value, tuple):
+                    spec[key] = tuple(value)
+                elif isinstance(value, dict):
+                    spec[key] = dict(value)
+                elif value not in (None, ""):
+                    spec[key] = value
+            if row["senerg"].isChecked():
+                raw = (row["senerg_edit"].text() or "").strip()
+                if raw:
+                    spec["senerg_kev"] = raw
+                    spec.pop("spectr_file", None)
+                    spec.pop("spectr_db_label", None)
+                    spec.pop("spectr_lines", None)
+                    spec.pop("spectr_range", None)
+                    spec.pop("spectr_last_kev", None)
+            if row["spectr"].isChecked():
+                try:
+                    lines, db_label, source_path = row_spectrum_lines(row, validate=False)
+                except Exception:
+                    lines, db_label, source_path = [], "", ""
+                if lines:
+                    spec["spectr_lines"] = list(lines)
+                    spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                    if db_label:
+                        spec["spectr_db_label"] = db_label
+                        spec.pop("spectr_file", None)
+                    elif source_path:
+                        spec["spectr_file"] = source_path
+                        spec.pop("spectr_db_label", None)
+                    try:
+                        spec["spectr_last_kev"] = float(str(lines[-1].split()[0]).replace(",", "."))
+                    except Exception:
+                        pass
+                    spec.pop("senerg_kev", None)
+            if row["sposit"].isChecked():
+                values = [(edit.text() or "").strip() for edit in row["sposit_edits"]]
+                if all(values):
+                    spec["sposit"] = values
+            if row["scone"].isChecked():
+                if row["scone_mode"].currentIndex() == 0:
+                    values = [(edit.text() or "").strip() for edit in row["scone_direct_edits"]]
+                    if all(values):
+                        spec["scone"] = values
+                        synced_calc = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), values)
+                        if synced_calc:
+                            spec["source_target_calc"] = synced_calc
+                else:
+                    try:
+                        xa = float((row["scone_target_edits"]["XA"].text() or "").strip().replace(",", "."))
+                        ya = float((row["scone_target_edits"]["YA"].text() or "").strip().replace(",", "."))
+                        za = float((row["scone_target_edits"]["ZA"].text() or "").strip().replace(",", "."))
+                        radius = float((row["scone_target_edits"]["R"].text() or "").strip().replace(",", "."))
+                        beta = float((row["scone_target_edits"]["beta"].text() or "").strip().replace(",", "."))
+                        gamma = float((row["scone_target_edits"]["gamma"].text() or "").strip().replace(",", "."))
+                        alpha = float((row["scone_target_edits"]["alpha"].text() or "").strip().replace(",", "."))
+                        calc_sposit, calc_scone = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
+                        spec["sposit"] = calc_sposit
+                        spec["scone"] = calc_scone
+                        spec["source_target_calc"] = self._normalize_source_target_calc(
+                            {
+                                "XA": xa,
+                                "YA": ya,
+                                "ZA": za,
+                                "R": radius,
+                                "beta": beta,
+                                "gamma": gamma,
+                                "alpha": alpha,
+                            }
+                        )
+                    except ValueError:
+                        pass
+            spec["folder_token_keys"] = current_folder_token_keys()
+            return spec
 
         def refresh_row_preview(row):
+            update_row_identity(row)
             chk_senerg = row["senerg"]
             chk_spectr = row["spectr"]
             chk_sposit = row["sposit"]
@@ -22201,16 +22574,25 @@ class SimulationTab(QWidget):
             target_edits = row["scone_target_edits"]
             direct_mode = cmb_scone_mode.currentIndex() == 0
             target_mode = chk_scone.isChecked() and not direct_mode
+            spectr_db_mode = str(row.get("spectr_source_kind") or "file").strip().lower() == "database"
             row["scone_stack"].setCurrentIndex(0 if direct_mode else 1)
             row["scone_stack"].setVisible(chk_scone.isChecked())
             row["lbl_senerg"].setVisible(chk_senerg.isChecked())
             e_senerg.setVisible(chk_senerg.isChecked())
             row["btn_senerg_all"].setVisible(chk_senerg.isChecked())
             row["lbl_spectr_file"].setVisible(chk_spectr.isChecked())
-            spectr_path.setVisible(chk_spectr.isChecked())
+            spectr_path.setVisible(chk_spectr.isChecked() and not spectr_db_mode)
             row["btn_spectr"].setVisible(chk_spectr.isChecked())
             row["btn_spectr_all"].setVisible(chk_spectr.isChecked())
-            spectr_inline_lbl.setVisible(chk_spectr.isChecked() and bool(row.get("spectr_seed_lines")) and not (spectr_path.text() or "").strip())
+            spectr_inline_lbl.setText(row_spectrum_summary(row))
+            spectr_inline_lbl.setVisible(
+                chk_spectr.isChecked()
+                and (
+                    spectr_db_mode
+                    or bool(row.get("spectr_seed_lines"))
+                    or not (spectr_path.text() or "").strip()
+                )
+            )
             row["lbl_sposit"].setVisible(chk_sposit.isChecked() and not target_mode)
             row["lbl_sposit_auto"].setVisible(target_mode)
             for btn in row.get("btn_sposit_axis_all", []):
@@ -22225,50 +22607,129 @@ class SimulationTab(QWidget):
             row["target_wrapper"].setVisible(chk_scone.isChecked() and not direct_mode)
             if allow_resource_overrides:
                 row["resource_block"].setVisible(True)
-            spec = {}
-            if chk_senerg.isChecked():
-                spec["senerg_kev"] = (e_senerg.text() or "").strip()
-            if chk_spectr.isChecked():
-                try:
-                    if (spectr_path.text() or "").strip():
-                        lines = self._spectr_lines_from_file(spectr_path.text().strip(), prob_col=self._spectr_prob_col_for_particle(particle))
-                        spec["spectr_range"] = self._spectr_range_from_lines(lines)
-                    elif row.get("spectr_seed_lines"):
-                        spec["spectr_range"] = self._spectr_range_from_lines(row["spectr_seed_lines"])
-                except Exception:
-                    pass
-            if chk_sposit.isChecked():
-                spec["sposit"] = [(edit.text() or "").strip() for edit in sposit_edits]
-            if chk_scone.isChecked():
-                if direct_mode:
-                    spec["scone"] = [(edit.text() or "").strip() for edit in scone_direct_edits]
-                else:
-                    try:
-                        xa = float((target_edits["XA"].text() or "").strip().replace(",", "."))
-                        ya = float((target_edits["YA"].text() or "").strip().replace(",", "."))
-                        za = float((target_edits["ZA"].text() or "").strip().replace(",", "."))
-                        radius = float((target_edits["R"].text() or "").strip().replace(",", "."))
-                        beta = float((target_edits["beta"].text() or "").strip().replace(",", "."))
-                        gamma = float((target_edits["gamma"].text() or "").strip().replace(",", "."))
-                        alpha = float((target_edits["alpha"].text() or "").strip().replace(",", "."))
-                        calc_sposit, calc_scone = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
-                        spec["sposit"] = calc_sposit
-                        spec["scone"] = calc_scone
-                    except ValueError:
-                        pass
-            spec["folder_token_keys"] = current_folder_token_keys()
-            row["lbl_preview"].setText(f"Folder preview: {self._case_variant_folder_name(row['case_name'].text(), spec)}")
+            spec = _row_effective_folder_spec(row)
+            row["lbl_preview"].setText(f"Folder preview: {self._case_variant_folder_name(row['computed_case_name'], spec)}")
 
         def choose_spectrum(row):
-            path, _ = QFileDialog.getOpenFileName(
-                dlg,
-                "Choose spectrum file",
-                str(self._in_folder()),
-                "Spectrum data (*.dat *.txt);;All files (*.*)",
+            spec_dlg = QDialog(dlg)
+            spec_dlg.setWindowTitle("Choose spectrum")
+            spec_dlg.setModal(True)
+            spec_dlg.setMinimumWidth(660)
+            spec_dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+            spec_lay = QVBoxLayout(spec_dlg)
+            mode_combo = QComboBox()
+            mode_combo.addItems(["File (.dat/.txt/.xlsx/.xlsm)", "Spectrum Database"])
+            mode_combo.setStyleSheet(combo_css())
+            mode_combo.setCurrentIndex(1 if str(row.get("spectr_source_kind") or "file").strip().lower() == "database" else 0)
+            form = QFormLayout()
+            form.addRow("Source:", mode_combo)
+
+            path_row = QWidget()
+            path_lay = QHBoxLayout(path_row)
+            path_lay.setContentsMargins(0, 0, 0, 0)
+            path_lay.setSpacing(6)
+            e_path = QLineEdit((row["spectr_path"].text() or "").strip())
+            e_path.setStyleSheet(entry_css())
+            e_path.setReadOnly(True)
+            e_path.setPlaceholderText("Existing SPECTR will be preserved; choose a file to replace")
+            browse = QPushButton("Browse...")
+            browse.setStyleSheet(btn_css(P["bg2"], 92))
+
+            def choose_file():
+                path, _ = QFileDialog.getOpenFileName(
+                    spec_dlg,
+                    "Choose spectrum file",
+                    str(self._in_folder()),
+                    "Spectrum data (*.dat *.txt *.xlsx *.xlsm);;All files (*.*)",
+                )
+                if path:
+                    e_path.setText(path)
+
+            browse.clicked.connect(choose_file)
+            path_lay.addWidget(e_path, stretch=1)
+            path_lay.addWidget(browse)
+            form.addRow("SPECTR:", path_row)
+
+            db_row = QWidget()
+            db_lay = QHBoxLayout(db_row)
+            db_lay.setContentsMargins(0, 0, 0, 0)
+            db_lay.setSpacing(6)
+            cmb_db = QComboBox()
+            cmb_db.setStyleSheet(combo_css())
+            cmb_db.setMinimumWidth(280)
+            btn_edit_db = QPushButton("Add/Edit Spectrum")
+            btn_edit_db.setStyleSheet(btn_css(P["bg2"], 130))
+            db_lay.addWidget(cmb_db, stretch=1)
+            db_lay.addWidget(btn_edit_db)
+            form.addRow("Database:", db_row)
+
+            def refresh_db_choices(selected_label=""):
+                labels = self._spectrum_database_choices()
+                cmb_db.blockSignals(True)
+                cmb_db.clear()
+                cmb_db.addItems(labels)
+                if selected_label and selected_label in labels:
+                    cmb_db.setCurrentText(selected_label)
+                cmb_db.blockSignals(False)
+
+            refresh_db_choices(row.get("spectr_db_label", ""))
+            btn_edit_db.clicked.connect(lambda: refresh_db_choices(self._cmd_create_spectrum() or cmb_db.currentText()))
+            spec_lay.addLayout(form)
+
+            note = QLabel(
+                f"SPECTR imports energy from column 1 and uses probability column from SKPAR {particle}: "
+                f"{self._spectr_prob_col_for_particle(particle)}."
             )
-            if path:
-                row["spectr_path"].setText(path)
-                row["spectr_seed_lines"] = []
+            note.setStyleSheet(label_css(P["fg2"]))
+            note.setWordWrap(True)
+            spec_lay.addWidget(note)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.setStyleSheet(btn_css(P["bg2"]))
+            buttons.accepted.connect(spec_dlg.accept)
+            buttons.rejected.connect(spec_dlg.reject)
+            spec_lay.addWidget(buttons)
+
+            def update_mode():
+                use_db = mode_combo.currentIndex() == 1
+                path_row.setVisible(not use_db)
+                db_row.setVisible(use_db)
+
+            mode_combo.currentTextChanged.connect(lambda _txt: update_mode())
+            update_mode()
+            if spec_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            if mode_combo.currentIndex() == 1:
+                label = self._normalize_spectrum_label(cmb_db.currentText())
+                if not label:
+                    QMessageBox.warning(dlg, dialog_title, "Choose a spectrum from the database.")
+                    return
+                try:
+                    entry = next(entry for entry in self._load_spectrum_database() if entry["label"] == label)
+                    self._spectr_lines_from_database_rows(entry["rows"])
+                except StopIteration:
+                    QMessageBox.warning(dlg, dialog_title, "The selected database spectrum was not found.")
+                    return
+                except ValueError as exc:
+                    QMessageBox.warning(dlg, dialog_title, str(exc))
+                    return
+                row["spectr_source_kind"] = "database"
+                row["spectr_db_label"] = label
+                row["spectr_path"].setText("")
+            else:
+                path = (e_path.text() or "").strip()
+                if path:
+                    try:
+                        self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
+                    except ValueError as exc:
+                        QMessageBox.warning(dlg, dialog_title, f"Invalid spectrum file.\n\n{exc}")
+                        return
+                    row["spectr_path"].setText(path)
+                    row["spectr_seed_lines"] = []
+                row["spectr_source_kind"] = "file"
+                row["spectr_db_label"] = ""
+            row["spectr"].setChecked(True)
+            refresh_row_preview(row)
 
         def choose_geo(row):
             start = str(Path(row["geo_override_path"].text()).parent) if (row["geo_override_path"].text() or "").strip() else str(Path(geo_path).parent if geo_path else self._in_folder())
@@ -22288,8 +22749,21 @@ class SimulationTab(QWidget):
                 row["mat_folder"].setText(folder)
 
         def add_row(seed_index=None, seed_spec=None):
-            row_index = len(rows) + 1 if seed_index is None else int(seed_index)
+            row_index = next_case_number() if seed_index is None else int(seed_index)
             seed_spec = dict(seed_spec or {})
+            seed_case_name = str(seed_spec.get("case_name") or f"{Path(in_path).stem}_case{row_index}")
+            seed_label_prefix = str(seed_spec.get("case_label_prefix") or "")
+            parsed_label, parsed_case_number = self._case_variant_label_and_number(
+                seed_case_name,
+                Path(in_path).stem or "case",
+                seed_spec.get("case_number", row_index),
+            )
+            if not seed_label_prefix:
+                seed_label_prefix = parsed_label
+            try:
+                case_number = int(seed_spec.get("case_number", parsed_case_number if parsed_case_number not in (None, "") else row_index))
+            except Exception:
+                case_number = row_index
             box = QGroupBox(f"CASE {row_index}")
             box.setStyleSheet(
                 f"QGroupBox {{ color:#315f92; background:{P['bg']};"
@@ -22313,20 +22787,29 @@ class SimulationTab(QWidget):
             chk_scone = QCheckBox("SCONE")
             for chk in (chk_senerg, chk_spectr, chk_sposit, chk_scone):
                 chk.setStyleSheet(checkbox_css())
-            e_case = QLineEdit(seed_spec.get("case_name") or f"{Path(in_path).stem}_case{row_index}")
-            e_case.setStyleSheet(entry_css())
-            e_in = QLineEdit(seed_spec.get("in_filename") or f"{Path(in_path).stem}_case{row_index}.in")
+            e_case_label = QLineEdit(seed_label_prefix or Path(in_path).stem or "case")
+            e_case_label.setStyleSheet(entry_css())
+            e_case_label.setPlaceholderText("Folder /.in prefix label")
+            btn_case_label_all = QPushButton("All")
+            btn_case_label_all.setStyleSheet(btn_css(P["bg2"], 48))
+            lbl_case_number = QLabel(str(case_number))
+            lbl_case_number.setStyleSheet(label_css(P["fg"], bold=True))
+            e_in = QLineEdit("")
             e_in.setStyleSheet(entry_css())
+            e_in.setReadOnly(True)
             top_form.addWidget(hdr_case, 0, 0)
             top_form.addWidget(chk_senerg, 0, 1)
             top_form.addWidget(chk_spectr, 0, 2)
             top_form.addWidget(chk_sposit, 0, 3)
             top_form.addWidget(chk_scone, 0, 4)
             top_form.addWidget(btn_remove, 0, 5)
-            top_form.addWidget(QLabel("Case Name:"), 1, 0)
-            top_form.addWidget(e_case, 1, 1, 1, 2)
-            top_form.addWidget(QLabel(".in filename:"), 1, 3)
-            top_form.addWidget(e_in, 1, 4, 1, 2)
+            top_form.addWidget(QLabel("Prefix Label:"), 1, 0)
+            top_form.addWidget(e_case_label, 1, 1)
+            top_form.addWidget(btn_case_label_all, 1, 2)
+            top_form.addWidget(QLabel("Case #:"), 1, 3)
+            top_form.addWidget(lbl_case_number, 1, 4)
+            top_form.addWidget(QLabel(".in filename:"), 2, 0)
+            top_form.addWidget(e_in, 2, 1, 1, 5)
             box_lay.addLayout(top_form)
 
             details = QWidget()
@@ -22350,13 +22833,15 @@ class SimulationTab(QWidget):
             spectr_path = QLineEdit(str(seed_spec.get("spectr_file", "")))
             spectr_path.setStyleSheet(entry_css())
             spectr_path.setPlaceholderText("Spectrum file (.dat/.txt)")
-            btn_spectr = QPushButton("Browse...")
+            btn_spectr = QPushButton("Select...")
             btn_spectr.setStyleSheet(btn_css(P["bg2"], 82))
             btn_spectr_all = QPushButton("All")
             btn_spectr_all.setStyleSheet(btn_css(P["bg2"], 48))
             spectr_inline_lbl = QLabel("Using inline SPECTR block from source case")
             spectr_inline_lbl.setStyleSheet(label_css(P["fg2"], size=8))
             spectr_seed_lines = list(seed_spec.get("spectr_lines") or [])
+            spectr_db_label = str(seed_spec.get("spectr_db_label", "") or "")
+            spectr_source_kind = "database" if spectr_db_label else "file"
             details_lay.addWidget(lbl_spectr_file, 0, 3)
             details_lay.addWidget(spectr_path, 0, 4)
             details_lay.addWidget(btn_spectr, 0, 5)
@@ -22428,6 +22913,17 @@ class SimulationTab(QWidget):
                 target_lay.addWidget(btn_target_all, idx // 4, (idx % 4) * 3 + 2)
                 target_edits[key] = edit
                 target_all_buttons[key] = btn_target_all
+            seed_calc = dict(
+                self._sync_source_target_calc_to_direct(
+                    seed_spec.get("source_target_calc") or defaults.get("source_target_calc") or {},
+                    scone_seed,
+                )
+                or {}
+            )
+            if seed_calc:
+                for key, edit in target_edits.items():
+                    if key in seed_calc and str(seed_calc[key] or "").strip():
+                        edit.setText(str(seed_calc[key]))
             scone_stack = QStackedWidget()
             direct_wrapper = QWidget()
             dw_lay = QVBoxLayout(direct_wrapper)
@@ -22480,7 +22976,11 @@ class SimulationTab(QWidget):
             row = {
                 "box": box,
                 "hdr_case": hdr_case,
-                "case_name": e_case,
+                "case_label": e_case_label,
+                "case_number": case_number,
+                "case_number_display": lbl_case_number,
+                "label_fallback": Path(in_path).stem or "case",
+                "seed_spec": dict(seed_spec or {}),
                 "in_name": e_in,
                 "senerg": chk_senerg,
                 "senerg_edit": e_senerg,
@@ -22488,6 +22988,8 @@ class SimulationTab(QWidget):
                 "spectr_path": spectr_path,
                 "spectr_seed_lines": spectr_seed_lines,
                 "spectr_inline_lbl": spectr_inline_lbl,
+                "spectr_source_kind": spectr_source_kind,
+                "spectr_db_label": spectr_db_label,
                 "sposit": chk_sposit,
                 "sposit_edits": sposit_edits,
                 "scone": chk_scone,
@@ -22505,6 +23007,7 @@ class SimulationTab(QWidget):
                 "resource_block": resource_block,
                 "geo_override_path": geo_override_path,
                 "mat_folder": mat_folder_edit,
+                "btn_case_label_all": btn_case_label_all,
                 "btn_senerg_all": btn_senerg_all,
                 "btn_spectr": btn_spectr,
                 "btn_spectr_all": btn_spectr_all,
@@ -22515,8 +23018,9 @@ class SimulationTab(QWidget):
 
             btn_remove.clicked.connect(lambda _=False, r=row: remove_row(r))
             btn_spectr.clicked.connect(lambda _=False, r=row: choose_spectrum(r))
+            btn_case_label_all.clicked.connect(lambda _=False, edit=e_case_label: propagate_line_value(edit, "case_label"))
             btn_senerg_all.clicked.connect(lambda _=False, edit=e_senerg: propagate_line_value(edit, "senerg_edit", "senerg"))
-            btn_spectr_all.clicked.connect(lambda _=False, edit=spectr_path: propagate_line_value(edit, "spectr_path", "spectr"))
+            btn_spectr_all.clicked.connect(lambda _=False, r=row: propagate_spectrum_source(r))
             for idx, btn in enumerate(sposit_axis_all_buttons):
                 btn.clicked.connect(lambda _=False, edit=sposit_edits[idx], key_index=idx: propagate_list_index(edit, "sposit_edits", key_index, "sposit"))
             for idx, btn in enumerate(scone_direct_all_buttons):
@@ -22529,7 +23033,16 @@ class SimulationTab(QWidget):
                 btn_geo_all.clicked.connect(lambda _=False, edit=geo_override_path: propagate_line_value(edit, "geo_override_path"))
                 btn_mat_all.clicked.connect(lambda _=False, edit=mat_folder_edit: propagate_line_value(edit, "mat_folder"))
 
-            for widget in [e_case, e_in, e_senerg, spectr_path, cmb_scone_mode, chk_senerg, chk_spectr, chk_sposit, chk_scone, *sposit_edits, *scone_direct_edits, *target_edits.values(), geo_override_path, mat_folder_edit]:
+            e_senerg.textChanged.connect(lambda _txt, chk=chk_senerg: chk.setChecked(True))
+            spectr_path.textChanged.connect(lambda _txt, chk=chk_spectr: chk.setChecked(True))
+            for edit in sposit_edits:
+                edit.textChanged.connect(lambda _txt, chk=chk_sposit: chk.setChecked(True))
+            for edit in scone_direct_edits:
+                edit.textChanged.connect(lambda _txt, chk=chk_scone: chk.setChecked(True))
+            for edit in target_edits.values():
+                edit.textChanged.connect(lambda _txt, chk=chk_scone: chk.setChecked(True))
+
+            for widget in [e_case_label, e_senerg, spectr_path, cmb_scone_mode, chk_senerg, chk_spectr, chk_sposit, chk_scone, *sposit_edits, *scone_direct_edits, *target_edits.values(), geo_override_path, mat_folder_edit]:
                 if isinstance(widget, QComboBox):
                     widget.currentTextChanged.connect(lambda _txt, r=row: refresh_row_preview(r))
                 elif isinstance(widget, QCheckBox):
@@ -22556,7 +23069,7 @@ class SimulationTab(QWidget):
                 count = 0
             for _ in range(max(0, count)):
                 add_row()
-            renumber_rows()
+            refresh_row_headers()
 
         if seed_specs:
             for idx, seed_spec in enumerate(seed_specs, start=1):
@@ -22564,6 +23077,7 @@ class SimulationTab(QWidget):
         else:
             for idx in range(1, max(1, int(case_count)) + 1):
                 add_row(idx)
+        refresh_row_headers()
         scroll.setWidget(content)
         lay.addWidget(scroll, stretch=1)
 
@@ -22610,12 +23124,23 @@ class SimulationTab(QWidget):
 
         specs = []
         for idx, row in enumerate(rows, start=1):
-            case_name = self._workspace_safe_token(row["case_name"].text(), "")
-            if not case_name:
-                QMessageBox.warning(self, dialog_title, f"CASE {idx} needs a Case Name.")
+            case_label = self._workspace_safe_token((row["case_label"].text() or "").strip(), "")
+            if not case_label:
+                QMessageBox.warning(self, dialog_title, f"CASE {idx} needs a Prefix Label.")
                 return None
-            in_filename = self._case_variant_in_filename(row["in_name"].text(), case_name)
-            spec = {"case_name": case_name, "in_filename": in_filename}
+            case_number = row.get("case_number")
+            case_name = self._case_variant_name_from_label(case_label, case_number, case_label or "case")
+            in_filename = self._case_variant_in_filename(f"{case_name}.in", case_name)
+            spec = {
+                "case_name": case_name,
+                "case_label_prefix": case_label,
+                "in_filename": in_filename,
+            }
+            if case_number not in (None, ""):
+                try:
+                    spec["case_number"] = int(case_number)
+                except Exception:
+                    pass
             if row["senerg"].isChecked() and row["spectr"].isChecked():
                 QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose either SENERG or SPECTR, not both.")
                 return None
@@ -22626,29 +23151,24 @@ class SimulationTab(QWidget):
                     return None
                 spec["senerg_kev"] = raw
             if row["spectr"].isChecked():
-                path = (row["spectr_path"].text() or "").strip()
-                if path:
-                    try:
-                        lines = self._spectr_lines_from_file(path, prob_col=self._spectr_prob_col_for_particle(particle))
-                    except Exception as exc:
-                        QMessageBox.warning(self, dialog_title, f"CASE {idx}: invalid SPECTR file.\n\n{exc}")
-                        return None
-                    spec["spectr_file"] = path
-                    spec["spectr_lines"] = lines
+                try:
+                    lines, db_label, source_path = row_spectrum_lines(row, validate=True)
+                except Exception as exc:
+                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: invalid SPECTR source.\n\n{exc}")
+                    return None
+                if lines:
+                    spec["spectr_lines"] = list(lines)
                     spec["spectr_range"] = self._spectr_range_from_lines(lines)
+                    if source_path:
+                        spec["spectr_file"] = source_path
+                    if db_label:
+                        spec["spectr_db_label"] = db_label
                     try:
                         spec["spectr_last_kev"] = float(str(lines[-1].split()[0]).replace(",", "."))
                     except Exception:
                         pass
-                elif row.get("spectr_seed_lines"):
-                    spec["spectr_lines"] = list(row["spectr_seed_lines"])
-                    spec["spectr_range"] = self._spectr_range_from_lines(row["spectr_seed_lines"])
-                    try:
-                        spec["spectr_last_kev"] = float(str(row["spectr_seed_lines"][-1].split()[0]).replace(",", "."))
-                    except Exception:
-                        pass
                 else:
-                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose a SPECTR file.")
+                    QMessageBox.warning(self, dialog_title, f"CASE {idx}: choose a SPECTR source.")
                     return None
             if row["sposit"].isChecked():
                 values = [(edit.text() or "").strip() for edit in row["sposit_edits"]]
@@ -22678,6 +23198,17 @@ class SimulationTab(QWidget):
                     sposit_vals, scone_vals = self._case_source_from_target(xa, ya, za, radius, beta, gamma, alpha)
                     spec["sposit"] = sposit_vals
                     spec["scone"] = scone_vals
+                    spec["source_target_calc"] = self._normalize_source_target_calc(
+                        {
+                            "XA": xa,
+                            "YA": ya,
+                            "ZA": za,
+                            "R": radius,
+                            "beta": beta,
+                            "gamma": gamma,
+                            "alpha": alpha,
+                        }
+                    )
                     self._append_scone_calculation_log(
                         {
                             "context": "batch_case_variants",
@@ -22733,8 +23264,27 @@ class SimulationTab(QWidget):
                 return candidate
         raise FileExistsError(f"Could not find an unused workspace name for {base_dir}")
 
-    def _batch_workspace_container_name(self, in_path, batch_label=""):
-        stem = self._workspace_safe_token(Path(in_path).stem, "batch")
+    def _batch_workspace_source_stem_from_specs(self, specs, fallback=""):
+        values = []
+        for spec in list(specs or []):
+            if not isinstance(spec, dict):
+                continue
+            label = self._workspace_safe_token(spec.get("case_label_prefix", ""), "")
+            if not label:
+                case_name = self._case_variant_base_name(spec.get("case_name", ""), "")
+                label, _number = self._case_variant_label_and_number(case_name, "", None)
+                label = self._workspace_safe_token(label, "")
+            if label:
+                values.append(label)
+        if not values:
+            return self._workspace_safe_token(fallback, "")
+        first = values[0]
+        if all(value == first for value in values):
+            return first
+        return first
+
+    def _batch_workspace_container_name(self, in_path, batch_label="", source_stem_override=""):
+        stem = self._workspace_safe_token(source_stem_override or Path(in_path).stem, "batch")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"batch_{stem}_{stamp}"
         label = self._workspace_safe_token(batch_label, "")
@@ -23464,17 +24014,36 @@ class SimulationTab(QWidget):
             return
         target_case_dir = source_case_dir
         group_rel = str(record.get("group_rel") or "")
+        duplicate_spec = None
         if edit_result["mode"] == "duplicate":
             target_info = self._case_creation_target_root(source_in_path)
             if target_info is None:
                 return
             _case_root, target_root, group_rel = target_info
-            target_case_dir = self._unique_workspace_dir(target_root / Path(source_case_dir).name)
         try:
             updated_case_text = self._apply_sim_block_edit_changes_to_text(source_text, changes)
+            write_in_name = source_in_name
+            if edit_result["mode"] == "duplicate":
+                duplicate_spec = self._case_spec_from_in_text(
+                    source_case_dir.name,
+                    source_in_name,
+                    updated_case_text,
+                    geo_override_path=str(fallback_geo or ""),
+                    mat_folder=str(edit_result.get("mat_folder") or source_case_dir),
+                )
+                updated_case_text, _ = self._replace_or_insert_line_in_text(
+                    updated_case_text,
+                    "TITLE",
+                    f"TITLE  {self._case_variant_title(duplicate_spec['case_name'], duplicate_spec)}",
+                    before_keywords=("SKPAR", "SENERG", "SPECTR", "END"),
+                )
+                target_case_dir = self._unique_workspace_dir(
+                    target_root / self._case_variant_folder_name(duplicate_spec["case_name"], duplicate_spec)
+                )
+                write_in_name = duplicate_spec["in_filename"]
             result = self._write_case_from_edited_text(
                 target_case_dir,
-                source_in_name,
+                write_in_name,
                 updated_case_text,
                 source_in_path=source_in_path,
                 case_source_dir=source_case_dir,
@@ -23498,6 +24067,7 @@ class SimulationTab(QWidget):
                     self._current_geom_filename_from_text(result["workspace_text"]),
                     group_rel=group_rel,
                     source_in_path=source_in_path,
+                    spec=duplicate_spec,
                 )
         self._in_path = str(result["workspace_in_path"])
         self._run_folder = target_case_dir
@@ -23608,7 +24178,8 @@ class SimulationTab(QWidget):
                 return
             _case_root, target_root, group_rel = target_info
             batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
-            batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label))
+            batch_stem = self._batch_workspace_source_stem_from_specs(edited_specs_list, Path(source_in_path).stem)
+            batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label, source_stem_override=batch_stem))
             batch_root.mkdir(parents=True, exist_ok=True)
 
         created_records = []
@@ -23932,7 +24503,8 @@ class SimulationTab(QWidget):
             QMessageBox.warning(self, "Duplicate Batch", str(exc))
             return
         batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
-        batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label))
+        batch_stem = self._batch_workspace_source_stem_from_specs(edited_specs, Path(source_in_path).stem)
+        batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label, source_stem_override=batch_stem))
         batch_root.mkdir(parents=True, exist_ok=True)
         created_dirs = []
         batch_log_records = []
@@ -24483,6 +25055,185 @@ class SimulationTab(QWidget):
         except Exception as exc:
             raise ValueError(f"Invalid scientific value: {value}") from exc
 
+    def _fmt_source_calc_number(self, value):
+        value = float(value)
+        if abs(value) < 5e-13:
+            value = 0.0
+        return f"{value:.8g}"
+
+    def _normalize_source_calc_angle(self, value):
+        angle = float(value)
+        while angle <= -180.0:
+            angle += 360.0
+        while angle > 180.0:
+            angle -= 360.0
+        if abs(angle) < 5e-13:
+            angle = 0.0
+        return angle
+
+    def _parse_source_target_calc_metadata(self, text):
+        match = re.search(r"STUDIO_TARGET\b([^\]\r\n]*)", str(text or ""), re.IGNORECASE)
+        if not match:
+            return None
+        trailer = match.group(1)
+        key_map = {
+            "XA": "XA",
+            "YA": "YA",
+            "ZA": "ZA",
+            "R": "R",
+            "BETA": "beta",
+            "GAMMA": "gamma",
+            "ALPHA": "alpha",
+        }
+        values = {}
+        for token, key in key_map.items():
+            piece = re.search(
+                rf"\b{token}\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)",
+                trailer,
+                re.IGNORECASE,
+            )
+            if piece:
+                values[key] = piece.group(1)
+        required = ("XA", "YA", "ZA", "R", "beta", "gamma", "alpha")
+        if not all(key in values for key in required):
+            return None
+        return values
+
+    def _normalize_source_target_calc(self, values):
+        if not isinstance(values, dict):
+            return None
+        required = ("XA", "YA", "ZA", "R", "beta", "gamma", "alpha")
+        normalized = {}
+        try:
+            for key in required:
+                normalized[key] = self._fmt_source_calc_number(values[key])
+        except Exception:
+            return None
+        return normalized
+
+    def _source_target_calc_defaults_from_direct(self, sposit, scone):
+        if len(list(sposit or [])) != 3 or len(list(scone or [])) != 3:
+            return None
+        try:
+            theta, phi, alpha = [float(str(v).replace(",", ".")) for v in list(scone or [])[:3]]
+        except Exception:
+            return None
+        beta = 180.0 - theta
+        gamma = self._normalize_source_calc_angle(phi - 180.0)
+        return {
+            "XA": "",
+            "YA": "",
+            "ZA": "",
+            "R": "",
+            "beta": self._fmt_source_calc_number(beta),
+            "gamma": self._fmt_source_calc_number(gamma),
+            "alpha": self._fmt_source_calc_number(alpha),
+        }
+
+    def _sync_source_target_calc_to_direct(self, calc_values, scone):
+        calc = self._normalize_source_target_calc(calc_values)
+        if not calc:
+            return None
+        if len(list(scone or [])) != 3:
+            return calc
+        try:
+            theta, phi, alpha = [float(str(v).replace(",", ".")) for v in list(scone or [])[:3]]
+        except Exception:
+            return calc
+        calc["beta"] = self._fmt_source_calc_number(180.0 - theta)
+        calc["gamma"] = self._fmt_source_calc_number(self._normalize_source_calc_angle(phi - 180.0))
+        calc["alpha"] = self._fmt_source_calc_number(alpha)
+        return self._normalize_source_target_calc(calc)
+
+    def _source_target_calc_from_direct(self, sposit, scone, radius_hint=None):
+        if len(list(sposit or [])) != 3 or len(list(scone or [])) != 3:
+            return None
+        try:
+            xf, yf, zf = [float(str(v).replace(",", ".")) for v in list(sposit or [])[:3]]
+            theta, phi, alpha = [float(str(v).replace(",", ".")) for v in list(scone or [])[:3]]
+        except Exception:
+            return None
+        beta = 180.0 - theta
+        gamma = self._normalize_source_calc_angle(phi - 180.0)
+        beta_rad = math.radians(beta)
+        gamma_rad = math.radians(gamma)
+        ux = math.sin(beta_rad) * math.cos(gamma_rad)
+        uy = math.sin(beta_rad) * math.sin(gamma_rad)
+        uz = math.cos(beta_rad)
+        radius = None
+        try:
+            if radius_hint not in (None, ""):
+                radius = abs(float(str(radius_hint).replace(",", ".")))
+        except Exception:
+            radius = None
+        if radius is None or radius <= 1e-12:
+            radius = xf * ux + yf * uy + zf * uz
+            if radius <= 1e-12:
+                radius = math.sqrt(xf * xf + yf * yf + zf * zf)
+            radius = abs(radius)
+        xa = xf - radius * ux
+        ya = yf - radius * uy
+        za = zf - radius * uz
+        return self._normalize_source_target_calc(
+            {
+                "XA": xa,
+                "YA": ya,
+                "ZA": za,
+                "R": radius,
+                "beta": beta,
+                "gamma": gamma,
+                "alpha": alpha,
+            }
+        )
+
+    def _source_target_calc_metadata_text(self, calc_values):
+        calc = self._normalize_source_target_calc(calc_values)
+        if not calc:
+            return ""
+        return (
+            "STUDIO_TARGET "
+            f"XA={calc['XA']} YA={calc['YA']} ZA={calc['ZA']} "
+            f"R={calc['R']} BETA={calc['beta']} GAMMA={calc['gamma']} ALPHA={calc['alpha']}"
+        )
+
+    def _format_source_position_line(self, x, y, z):
+        return f"SPOSIT {x} {y} {z}                    [Coordinates of the source]"
+
+    def _format_source_cone_line(self, theta, phi, alpha, calc_values=None):
+        meta = self._source_target_calc_metadata_text(calc_values)
+        if meta:
+            return (
+                f"SCONE  {theta} {phi} {alpha}                       "
+                f"[Conical beam; theta phi alpha in deg | {meta}]"
+            )
+        return f"SCONE  {theta} {phi} {alpha}                       [Conical beam; theta phi alpha in deg]"
+
+    def _rewrite_source_position_and_cone_text(self, text, sposit=None, scone=None, calc_values=None, radius_hint=None):
+        source_defaults = self._source_defaults_from_text(text or "")
+        sposit_vals = [str(v) for v in list(sposit or source_defaults.get("sposit") or [])[:3]]
+        scone_vals = [str(v) for v in list(scone or source_defaults.get("scone") or [])[:3]]
+        if len(sposit_vals) != 3 or len(scone_vals) != 3:
+            return str(text or "")
+        effective_calc = calc_values
+        if effective_calc is None:
+            old_sposit = [str(v) for v in list(source_defaults.get("sposit") or [])[:3]]
+            old_scone = [str(v) for v in list(source_defaults.get("scone") or [])[:3]]
+            direct_changed = sposit_vals != old_sposit or scone_vals != old_scone
+            effective_calc = None if direct_changed else self._normalize_source_target_calc(source_defaults.get("source_target_calc"))
+        updated, _ = self._replace_or_insert_line_in_text(
+            text,
+            "SPOSIT",
+            self._format_source_position_line(sposit_vals[0], sposit_vals[1], sposit_vals[2]),
+            before_keywords=("SCONE", "END"),
+        )
+        updated, _ = self._replace_or_insert_line_in_text(
+            updated,
+            "SCONE",
+            self._format_source_cone_line(scone_vals[0], scone_vals[1], scone_vals[2], effective_calc),
+            before_keywords=("END",),
+        )
+        return updated
+
     def _spectr_lines_from_database_rows(self, rows):
         entries = []
         for row in rows:
@@ -24516,7 +25267,7 @@ class SimulationTab(QWidget):
             for energy, prob in entries
         ]
         lines.append(
-            f"SPECTR {self._fmt_spectrum_number(entries[-1][0]):<10} -1.0E+00     [E bin: lower-end and total probability]"
+            f"SPECTR {self._fmt_spectrum_number(entries[-1][0]):<10} -1           [E bin: lower-end and total probability]"
         )
         return lines
 
@@ -24666,21 +25417,43 @@ class SimulationTab(QWidget):
         prob_idx = int(prob_col) - 1
         if prob_idx < 0:
             raise ValueError("Probability column must be 1 or greater.")
+        suffix = Path(path).suffix.lower()
         try:
-            for line in Path(path).read_text(errors="replace").splitlines():
-                if not line.strip() or line.lstrip().startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) <= prob_idx:
-                    continue
+            if suffix in {".xlsx", ".xlsm"}:
                 try:
-                    energy = float(parts[0])
-                    prob_raw = float(parts[prob_idx])
-                except ValueError:
-                    continue
-                if prob_raw <= 1e-34:
-                    continue
-                entries.append((energy, prob_raw))
+                    import openpyxl
+                except Exception as exc:
+                    raise ValueError(f"Could not read XLSX spectrum file: {exc}") from exc
+                wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                ws = wb.active
+                for row in ws.iter_rows(values_only=True):
+                    if not row or all(value in (None, "") for value in row):
+                        continue
+                    if len(row) <= prob_idx:
+                        continue
+                    try:
+                        energy = float(str(row[0]).replace(",", "."))
+                        prob_raw = float(str(row[prob_idx]).replace(",", "."))
+                    except ValueError:
+                        continue
+                    if prob_raw <= 1e-34:
+                        continue
+                    entries.append((energy, prob_raw))
+            else:
+                for line in Path(path).read_text(errors="replace").splitlines():
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) <= prob_idx:
+                        continue
+                    try:
+                        energy = float(parts[0])
+                        prob_raw = float(parts[prob_idx])
+                    except ValueError:
+                        continue
+                    if prob_raw <= 1e-34:
+                        continue
+                    entries.append((energy, prob_raw))
         except Exception as exc:
             raise ValueError(f"Could not read spectrum file: {exc}") from exc
         if not entries:
@@ -24695,7 +25468,7 @@ class SimulationTab(QWidget):
             for energy, prob in entries
         ]
         lines.append(
-            f"SPECTR {self._fmt_spectrum_number(entries[-1][0]):<10} -1.0E+00     [E bin: lower-end and total probability]"
+            f"SPECTR {self._fmt_spectrum_number(entries[-1][0]):<10} -1           [E bin: lower-end and total probability]"
         )
         return lines
 
@@ -24862,7 +25635,7 @@ class SimulationTab(QWidget):
                 self,
                 "Choose spectrum file",
                 str(self._in_folder()),
-                "Spectrum data (*.dat *.txt);;All files (*.*)",
+                "Spectrum data (*.dat *.txt *.xlsx *.xlsm);;All files (*.*)",
             )
             if path:
                 e_spectrum.setText(path)
@@ -24885,8 +25658,8 @@ class SimulationTab(QWidget):
             edit = QLineEdit(source_defaults["sposit"][idx])
             edit.setStyleSheet(entry_css())
             edit.setFixedWidth(72)
-        pos_lay.addWidget(edit)
-        pos_edits[axis] = edit
+            pos_lay.addWidget(edit)
+            pos_edits[axis] = edit
         pos_lay.addStretch()
         add_simple_row("SPOSIT:", pos_row)
 
@@ -24937,6 +25710,16 @@ class SimulationTab(QWidget):
         add_calc_edit(1, 2, "beta", "beta:")
         add_calc_edit(1, 4, "gamma", "gamma:")
         add_calc_edit(2, 0, "alpha", "alpha:", cone_edits["alpha"].text() or "0")
+        initial_calc_defaults = dict(
+            self._sync_source_target_calc_to_direct(
+                source_defaults.get("source_target_calc"),
+                source_defaults.get("scone"),
+            )
+            or {}
+        )
+        for key, edit in calc_edits.items():
+            if key in initial_calc_defaults and str(initial_calc_defaults[key] or "").strip():
+                edit.setText(str(initial_calc_defaults[key]))
         load_target_btn = QPushButton("Load TXT/XLSX")
         load_target_btn.setStyleSheet(btn_css(P["bg2"], 116))
         apply_calc_btn = QPushButton("Apply calculated SPOSIT/SCONE")
@@ -24992,6 +25775,8 @@ class SimulationTab(QWidget):
                 value = 0.0
             return f"{value:.8g}"
 
+        calc_state = {"applied": False}
+
         def apply_source_calculation():
             try:
                 xa = _parse_float_field("XA")
@@ -25017,6 +25802,14 @@ class SimulationTab(QWidget):
             cone_edits["theta"].setText(_fmt_calc_value(theta))
             cone_edits["phi"].setText(_fmt_calc_value(phi))
             cone_edits["alpha"].setText(_fmt_calc_value(alpha))
+            calc_edits["XA"].setText(_fmt_calc_value(xa))
+            calc_edits["YA"].setText(_fmt_calc_value(ya))
+            calc_edits["ZA"].setText(_fmt_calc_value(za))
+            calc_edits["R"].setText(_fmt_calc_value(radius))
+            calc_edits["beta"].setText(_fmt_calc_value(beta))
+            calc_edits["gamma"].setText(_fmt_calc_value(gamma))
+            calc_edits["alpha"].setText(_fmt_calc_value(alpha))
+            calc_state["applied"] = True
             self._append_scone_calculation_log(
                 {
                     "context": "particle_source_editor",
@@ -25190,6 +25983,27 @@ class SimulationTab(QWidget):
         theta = (cone_edits["theta"].text() or "0").strip()
         phi = (cone_edits["phi"].text() or "0").strip()
         alpha = (cone_edits["alpha"].text() or "0").strip()
+        existing_calc = dict(
+            self._sync_source_target_calc_to_direct(
+                source_defaults.get("source_target_calc"),
+                [theta, phi, alpha],
+            )
+            or {}
+        )
+        direct_unchanged = [x, y, z] == list(source_defaults.get("sposit") or []) and [theta, phi, alpha] == list(source_defaults.get("scone") or [])
+        calc_payload = None
+        calc_field_values = {key: (edit.text() or "").strip() for key, edit in calc_edits.items()}
+        direct_calc_defaults = self._source_target_calc_defaults_from_direct([x, y, z], [theta, phi, alpha]) or {}
+        for key in ("beta", "gamma", "alpha"):
+            if key in direct_calc_defaults:
+                calc_field_values[key] = direct_calc_defaults[key]
+        complete_calc_values = self._normalize_source_target_calc(calc_field_values)
+        if calc_state["applied"]:
+            calc_payload = complete_calc_values
+        elif complete_calc_values:
+            calc_payload = complete_calc_values
+        elif existing_calc and direct_unchanged:
+            calc_payload = self._normalize_source_target_calc(existing_calc)
         prob_col = self._spectr_prob_col_for_particle(particle)
         energy_lines = []
         if use_spectrum:
@@ -25255,8 +26069,8 @@ class SimulationTab(QWidget):
             [
                 f"SKPAR  {particle}        [Primary particles: 1=electron, 2=photon, 3=positron]",
                 *energy_lines,
-                f"SPOSIT {x} {y} {z}                    [Coordinates of the source]",
-                f"SCONE  {theta} {phi} {alpha}                       [Conical beam; theta phi alpha in deg]",
+                self._format_source_position_line(x, y, z),
+                self._format_source_cone_line(theta, phi, alpha, calc_payload),
             ],
         )
         self._sync_impdet_energy_to_source()
@@ -25303,9 +26117,9 @@ class SimulationTab(QWidget):
             return
         v = dlg.values()
         x, y, z = v["X (cm)"], v["Y (cm)"], v["Z (cm)"]
-        self._replace_or_insert_before_end(
-            "SPOSIT",
-            f"SPOSIT {x} {y} {z}                    [Coordinates of the source]")
+        updated = self._rewrite_source_position_and_cone_text(self._get_text(), sposit=[x, y, z])
+        self._set_text(updated)
+        self._update_sim_action_labels()
 
     def _cmd_cone(self):
         dlg = _SimpleDialog("Set Beam Cone", [
@@ -25317,9 +26131,9 @@ class SimulationTab(QWidget):
             return
         v = dlg.values()
         theta, phi, alpha = v["Theta (deg)"], v["Phi (deg)"], v["Alpha (deg)"]
-        self._replace_or_insert_before_end(
-            "SCONE",
-            f"SCONE  {theta} {phi} {alpha}                       [Conical beam; theta phi alpha in deg]")
+        updated = self._rewrite_source_position_and_cone_text(self._get_text(), scone=[theta, phi, alpha])
+        self._set_text(updated)
+        self._update_sim_action_labels()
 
     def _cmd_add_material(self):
         self._cmd_edit_materials()
@@ -26519,16 +27333,31 @@ class SimulationTab(QWidget):
             updated, _ = self._replace_or_insert_line_in_text(
                 updated,
                 "SPOSIT",
-                f"SPOSIT {sposit[0]} {sposit[1]} {sposit[2]}                    [Coordinates of the source]",
+                self._format_source_position_line(sposit[0], sposit[1], sposit[2]),
                 before_keywords=("SCONE", "END"),
             )
         scone = list(spec.get("scone") or [])
         if len(scone) == 3:
+            calc_values = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), scone)
             updated, _ = self._replace_or_insert_line_in_text(
                 updated,
                 "SCONE",
-                f"SCONE  {scone[0]} {scone[1]} {scone[2]}                       [Conical beam; theta phi alpha in deg]",
+                self._format_source_cone_line(
+                    scone[0],
+                    scone[1],
+                    scone[2],
+                    calc_values,
+                ),
                 before_keywords=("END",),
+            )
+        defaults = self._source_defaults_from_text(updated)
+        if defaults.get("scone"):
+            calc_values = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), defaults.get("scone") or [])
+            updated = self._rewrite_source_position_and_cone_text(
+                updated,
+                sposit=defaults.get("sposit") or [],
+                scone=defaults.get("scone") or [],
+                calc_values=calc_values,
             )
         return updated
 
@@ -27342,6 +28171,24 @@ class SimulationTab(QWidget):
         except Exception:
             return None
 
+    def _fmt_duration(self, seconds):
+        try:
+            total = float(seconds)
+        except Exception:
+            return "?"
+        if total < 0:
+            total = 0.0
+        if total < 60:
+            return f"{total:.0f}s"
+        minutes, sec = divmod(int(round(total)), 60)
+        if minutes < 60:
+            return f"{minutes}m {sec:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h {minutes:02d}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours:02d}h"
+
     def _job_properties_from_text(self, text):
         text = text or ""
         info = {
@@ -27389,12 +28236,23 @@ class SimulationTab(QWidget):
             return False
         if run.get("safe_stop_requested"):
             return True
+        run_folder = Path(run.get("run_folder", run["path"].parent))
+        baseline_showers = self._penmain_res_showers(run_folder)
+        baseline_dmp_mtime = self._latest_dmp_mtime(run_folder)
+        timeout_sec = max(30.0, float(dumpp_sec or 0.0) * 2.5)
         run["cancelled_by_user"] = True
         if kill_all:
             run["cancelled_by_kill_all"] = True
         run["safe_stop_requested"] = True
         run["safe_stop_triggered"] = False
         run["safe_stop_dumpp_sec"] = dumpp_sec
+        run["safe_stop_request_shower"] = run.get("last_shower")
+        run["safe_stop_request_result_showers"] = baseline_showers
+        run["safe_stop_request_dmp_mtime"] = baseline_dmp_mtime
+        run["safe_stop_request_wallclock"] = time.time()
+        run["safe_stop_requested_at"] = time.monotonic()
+        run["safe_stop_timeout_sec"] = timeout_sec
+        run["safe_stop_timed_out"] = False
         detail = f"waiting for safe dump checkpoint ({reason})"
         self._update_sim_run(run["proc"], "waiting safe stop", detail)
         self.console.log(
@@ -27402,6 +28260,11 @@ class SimulationTab(QWidget):
             "Studio will stop the process after the next PENELOPE dump checkpoint.\n",
             "info",
         )
+        QTimer.singleShot(
+            int(max(1000, timeout_sec * 1000.0)),
+            lambda p=run.get("proc"): self._on_safe_stop_timeout(p),
+        )
+        QTimer.singleShot(2000, lambda p=run.get("proc"): self._poll_safe_stop_checkpoint(p))
         return True
 
     def _complete_safe_stop_after_checkpoint(self, run):
@@ -27416,6 +28279,69 @@ class SimulationTab(QWidget):
         self._update_sim_run(proc, "stopping at dump checkpoint", summary)
         self.console.log(
             f"[SIM] Safe stop checkpoint reached for {run['path'].name}; stopping now.\n",
+            "warn",
+        )
+        QTimer.singleShot(250, lambda p=proc: self._kill_process_tree(p))
+
+    def _safe_stop_should_trigger(self, run):
+        if not run or not run.get("safe_stop_requested") or run.get("safe_stop_triggered"):
+            return False
+        value = run.get("last_shower")
+        baseline = run.get("safe_stop_request_shower")
+        if value is not None:
+            if baseline is None:
+                return True
+            tolerance = max(1.0, abs(float(baseline)) * 1e-9)
+            if float(value) > float(baseline) + tolerance:
+                return True
+        run_folder = Path(run.get("run_folder", run["path"].parent))
+        result_value = self._penmain_res_showers(run_folder)
+        result_baseline = run.get("safe_stop_request_result_showers")
+        if result_value is not None:
+            if result_baseline is None:
+                return True
+            result_tolerance = max(1.0, abs(float(result_baseline)) * 1e-9)
+            if float(result_value) > float(result_baseline) + result_tolerance:
+                run["last_shower"] = result_value
+                return True
+        dmp_health = self._current_dmp_health(run_folder)
+        latest_dmp_mtime = self._latest_dmp_mtime(run_folder)
+        baseline_mtime = run.get("safe_stop_request_dmp_mtime")
+        if dmp_health.get("state") == "present" and latest_dmp_mtime is not None:
+            if baseline_mtime is None:
+                return True
+            if float(latest_dmp_mtime) > float(baseline_mtime) + 0.5:
+                return True
+        return False
+
+    def _poll_safe_stop_checkpoint(self, proc):
+        run = self._find_sim_run(proc)
+        if not run or not run.get("safe_stop_requested") or run.get("safe_stop_triggered"):
+            return
+        if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        if self._safe_stop_should_trigger(run):
+            self._complete_safe_stop_after_checkpoint(run)
+            return
+        QTimer.singleShot(2000, lambda p=proc: self._poll_safe_stop_checkpoint(p))
+
+    def _on_safe_stop_timeout(self, proc):
+        run = self._find_sim_run(proc)
+        if not run or not run.get("safe_stop_requested") or run.get("safe_stop_triggered"):
+            return
+        if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        run["safe_stop_timed_out"] = True
+        timeout_sec = float(run.get("safe_stop_timeout_sec") or 0.0)
+        self._snapshot_active_dmps_before_kill(run)
+        self._update_sim_run(
+            proc,
+            "forcing stop",
+            f"safe stop timed out after {self._fmt_duration(timeout_sec)}; forcing stop",
+        )
+        self.console.log(
+            f"[SIM] Safe stop timed out for {run['path'].name} after "
+            f"{self._fmt_duration(timeout_sec)} without a detected dump checkpoint; forcing stop.\n",
             "warn",
         )
         QTimer.singleShot(250, lambda p=proc: self._kill_process_tree(p))
@@ -28028,6 +28954,16 @@ class SimulationTab(QWidget):
             return {"state": "truncated", "count": len(dmp_files), "truncated": truncated}
         return {"state": "present", "count": len(dmp_files)}
 
+    def _latest_dmp_mtime(self, run_folder):
+        run_folder = Path(run_folder)
+        dmp_files = [p for p in run_folder.glob("*.dmp") if p.is_file()]
+        if not dmp_files:
+            return None
+        try:
+            return max(float(p.stat().st_mtime) for p in dmp_files)
+        except Exception:
+            return None
+
     def _recover_interrupted_resume_dump(self, run):
         if not run:
             return
@@ -28187,6 +29123,11 @@ class SimulationTab(QWidget):
             "cancelled_by_kill_all": False,
             "cancelled_by_user": False,
             "last_shower": None,
+            "output_tail": "",
+            "safe_stop_request_shower": None,
+            "safe_stop_requested_at": None,
+            "safe_stop_timeout_sec": None,
+            "safe_stop_timed_out": False,
         }
         self._sim_runs.append(run)
         self._update_sim_run_button()
@@ -28916,7 +29857,14 @@ class SimulationTab(QWidget):
             return None
 
     def _remember_last_shower_from_output(self, run, raw_text):
-        value = self._extract_last_shower_value(raw_text)
+        if not run:
+            return None
+        tail = str(run.get("output_tail") or "")
+        tail = (tail + (raw_text or ""))
+        if len(tail) > 16000:
+            tail = tail[-16000:]
+        run["output_tail"] = tail
+        value = self._extract_last_shower_value(tail)
         if value is not None:
             run["last_shower"] = value
         return value
@@ -28927,6 +29875,10 @@ class SimulationTab(QWidget):
             if value is None:
                 return "safely stopped at dump checkpoint"
             return f"safely stopped at dump checkpoint after {float(value):.2f} showers"
+        if run and run.get("safe_stop_timed_out"):
+            if value is None:
+                return "forced stop after waiting for dump checkpoint"
+            return f"forced stop after waiting for dump checkpoint at {float(value):.2f} showers"
         if run and run.get("safe_stop_requested"):
             if value is None:
                 return "safe stop requested before shower count"
@@ -28944,10 +29896,9 @@ class SimulationTab(QWidget):
             run["dump_corrupt"] = True
         if run:
             self._remember_last_shower_from_output(run, text)
-            if run.get("safe_stop_requested") and not run.get("safe_stop_triggered"):
-                if self._extract_last_shower_value(text) is not None:
-                    self._complete_safe_stop_after_checkpoint(run)
-                    return
+            if self._safe_stop_should_trigger(run):
+                self._complete_safe_stop_after_checkpoint(run)
+                return
         latest = self._last_process_line(text)
         if latest:
             if run and run.get("cancelled_by_user"):
@@ -28964,10 +29915,9 @@ class SimulationTab(QWidget):
             run["dump_corrupt"] = True
         if run:
             self._remember_last_shower_from_output(run, text)
-            if run.get("safe_stop_requested") and not run.get("safe_stop_triggered"):
-                if self._extract_last_shower_value(text) is not None:
-                    self._complete_safe_stop_after_checkpoint(run)
-                    return
+            if self._safe_stop_should_trigger(run):
+                self._complete_safe_stop_after_checkpoint(run)
+                return
         latest = self._last_process_line(text)
         if latest:
             if run and run.get("cancelled_by_user"):
@@ -29936,6 +30886,20 @@ def _analysis_preferred_geo_file(folder):
     return None
 
 
+def _analysis_has_material_context(folder):
+    folder = Path(folder)
+    search_dirs = [folder] + list(folder.parents[:2])
+    for search_dir in search_dirs:
+        try:
+            if (search_dir / "material.dat").exists():
+                return True
+            if any(search_dir.glob("*.mat")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _analysis_preferred_rep_file(folder, geo_file=None):
     folder = Path(folder)
     search_dirs = [folder] + list(folder.parents[:2])
@@ -30223,7 +31187,9 @@ class AnalysisTab(QWidget):
             return_label=True,
         )
         self.lbl_multi_root.setStyleSheet(label_css(P["fg2"]))
-        self.lbl_multi_root.setWordWrap(True)
+        self.lbl_multi_root.setWordWrap(False)
+        self.lbl_multi_root.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_multi_root.setMinimumWidth(220)
         self.chk_analysis_recursive = QCheckBox("Recursive")
         self.chk_analysis_recursive.setStyleSheet(checkbox_css())
         self.chk_analysis_recursive.setToolTip(
@@ -30270,7 +31236,9 @@ class AnalysisTab(QWidget):
             return_label=True,
         )
         self.lbl_dose_xlsx.setStyleSheet(label_css(P["fg2"]))
-        self.lbl_dose_xlsx.setWordWrap(True)
+        self.lbl_dose_xlsx.setWordWrap(False)
+        self.lbl_dose_xlsx.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_dose_xlsx.setMinimumWidth(220)
         btn_xlsx = QPushButton("Dose XLSX...")
         btn_xlsx.setStyleSheet(btn_css(width=110))
         btn_xlsx.clicked.connect(self._choose_dose_xlsx)
@@ -30362,7 +31330,9 @@ class AnalysisTab(QWidget):
             return_label=True,
         )
         self.lbl_workspace.setStyleSheet(label_css(P["fg2"]))
-        self.lbl_workspace.setWordWrap(True)
+        self.lbl_workspace.setWordWrap(False)
+        self.lbl_workspace.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_workspace.setMinimumWidth(220)
         self.lbl_workspace.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top_lay.addWidget(workspace_widget)
         top_row = QWidget()
@@ -30464,6 +31434,7 @@ class AnalysisTab(QWidget):
         self._log_analysis("Analysis append log ready.", "info")
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
         self.lst_files = QListWidget()
         self.lst_files.setMinimumWidth(180)
         self.lst_files.setMaximumWidth(230)
@@ -30475,6 +31446,8 @@ class AnalysisTab(QWidget):
         splitter.addWidget(self.lst_files)
 
         right = QWidget()
+        right.setMinimumWidth(0)
+        right.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(8)
@@ -30507,6 +31480,8 @@ class AnalysisTab(QWidget):
         right_lay.addWidget(self.tbl_bodies, stretch=1)
         splitter.addWidget(right)
         splitter.setSizes([220, 980])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, stretch=1)
 
     def _configure_body_table_columns(self):
@@ -30562,8 +31537,8 @@ class AnalysisTab(QWidget):
               <li>Mass is estimated from geometry volume and material density when the needed information is available.</li>
               <li>Dose is reported both as <b>Gy</b> and <b>eV/g</b>. Gy uses <code>D = E / m</code> after converting eV to joules with <code>1.602176634e-19</code>; eV/g uses deposited energy directly over mass in grams.</li>
               <li>The table includes body rows and a total row for the selected case.</li>
-              <li><b>3D Dose...</b> now offers two MATLAB helpers: a case-specific script saved inside the current case folder, or a reusable browser script saved at a chosen cases/root folder.</li>
-              <li>The browser script scans subfolders recursively under a chosen root and saves PNG plots beside each <code>3d-dose*.dat</code>.</li>
+              <li><b>3D Dose...</b> offers a case-specific helper plus a batch-analysis MATLAB script for a chosen root folder.</li>
+              <li>The batch-analysis script handles recursive dose workbook analysis and recursive <code>3d-dose*.dat</code> plotting under the selected root.</li>
             </ul>
             <h3>Excel Output</h3>
             <ul>
@@ -30600,40 +31575,117 @@ class AnalysisTab(QWidget):
         if folder:
             self._load_workspace(Path(folder))
 
+    def _dose_workbook_has_penelope_headers(self, path):
+        path = Path(path)
+        if not path.exists() or not path.is_file():
+            return False
+        openpyxl = self._load_openpyxl()
+        if openpyxl is None:
+            return False
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            headers = [
+                str(ws.cell(1, col).value or "").strip()
+                for col in range(1, len(self.DOSE_HEADERS) + 1)
+            ]
+            return headers == self.DOSE_HEADERS
+        except Exception:
+            return False
+
+    def _find_recursive_dose_workbooks(self, root):
+        root = Path(root)
+        candidates = []
+        if not root.exists():
+            return candidates
+        for path in sorted(root.rglob("*.xlsx")):
+            if not path.is_file():
+                continue
+            lowered_parts = {part.lower() for part in path.parts}
+            if "old appends" in lowered_parts:
+                continue
+            if self._dose_workbook_has_penelope_headers(path):
+                candidates.append(path)
+        return candidates
+
+    def _select_recursive_dose_workbook_candidate(self, root, candidates):
+        candidates = [Path(path) for path in (candidates or [])]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Dose Workbook")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(860)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(
+            f"Found {len(candidates)} valid Penelope dose workbooks under:\n{root}\n\n"
+            "Select which workbook to use."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"]))
+        lay.addWidget(hint)
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        lst.setStyleSheet(
+            f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item {{ padding:4px; }}"
+            f"QListWidget::item:selected {{ background:{P['sel']}; color:{P['fg']}; }}"
+        )
+        for path in candidates:
+            try:
+                label = str(path.relative_to(root))
+            except Exception:
+                label = str(path)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(str(path))
+            lst.addItem(item)
+        if lst.count():
+            lst.setCurrentRow(0)
+        lay.addWidget(lst, stretch=1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not lst.currentItem():
+            return None
+        return Path(lst.currentItem().data(Qt.ItemDataRole.UserRole))
+
     def _choose_dose_xlsx(self):
         start_dir = self._workspace or Path.cwd()
         if self._dose_xlsx is not None:
             start_dir = self._dose_xlsx.parent
-        start = start_dir / (self._dose_xlsx.name if self._dose_xlsx else "dose_analysis.xlsx")
-        dialog = QFileDialog(
+        folder = QFileDialog.getExistingDirectory(
             self,
-            "Select existing or create dose workbook",
+            "Select folder to scan recursively for Penelope dose workbooks",
             str(start_dir),
-            "Excel workbook (*.xlsx);;All files (*.*)",
         )
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
-        dialog.setDefaultSuffix("xlsx")
-        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
-        dialog.selectFile(str(start))
-        if not dialog.exec():
+        if not folder:
             return
-        selected = dialog.selectedFiles()
-        if not selected:
+        root = Path(folder)
+        candidates = self._find_recursive_dose_workbooks(root)
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Dose XLSX",
+                f"No valid Penelope dose workbook was found under:\n{root}\n\n"
+                "Validation checks the header row against the Studio dose workbook columns.",
+            )
             return
-        path = selected[0]
-        if not path:
+        chosen_path = self._select_recursive_dose_workbook_candidate(root, candidates)
+        if not chosen_path:
             return
-        if not path.lower().endswith(".xlsx"):
-            path += ".xlsx"
-        chosen_path = Path(path)
         self._dose_xlsx = chosen_path
         self._dose_xlsx_user_selected = True
         self._dose_workbook_config = None
-        state = "existing" if self._dose_xlsx.exists() else "will be created on append"
+        state = "existing"
         self._update_dose_xlsx_label(state)
         self.status_message.emit(f"Dose workbook selected: {self._dose_xlsx}")
-        self._log_analysis(f"Dose workbook selected: {self._dose_xlsx} ({state}).", "info")
+        self._log_analysis(f"Dose workbook selected recursively: {self._dose_xlsx} ({state}).", "info")
         self._refresh_dose_columns()
 
     def _extract_source_info_from_in(self, folder):
@@ -31074,7 +32126,7 @@ class AnalysisTab(QWidget):
         cases_root = root / folders.get("cases", PROJECT_DIR_CASES)
         self._multi_root = cases_root if cases_root.exists() else root
         if hasattr(self, "lbl_multi_root"):
-            rel = self._analysis_workspace_display_text(self._multi_root).replace("Case:\n", "").replace("\\\n", "\\")
+            rel = self._compact_analysis_path_text(self._multi_root, max_parts=5, max_leaf_chars=60)
             self.lbl_multi_root.setText(f"Case Root: {rel}")
             self.lbl_multi_root.setToolTip(str(self._multi_root))
         if (not self._dose_xlsx_user_selected) and analysis_root.exists():
@@ -31112,8 +32164,9 @@ class AnalysisTab(QWidget):
                 if (
                     folder.is_dir()
                     and (folder / "penmain-res.dat").exists()
-                    and any(folder.glob("*.geo"))
-                    and any(folder.glob("*.mat"))
+                    and any(folder.glob("*.in"))
+                    and _analysis_preferred_geo_file(folder) is not None
+                    and _analysis_has_material_context(folder)
                     and not _penmain_result_health(folder).get("incomplete")
                 )
             ]
@@ -31127,24 +32180,45 @@ class AnalysisTab(QWidget):
             )
         ]
 
+    def _elide_middle_text(self, text, max_chars=64):
+        text = str(text or "")
+        max_chars = max(12, int(max_chars or 64))
+        if len(text) <= max_chars:
+            return text
+        keep_left = max(4, (max_chars - 3) // 2)
+        keep_right = max(4, max_chars - keep_left - 3)
+        return f"{text[:keep_left]}...{text[-keep_right:]}"
+
+    def _project_display_path_text(self, path):
+        if not path:
+            return ""
+        target = Path(path)
+        if not self._project_root:
+            return str(target)
+        try:
+            root = Path(self._project_root).resolve()
+            rel = str(target.resolve().relative_to(root)).replace("/", "\\")
+            return f"{root.name}\\{rel}" if rel else root.name
+        except Exception:
+            return str(target)
+
+    def _compact_analysis_path_text(self, path, max_parts=5, max_leaf_chars=60):
+        display = self._project_display_path_text(path) or str(path or "")
+        parts = [part for part in str(display).replace("/", "\\").split("\\") if part]
+        if not parts:
+            return ""
+        max_parts = max(3, int(max_parts or 5))
+        if len(parts) > max_parts:
+            prefix = parts[:2]
+            suffix_count = max(1, max_parts - len(prefix) - 1)
+            parts = prefix + ["..."] + parts[-suffix_count:]
+        parts[-1] = self._elide_middle_text(parts[-1], max_leaf_chars)
+        if len(parts) >= 2:
+            parts[-2] = self._elide_middle_text(parts[-2], max(24, max_leaf_chars // 2))
+        return "\\".join(parts)
+
     def _analysis_workspace_display_text(self, folder):
-        folder = Path(folder)
-        if self._project_root:
-            try:
-                root = Path(self._project_root).resolve()
-                rel = str(folder.resolve().relative_to(root)).replace("/", "\\")
-                rel = f"{root.name}\\{rel}" if rel else root.name
-            except Exception:
-                rel = str(folder)
-        else:
-            root = self._multi_root or folder.parent
-            try:
-                rel = str(folder.relative_to(root))
-            except Exception:
-                rel = str(folder)
-        rel = rel.replace("/", "\\")
-        rel_wrapped = rel.replace("\\", "\\\n")
-        return f"Case:\n{rel_wrapped}"
+        return f"Case: {self._compact_analysis_path_text(folder, max_parts=5, max_leaf_chars=72)}"
 
     def _set_workspace_label(self, folder=None, text=None):
         if text is not None:
@@ -31177,7 +32251,9 @@ class AnalysisTab(QWidget):
                 display = str(root)
         else:
             display = str(root)
-        self.lbl_multi_root.setText(f"Case Root: {display}")
+        self.lbl_multi_root.setText(
+            f"Case Root: {self._compact_analysis_path_text(root, max_parts=5, max_leaf_chars=60)}"
+        )
         self.lbl_multi_root.setToolTip(str(root))
 
     def _refresh_analysis_workspace_candidates(self):
@@ -31495,7 +32571,7 @@ class AnalysisTab(QWidget):
         for idx in range(1, len(dose_paths) + 1):
             dose_rows.append(f"dose{idx} = S{idx}(:,4);")
             sum_rows.append(f"doseT = doseT + dose{idx};")
-            legend_rows.append(f"'dose{idx}'")
+            legend_rows.append(f"'dose {idx}'")
             plot_rows_x.append(f"plot(x(ix), dose{idx}(ix), '.'); hold on;")
             plot_rows_y.append(f"plot(y(iy), dose{idx}(iy), '.'); hold on;")
             plot_rows_z.append(f"plot(z(iz), dose{idx}(iz), '.'); hold on;")
@@ -31511,45 +32587,391 @@ class AnalysisTab(QWidget):
             + "\n".join(dose_rows) + "\n"
             + "\n".join(sum_rows) + "\n\n"
             "% Target slice centres and tolerances (cm) - edit these to match your target\n"
-            "xT = 0.0;\n"
-            "yT = 0.0;\n"
-            "zT = 0.0;\n"
+            "xT = 4.0;\n"
+            "yT = 3.0;\n"
+            "zT = -2.2;\n"
+            "xOD = 4.0;\n"
+            "yOD = 6.5;\n"
+            "zOD = -2.0;\n"
             "d = 0.5;\n\n"
             "tol_xy = 0.5;\n"
             "tol_xz = 0.3;\n"
             "tol_yz = 0.3;\n\n"
+            "ced = [char(231) char(227)];\n\n"
             "ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
             "iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
             "iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n\n"
             + "\n".join(plot_rows_x) + "\n"
             "plot(x(ix), doseT(ix), 'k*');\n"
-            "xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along X');\n"
+            "xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de X');\n"
             f"legend({', '.join(legend_rows)}); grid on; hold off;\n\n"
             "pause\n\n"
             + "\n".join(plot_rows_y) + "\n"
             "plot(y(iy), doseT(iy), 'k*');\n"
-            "xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Y');\n"
+            "xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de Y');\n"
             f"legend({', '.join(legend_rows)}); grid on; hold off;\n\n"
             "pause\n\n"
             + "\n".join(plot_rows_z) + "\n"
             "plot(z(iz), doseT(iz), 'k*');\n"
-            "xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Z');\n"
+            "xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de Z');\n"
             f"legend({', '.join(legend_rows)}); grid on; hold off;\n\n"
             "pause\n\n"
             "i_xy = find((abs(z - zT) < tol_xy) .* (doseT > 1e-10));\n"
             "scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
-            "colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Dose distribution on XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n\n"
+            "hold on; hTumor = plot(xT, yT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, yOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Distribui' ced 'o de dose no plano XY (z = ', num2str(zT), ' cm)']); axis equal; grid on; hold off;\n\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n\n"
             "pause\n\n"
             "i_xz = find((abs(y - yT) < tol_xz) .* (doseT > 1e-10));\n"
             "scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
-            "colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Dose distribution on XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n\n"
+            "hold on; hTumor = plot(xT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o de dose no plano XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on; hold off;\n\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n\n"
             "pause\n\n"
             "i_yz = find((abs(x - xT) < tol_yz) .* (doseT > 1e-10));\n"
             "scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
-            "colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Dose distribution on YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
+            "hold on; hTumor = plot(yT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(yOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o de dose no plano YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on; hold off;\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
         )
 
-    def _build_matlab_3d_dose_browser_script(self):
+    def _prompt_3d_dose_target_center(self, title="3D Dose Target Center"):
+        settings = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_NAME)
+        defaults = (
+            float(settings.value("analysis/3d_dose_target_x", 4.0) or 4.0),
+            float(settings.value("analysis/3d_dose_target_y", 3.0) or 3.0),
+            float(settings.value("analysis/3d_dose_target_z", -2.2) or -2.2),
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setModal(True)
+        dlg.setMinimumWidth(360)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel("Set the target center that will be written into the MATLAB script as xT, yT, and zT.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"]))
+        lay.addWidget(hint)
+        form = QFormLayout()
+        edits = []
+        for label, value in (("Target X", defaults[0]), ("Target Y", defaults[1]), ("Target Z", defaults[2])):
+            edit = QLineEdit(f"{value:g}")
+            edit.setStyleSheet(entry_css())
+            form.addRow(f"{label}:", edit)
+            edits.append(edit)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        try:
+            values = tuple(float(edit.text().strip()) for edit in edits)
+        except (TypeError, ValueError):
+            QMessageBox.warning(dlg, "Invalid target center", "Target center values must be valid numbers.")
+            return None
+        settings.setValue("analysis/3d_dose_target_x", values[0])
+        settings.setValue("analysis/3d_dose_target_y", values[1])
+        settings.setValue("analysis/3d_dose_target_z", values[2])
+        return values
+
+    def _infer_surface_label_xyz(self, surface):
+        params = dict((surface or {}).get("params") or {})
+        coords = {"x": None, "y": None, "z": None}
+        for axis, key in (("x", "X-SHIFT"), ("y", "Y-SHIFT"), ("z", "Z-SHIFT")):
+            if key in params:
+                try:
+                    value = float(params.get(key))
+                except Exception:
+                    value = None
+                if value is not None and math.isfinite(value):
+                    coords[axis] = value
+        try:
+            ax = float(params.get("AX", 0.0) or 0.0)
+            ay = float(params.get("AY", 0.0) or 0.0)
+            az = float(params.get("AZ", 0.0) or 0.0)
+            a0 = float(params.get("A0")) if "A0" in params else None
+        except Exception:
+            ax = ay = az = 0.0
+            a0 = None
+        if a0 is not None and math.isfinite(a0):
+            axis_terms = [(axis, coeff) for axis, coeff in (("x", ax), ("y", ay), ("z", az)) if abs(coeff) > 1.0e-12]
+            if len(axis_terms) == 1:
+                axis, coeff = axis_terms[0]
+                if coords[axis] is None:
+                    coords[axis] = -a0 / coeff
+        return coords["x"], coords["y"], coords["z"]
+
+    def _collect_geo_surface_label_rows(self, geo_path):
+        geo_path = Path(geo_path)
+        text = _decode_text_bytes(geo_path.read_bytes())
+        surfaces, _bodies = _parse_geo(text)
+        rows = []
+        for sid, surface in sorted(surfaces.items(), key=lambda item: int(item[0])):
+            label = str((surface or {}).get("label") or "").strip() or f"SURFACE ({sid})"
+            x_val, y_val, z_val = self._infer_surface_label_xyz(surface)
+            selectable = all(v is not None and math.isfinite(v) for v in (x_val, y_val, z_val))
+            rows.append(
+                {
+                    "surface_id": int(sid),
+                    "label": label,
+                    "x": x_val,
+                    "y": y_val,
+                    "z": z_val,
+                    "selectable": selectable,
+                    "status": "OK" if selectable else "Missing full X/Y/Z center",
+                }
+            )
+        return rows
+
+    def _safe_matlab_label_suffix(self, label, used_suffixes=None):
+        text = unicodedata.normalize("NFKD", str(label or ""))
+        ascii_text = text.encode("ascii", "ignore").decode("ascii")
+        tokens = [token for token in re.split(r"[^A-Za-z0-9]+", ascii_text) if token]
+        suffix = "".join(token[:1].upper() + token[1:] for token in tokens) or "Label"
+        if not re.match(r"^[A-Za-z]", suffix):
+            suffix = f"Label{suffix}"
+        if used_suffixes is not None:
+            base = suffix
+            counter = 2
+            while suffix.lower() in used_suffixes:
+                suffix = f"{base}{counter}"
+                counter += 1
+            used_suffixes.add(suffix.lower())
+        return suffix
+
+    def _build_matlab_selected_label_block(self, target_center=None, label_specs=None):
+        x_target, y_target, z_target = tuple(target_center or (4.0, 3.0, -2.2))
+        label_specs = list(label_specs or [])
+        used_suffixes = set()
+        lines = [
+            "% Script-generated geometry label centres (cm)",
+            "%__STUDIO_SELECTED_LABELS_BEGIN__",
+        ]
+        matlab_entries = []
+        target_suffix = None
+        for spec in label_specs:
+            label = str(spec.get("label") or "").strip() or "Label"
+            marker = "o" if str(spec.get("marker") or "").strip().lower() == "o" else "x"
+            try:
+                x_val, y_val, z_val = tuple(float(v) for v in spec.get("coords") or ())
+            except Exception:
+                continue
+            suffix = self._safe_matlab_label_suffix(label, used_suffixes)
+            lines.append(f"x{suffix} = {x_val:.12g};  y{suffix} = {y_val:.12g};  z{suffix} = {z_val:.12g};")
+            safe_label = label.replace("'", "''")
+            matlab_entries.append(f"    {{'{safe_label}', '{marker}', x{suffix}, y{suffix}, z{suffix}}};")
+            if marker == "o" and not target_suffix:
+                target_suffix = suffix
+        if matlab_entries:
+            lines.append("selectedLabelSpecs = {")
+            lines.extend(matlab_entries)
+            lines.append("};")
+        else:
+            lines.append("selectedLabelSpecs = {};")
+        if target_suffix:
+            lines.append(f"xT = x{target_suffix};  yT = y{target_suffix};  zT = z{target_suffix};")
+        else:
+            lines.append(f"xT = {x_target:.12g};  yT = {y_target:.12g};  zT = {z_target:.12g};")
+        lines.append("%__STUDIO_SELECTED_LABELS_END__")
+        return "\n".join(lines)
+
+    def _prompt_3d_dose_geo_label_config(self, default_geo=None, title="3D Dose Geometry Labels"):
+        settings = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_NAME)
+        saved_geo = str(settings.value("analysis/3d_dose_geo_path", "") or "").strip()
+        if default_geo:
+            default_geo = str(Path(default_geo))
+        start_geo = default_geo or saved_geo
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setModal(True)
+        dlg.setMinimumWidth(860)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(
+            "Choose a .geo file, review the detected SURFACE labels, and select which centers should be marked in the MATLAB plots. "
+            "The selected target row becomes xT/yT/zT and uses an 'o' marker; all other selected rows use 'x'."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"]))
+        lay.addWidget(hint)
+
+        geo_row = QHBoxLayout()
+        geo_edit = QLineEdit(start_geo)
+        geo_edit.setStyleSheet(entry_css())
+        geo_row.addWidget(QLabel("Geometry (.geo):"))
+        geo_row.addWidget(geo_edit, 1)
+        btn_browse = QPushButton("...")
+        btn_browse.setStyleSheet(btn_css(P["bg2"]))
+        btn_reload = QPushButton("Load")
+        btn_reload.setStyleSheet(btn_css(P["bg2"]))
+        geo_row.addWidget(btn_browse)
+        geo_row.addWidget(btn_reload)
+        lay.addLayout(geo_row)
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["Use", "Label", "X", "Y", "Z", "Status"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(table_css())
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in (2, 3, 4, 5):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        lay.addWidget(table, 1)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Slice center / target label:"))
+        target_combo = QComboBox()
+        target_combo.setStyleSheet(combo_css())
+        target_row.addWidget(target_combo, 1)
+        lay.addLayout(target_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        lay.addWidget(buttons)
+
+        state = {"rows": [], "geo_path": ""}
+
+        def _preferred_target_index(rows):
+            for idx, row in enumerate(rows):
+                if row.get("selectable") and "tumor" in str(row.get("label", "")).lower():
+                    return idx
+            for idx, row in enumerate(rows):
+                if row.get("selectable"):
+                    return idx
+            return None
+
+        def _load_geo_rows(path_text):
+            path_text = str(path_text or "").strip().strip('"')
+            if not path_text:
+                return
+            geo_path = Path(path_text)
+            if not geo_path.exists():
+                QMessageBox.warning(dlg, "Missing geometry", f"Could not find:\n{geo_path}")
+                return
+            try:
+                rows = self._collect_geo_surface_label_rows(geo_path)
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Geometry labels", f"Could not scan the geometry file:\n{exc}")
+                return
+            state["rows"] = rows
+            state["geo_path"] = str(geo_path)
+            geo_edit.setText(str(geo_path))
+            table.setRowCount(len(rows))
+            target_combo.clear()
+            default_target = _preferred_target_index(rows)
+            for row_idx, row in enumerate(rows):
+                selectable = bool(row.get("selectable"))
+                lower_label = str(row.get("label", "")).lower()
+                default_checked = selectable and any(
+                    token in lower_label for token in ("tumor", "olho direito", "olho dto", "olho esquerdo", "olho esq")
+                )
+                chk = QTableWidgetItem("")
+                if selectable:
+                    chk.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    chk.setCheckState(Qt.CheckState.Checked if default_checked else Qt.CheckState.Unchecked)
+                    target_combo.addItem(
+                        f"{row['label']}  ({row['x']:.4g}, {row['y']:.4g}, {row['z']:.4g})",
+                        row_idx,
+                    )
+                else:
+                    chk.setFlags(Qt.ItemFlag.NoItemFlags)
+                table.setItem(row_idx, 0, chk)
+                for col_idx, value in enumerate(
+                    (
+                        row.get("label", ""),
+                        "" if row.get("x") is None else f"{row['x']:.6g}",
+                        "" if row.get("y") is None else f"{row['y']:.6g}",
+                        "" if row.get("z") is None else f"{row['z']:.6g}",
+                        row.get("status", ""),
+                    ),
+                    start=1,
+                ):
+                    item = QTableWidgetItem(str(value))
+                    if not selectable:
+                        item.setForeground(QColor(P["fg2"]))
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    table.setItem(row_idx, col_idx, item)
+            if default_target is not None:
+                combo_index = target_combo.findData(default_target)
+                if combo_index >= 0:
+                    target_combo.setCurrentIndex(combo_index)
+            settings.setValue("analysis/3d_dose_geo_path", str(geo_path))
+
+        def _browse_geo():
+            current = geo_edit.text().strip() or start_geo or str(self._workspace or Path.cwd())
+            file_path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "Choose geometry file",
+                current,
+                "Geometry (*.geo);;All files (*.*)",
+            )
+            if file_path:
+                _load_geo_rows(file_path)
+
+        btn_browse.clicked.connect(_browse_geo)
+        btn_reload.clicked.connect(lambda: _load_geo_rows(geo_edit.text()))
+        buttons.rejected.connect(dlg.reject)
+
+        result = {}
+
+        def _accept():
+            rows = list(state.get("rows") or [])
+            if not rows:
+                QMessageBox.warning(dlg, "Geometry labels", "Load a geometry file first.")
+                return
+            target_row_idx = target_combo.currentData()
+            if target_row_idx is None:
+                QMessageBox.warning(dlg, "Geometry labels", "No SURFACE label with a full X/Y/Z center is available for selection.")
+                return
+            selected_indices = []
+            for row_idx, row in enumerate(rows):
+                item = table.item(row_idx, 0)
+                if row.get("selectable") and item and item.checkState() == Qt.CheckState.Checked:
+                    selected_indices.append(row_idx)
+            if target_row_idx not in selected_indices:
+                selected_indices.insert(0, int(target_row_idx))
+            ordered_indices = []
+            seen_indices = set()
+            for idx in selected_indices:
+                if idx not in seen_indices:
+                    ordered_indices.append(idx)
+                    seen_indices.add(idx)
+            label_specs = []
+            for idx in ordered_indices:
+                row = rows[idx]
+                marker = "o" if idx == int(target_row_idx) else "x"
+                label_specs.append(
+                    {
+                        "label": row["label"],
+                        "coords": (float(row["x"]), float(row["y"]), float(row["z"])),
+                        "marker": marker,
+                        "surface_id": int(row["surface_id"]),
+                    }
+                )
+            target_row = rows[int(target_row_idx)]
+            result["target_center"] = (float(target_row["x"]), float(target_row["y"]), float(target_row["z"]))
+            result["label_specs"] = label_specs
+            result["geo_path"] = state.get("geo_path", "")
+            dlg.accept()
+
+        buttons.accepted.connect(_accept)
+        if start_geo:
+            _load_geo_rows(start_geo)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return result
+
+    def _build_matlab_3d_dose_browser_script(self, target_center=None):
+        x_target, y_target, z_target = tuple(target_center or (4.0, 3.0, -2.2))
         return (
             "% Auto-generated by Penelope Studio\n"
             "% Recursive 3D dose plot exporter.\n"
@@ -31561,13 +32983,17 @@ class AnalysisTab(QWidget):
             "    return;\n"
             "end\n\n"
             "% Target slice centres and tolerances (cm) - edit these to match your target\n"
-            "xT = 4.0;\n"
-            "yT = 3.0;\n"
-            "zT = -2.2;\n"
+            f"xT = {x_target:.12g};\n"
+            f"yT = {y_target:.12g};\n"
+            f"zT = {z_target:.12g};\n"
+            "xOD = 4.0;\n"
+            "yOD = 6.5;\n"
+            "zOD = -2.0;\n"
             "d = 0.5;\n\n"
             "tol_xy = 0.5;\n"
             "tol_xz = 0.3;\n"
             "tol_yz = 0.3;\n\n"
+            "ced = [char(231) char(227)];\n\n"
             "allDirs = regexp(genpath(scanRoot), pathsep, 'split');\n"
             "processed = 0;\n"
             "for dIdx = 1:numel(allDirs)\n"
@@ -31576,7 +33002,7 @@ class AnalysisTab(QWidget):
             "        continue;\n"
             "    end\n"
             "    lowerDir = lower(caseDir);\n"
-            "    if ~isempty(strfind(lowerDir, [filesep 'previous_runs'])) || ~isempty(strfind(lowerDir, [filesep 'dmps'])) || ~isempty(strfind(lowerDir, '_3d_dose_header_backup_'))\n"
+            "    if ~isempty(strfind(lowerDir, [filesep 'previous_runs'])) || ~isempty(strfind(lowerDir, [filesep 'dmps'])) || ~isempty(strfind(lowerDir, [filesep '3d-dose_group'])) || ~isempty(strfind(lowerDir, '_3d_dose_header_backup_'))\n"
             "        continue;\n"
             "    end\n"
             "    files = dir(fullfile(caseDir, '3d-dose*.dat'));\n"
@@ -31586,7 +33012,7 @@ class AnalysisTab(QWidget):
             "    [~, order] = sort({files.name});\n"
             "    files = files(order);\n"
             "    try\n"
-            "        clear x y z dose1 doseT ix iy iz i_xy i_xz i_yz;\n"
+            "        clear x y z dose1 doseT uTotal2 ix iy iz i_xy i_xz i_yz D U xVec yVec zVec;\n"
             "        for k = 1:numel(files)\n"
             "            dosePath = fullfile(caseDir, files(k).name);\n"
             "            fid = fopen(dosePath, 'rt');\n"
@@ -31604,15 +33030,40 @@ class AnalysisTab(QWidget):
             "                y = Scur(:,2);\n"
             "                z = Scur(:,3);\n"
             "                dose1 = Scur(:,4);\n"
+            "                ix = round(Scur(:,6));\n"
+            "                iy = round(Scur(:,7));\n"
+            "                iz = round(Scur(:,8));\n"
             "                doseT = zeros(size(x));\n"
+            "                uTotal2 = zeros(size(x));\n"
             "            end\n"
             "            doseT = doseT + Scur(:,4);\n"
+            "            if size(Scur,2) >= 5\n"
+            "                uTotal2 = uTotal2 + (Scur(:,5).^2);\n"
+            "            end\n"
             "        end\n"
             "        if numel(files) == 1\n"
             "            [~, doseStem, ~] = fileparts(files(1).name);\n"
+            "            if strcmpi(doseStem, '3d-dose')\n"
+            "                filePrefix = '';\n"
+            "            else\n"
+            "                filePrefix = [doseStem, '_'];\n"
+            "            end\n"
             "        else\n"
             "            doseStem = '3d-dose_sum';\n"
+            "            filePrefix = '3d-dose_sum_';\n"
             "        end\n"
+            "        nx = max(ix); ny = max(iy); nz = max(iz);\n"
+            "        D = nan(nx, ny, nz);\n"
+            "        U = nan(nx, ny, nz);\n"
+            "        lin = sub2ind([nx, ny, nz], ix, iy, iz);\n"
+            "        D(lin) = doseT;\n"
+            "        U(lin) = sqrt(uTotal2);\n"
+            "        xVec = accumarray(ix, x, [nx 1], @mean);\n"
+            "        yVec = accumarray(iy, y, [ny 1], @mean);\n"
+            "        zVec = accumarray(iz, z, [nz 1], @mean);\n"
+            "        [~, ixt] = min(abs(xVec - xT));\n"
+            "        [~, iyt] = min(abs(yVec - yT));\n"
+            "        [~, izt] = min(abs(zVec - zT));\n"
             "        ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
             "        iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
             "        iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n"
@@ -31622,33 +33073,67 @@ class AnalysisTab(QWidget):
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        plot(x(ix), dose1(ix), '.'); hold on; plot(x(ix), doseT(ix), 'k*');\n"
-            "        xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along X'); legend('dose1', 'total'); grid on; hold off;\n"
+            "        xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de X'); legend('dose 1', 'total'); grid on; hold off;\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_profile_x.png'])); close(fig);\n"
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        plot(y(iy), dose1(iy), '.'); hold on; plot(y(iy), doseT(iy), 'k*');\n"
-            "        xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Y'); legend('dose1', 'total'); grid on; hold off;\n"
+            "        xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de Y'); legend('dose 1', 'total'); grid on; hold off;\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_profile_y.png'])); close(fig);\n"
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        plot(z(iz), dose1(iz), '.'); hold on; plot(z(iz), doseT(iz), 'k*');\n"
-            "        xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Dose profile along Z'); legend('dose1', 'total'); grid on; hold off;\n"
+            "        xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose ao longo de Z'); legend('dose 1', 'total'); grid on; hold off;\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_profile_z.png'])); close(fig);\n"
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
-            "        colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Dose distribution on XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n"
+            "        hold on; hTumor = plot(xT, yT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, yOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Distribui' ced 'o de dose no plano XY (z = ', num2str(zT), ' cm)']); axis equal; grid on; hold off;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_xy.png'])); close(fig);\n"
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
-            "        colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Dose distribution on XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n"
+            "        hold on; hTumor = plot(xT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o de dose no plano XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on; hold off;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_xz.png'])); close(fig);\n"
             "\n"
             "        fig = figure('Visible', 'off');\n"
             "        scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
-            "        colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Dose distribution on YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
+            "        hold on; hTumor = plot(yT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(yOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o de dose no plano YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on; hold off;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
             "        saveas(fig, fullfile(caseDir, [doseStem, '_yz.png'])); close(fig);\n"
+            "\n"
+            "        fig = figure('Visible', 'off');\n"
+            "        imagesc(xVec, yVec, squeeze(D(:, :, izt))'); axis xy equal tight; colorbar; hold on;\n"
+            "        hTumor = plot(xT, yT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, yOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        xlabel('x (cm)'); ylabel('y (cm)'); title(['Plano XY, z = ', num2str(zVec(izt), '%.2f'), ' cm']); grid on;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
+            "        saveas(fig, fullfile(caseDir, [filePrefix, 'plane_XY_tumor.png'])); close(fig);\n"
+            "\n"
+            "        fig = figure('Visible', 'off');\n"
+            "        imagesc(xVec, zVec, squeeze(D(:, iyt, :))'); axis xy equal tight; colorbar; hold on;\n"
+            "        hTumor = plot(xT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        xlabel('x (cm)'); ylabel('z (cm)'); title(['Plano XZ, y = ', num2str(yVec(iyt), '%.2f'), ' cm']); grid on;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
+            "        saveas(fig, fullfile(caseDir, [filePrefix, 'plane_XZ_tumor.png'])); close(fig);\n"
+            "\n"
+            "        fig = figure('Visible', 'off');\n"
+            "        imagesc(yVec, zVec, squeeze(D(ixt, :, :))'); axis xy equal tight; colorbar; hold on;\n"
+            "        hTumor = plot(yT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(yOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "        xlabel('y (cm)'); ylabel('z (cm)'); title(['Plano YZ, x = ', num2str(xVec(ixt), '%.2f'), ' cm']); grid on;\n"
+            "        legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside');\n"
+            "        saveas(fig, fullfile(caseDir, [filePrefix, 'plane_YZ_tumor.png'])); close(fig);\n"
+            "\n"
+            "        relU = 100 * squeeze(U(:, :, izt))' ./ squeeze(D(:, :, izt))';\n"
+            "        relU(~isfinite(relU) | squeeze(D(:, :, izt))' <= 1e-30) = NaN;\n"
+            "        fig = figure('Visible', 'off');\n"
+            "        imagesc(xVec, yVec, relU); axis xy equal tight; colorbar;\n"
+            "        xlabel('x (cm)'); ylabel('y (cm)'); title('Incerteza relativa 3sigma (%) no plano XY');\n"
+            "        saveas(fig, fullfile(caseDir, [filePrefix, 'uncertainty_XY_3sigma_pct.png'])); close(fig);\n"
             "\n"
             "        processed = processed + 1;\n"
             "        disp(['Saved 3D dose plots for ', caseDir]);\n"
@@ -31658,6 +33143,97 @@ class AnalysisTab(QWidget):
             "end\n"
             "\n"
             "disp(['Processed case folders: ', num2str(processed)]);\n"
+        )
+
+    def _build_matlab_3d_dose_group_script(self, target_center=None):
+        x_target, y_target, z_target = tuple(target_center or (4.0, 3.0, -2.2))
+        return (
+            "% Auto-generated by Penelope Studio\n"
+            "% Loads all 3d-dose files in this folder, sums the dose columns,\n"
+            "% and saves total profile and plane PNG files.\n\n"
+            "rootDir = fileparts(mfilename('fullpath'));\n"
+            "files = dir(fullfile(rootDir, '3d-dose_case*.dat'));\n"
+            "if isempty(files)\n"
+            "    files = dir(fullfile(rootDir, '3d-dose*.dat'));\n"
+            "end\n"
+            "if isempty(files)\n"
+            "    error('No 3d-dose files found in this folder.');\n"
+            "end\n"
+            "[~, order] = sort({files.name});\n"
+            "files = files(order);\n\n"
+            f"xT = {x_target:.12g};\n"
+            f"yT = {y_target:.12g};\n"
+            f"zT = {z_target:.12g};\n"
+            "xOD = 4.0;\n"
+            "yOD = 6.5;\n"
+            "zOD = -2.0;\n"
+            "d = 0.5;\n"
+            "tol_xy = 0.5;\n"
+            "tol_xz = 0.3;\n"
+            "tol_yz = 0.3;\n"
+            "ced = [char(231) char(227)];\n\n"
+            "for k = 1:numel(files)\n"
+            "    dosePath = fullfile(rootDir, files(k).name);\n"
+            "    fid = fopen(dosePath, 'rt');\n"
+            "    if fid < 0\n"
+            "        error(['Could not open ', dosePath]);\n"
+            "    end\n"
+            "    cols = textscan(fid, '%f%f%f%f%f%f%f%f', 'CommentStyle', '#', 'CollectOutput', true, 'MultipleDelimsAsOne', true, 'Delimiter', {' ', '\\t'});\n"
+            "    fclose(fid);\n"
+            "    Scur = cols{1};\n"
+            "    if isempty(Scur)\n"
+            "        error(['No numeric rows found in ', dosePath]);\n"
+            "    end\n"
+            "    if k == 1\n"
+            "        x = Scur(:,1);\n"
+            "        y = Scur(:,2);\n"
+            "        z = Scur(:,3);\n"
+            "        doseT = zeros(size(x));\n"
+            "        uTotal2 = zeros(size(x));\n"
+            "    end\n"
+            "    doseT = doseT + Scur(:,4);\n"
+            "    if size(Scur, 2) >= 5\n"
+            "        uTotal2 = uTotal2 + (Scur(:,5) .^ 2);\n"
+            "    end\n"
+            "end\n"
+            "uTotal = sqrt(uTotal2);\n"
+            "ix = find((abs(y - yT) <= d) .* (abs(z - zT) <= d));\n"
+            "iy = find((abs(x - xT) <= d) .* (abs(z - zT) <= d));\n"
+            "iz = find((abs(x - xT) <= d) .* (abs(y - yT) <= d));\n"
+            "i_xy = find((abs(z - zT) < tol_xy) .* (doseT > 1e-10));\n"
+            "i_xz = find((abs(y - yT) < tol_xz) .* (doseT > 1e-10));\n"
+            "i_yz = find((abs(x - xT) < tol_yz) .* (doseT > 1e-10));\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "plot(x(ix), doseT(ix), 'k*');\n"
+            "xlabel('x (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose total ao longo de X'); legend('total'); grid on;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_profile_x.png')); close(fig);\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "plot(y(iy), doseT(iy), 'k*');\n"
+            "xlabel('y (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose total ao longo de Y'); legend('total'); grid on;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_profile_y.png')); close(fig);\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "plot(z(iz), doseT(iz), 'k*');\n"
+            "xlabel('z (cm)'); ylabel('Dose (eV/g)'); title('Perfil de dose total ao longo de Z'); legend('total'); grid on;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_profile_z.png')); close(fig);\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "scatter(x(i_xy), y(i_xy), 20, doseT(i_xy), 'filled');\n"
+            "hold on; hTumor = plot(xT, yT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, yOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('x (cm)'); ylabel('y (cm)'); title(['Distribui' ced 'o total no plano XY (z = ', num2str(zT), ' cm)']); axis equal; grid on;\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside'); hold off;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_xy.png')); close(fig);\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "scatter(x(i_xz), z(i_xz), 20, doseT(i_xz), 'filled');\n"
+            "hold on; hTumor = plot(xT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(xOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('x (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o total no plano XZ (y = ', num2str(yT), ' cm)']); axis equal; grid on;\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside'); hold off;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_xz.png')); close(fig);\n\n"
+            "fig = figure('Visible', 'off');\n"
+            "scatter(y(i_yz), z(i_yz), 20, doseT(i_yz), 'filled');\n"
+            "hold on; hTumor = plot(yT, zT, 'ko', 'MarkerSize', 8, 'LineWidth', 1.5); hEye = plot(yOD, zOD, 'kx', 'MarkerSize', 9, 'LineWidth', 1.5);\n"
+            "colorbar; xlabel('y (cm)'); ylabel('z (cm)'); title(['Distribui' ced 'o total no plano YZ (x = ', num2str(xT), ' cm)']); axis equal; grid on;\n"
+            "legend([hTumor hEye], {'Tumor', 'Olho direito'}, 'Location', 'northeastoutside'); hold off;\n"
+            "saveas(fig, fullfile(rootDir, '3d-dose_total_yz.png')); close(fig);\n\n"
+            "disp(['Processed grouped total from ', num2str(numel(files)), ' 3d-dose file(s).']);\n"
         )
 
     def _safe_matlab_script_stem(self, value):
@@ -31674,6 +33250,22 @@ class AnalysisTab(QWidget):
         safe_stem = self._safe_matlab_script_stem(path.stem)
         return path.with_name(f"{safe_stem}.m")
 
+    def _matlab_batch_analysis_template_path(self):
+        return Path(__file__).resolve().parent / "matlab_templates" / "penelope_report_dose_analysis.m"
+
+    def _build_matlab_batch_analysis_script(self, target_center=None, label_specs=None):
+        template_path = self._matlab_batch_analysis_template_path()
+        text = template_path.read_text(encoding="utf-8")
+        label_block = self._build_matlab_selected_label_block(target_center, label_specs)
+        text = re.sub(
+            r"%__STUDIO_SELECTED_LABELS_BEGIN__.*?%__STUDIO_SELECTED_LABELS_END__",
+            label_block,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        return text
+
     def _case_3d_dose_files(self, folder, selected_path=None):
         folder = Path(folder)
         selected = Path(selected_path) if selected_path else None
@@ -31687,7 +33279,11 @@ class AnalysisTab(QWidget):
 
     def _default_browser_3d_dose_script_path(self, root):
         root = Path(root)
-        return self._safe_matlab_script_path(root / f"{self._safe_matlab_script_stem(root.name)}_3d_dose_browser.m")
+        return root / "penelope_report_dose_analysis.m"
+
+    def _default_group_3d_dose_script_path(self, root):
+        root = Path(root)
+        return self._safe_matlab_script_path(root / f"{self._safe_matlab_script_stem(root.name)}_3d_dose_group.m")
 
     def _collect_3d_dose_case_groups(self, root):
         root = Path(root)
@@ -31698,7 +33294,7 @@ class AnalysisTab(QWidget):
             if not path.is_file():
                 continue
             lowered_parts = {part.lower() for part in path.parts}
-            if "previous_runs" in lowered_parts or "dmps" in lowered_parts:
+            if "previous_runs" in lowered_parts or "dmps" in lowered_parts or "3d-dose_group" in lowered_parts:
                 continue
             groups.setdefault(path.parent, []).append(path)
         return [
@@ -31706,11 +33302,22 @@ class AnalysisTab(QWidget):
             for folder, paths in sorted(groups.items(), key=lambda item: str(item[0]).lower())
         ]
 
-    def _create_matlab_3d_dose_browser_script(self):
+    def _case_number_from_3d_dose_path(self, path, fallback=None):
+        candidates = [str(Path(path).parent.name), str(Path(path).name)]
+        for candidate in candidates:
+            match = re.search(r"case(\d+)", candidate, re.IGNORECASE)
+            if match:
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    pass
+        return fallback
+
+    def _create_grouped_3d_dose_bundle(self):
         start_dir = str(self._multi_root or self._workspace or Path.cwd())
         root_str = QFileDialog.getExistingDirectory(
             self,
-            "Select cases or batch root for the MATLAB 3D dose browser script",
+            "Select root folder to collect grouped 3D dose files",
             start_dir,
         )
         if not root_str:
@@ -31718,31 +33325,110 @@ class AnalysisTab(QWidget):
         root = Path(root_str)
         groups = self._collect_3d_dose_case_groups(root)
         if not groups:
-            QMessageBox.information(self, "3D Dose", f"No 3d-dose*.dat files were found under:\n{root}")
+            QMessageBox.information(self, "Group 3D Dose", f"No 3d-dose*.dat files were found under:\n{root}")
             return
-        stripped = 0
-        for _case_folder, dose_files in groups:
-            for path in dose_files:
-                self._strip_3d_dose_headers_in_place(path)
-                stripped += 1
-        out_path = self._default_browser_3d_dose_script_path(root)
-        script_text = self._build_matlab_3d_dose_browser_script()
-        out_path.write_text(script_text, encoding="utf-8")
+        group_dir = root / "3d-dose_group"
+        group_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        used_names = set()
+        manifest = []
+        for idx, (case_folder, dose_files) in enumerate(groups, start=1):
+            chosen = next((p for p in dose_files if p.name.lower() == "3d-dose.dat"), dose_files[0])
+            case_number = self._case_number_from_3d_dose_path(chosen, fallback=idx)
+            target_name = f"3d-dose_case{case_number}.dat"
+            if target_name.lower() in used_names:
+                suffix = 2
+                while f"3d-dose_case{case_number}_{suffix}.dat".lower() in used_names:
+                    suffix += 1
+                target_name = f"3d-dose_case{case_number}_{suffix}.dat"
+            used_names.add(target_name.lower())
+            target_path = group_dir / target_name
+            shutil.copy2(chosen, target_path)
+            copied += 1
+            manifest.append(
+                {
+                    "case_folder": str(case_folder),
+                    "source_3d_dose": str(chosen),
+                    "group_file": str(target_path),
+                    "case_number": case_number,
+                }
+            )
+        manifest_path = group_dir / "3d-dose_group_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        target_center = self._prompt_3d_dose_target_center("Grouped 3D Dose Target Center")
+        if target_center is None:
+            return
+        script_path = self._default_group_3d_dose_script_path(group_dir)
+        script_path.write_text(self._build_matlab_3d_dose_group_script(target_center), encoding="utf-8")
         self._log_analysis(
-            f"3D dose browser script written: {out_path} (prepared {stripped} 3d-dose file(s) under {root})",
+            f"Grouped 3D dose folder created: {group_dir} ({copied} file(s)); MATLAB script written: {script_path}; target center={target_center}",
             "ok",
         )
         self.summary.setPlainText(
-            f"3D dose browser script saved:\n{out_path}\n\n"
+            f"Grouped 3D dose folder created:\n{group_dir}\n\n"
+            f"Copied files: {copied}\n"
+            f"Manifest:\n{manifest_path}\n\n"
+            f"Target center: ({target_center[0]:g}, {target_center[1]:g}, {target_center[2]:g})\n\n"
+            f"MATLAB script:\n{script_path}\n\n"
+            "Run the group script in MATLAB to create total profile and plane PNG files from all copied 3d-dose files."
+        )
+        QMessageBox.information(
+            self,
+            "Group 3D Dose",
+            f"Grouped 3D dose folder created:\n{group_dir}\n\nCopied {copied} 3d-dose file(s).\n"
+            f"Target center: ({target_center[0]:g}, {target_center[1]:g}, {target_center[2]:g})\n"
+            f"MATLAB script:\n{script_path}",
+        )
+
+    def _create_matlab_3d_dose_browser_script(self):
+        start_dir = str(self._multi_root or self._workspace or Path.cwd())
+        root_str = QFileDialog.getExistingDirectory(
+            self,
+            "Select cases or batch root for the MATLAB batch analysis script",
+            start_dir,
+        )
+        if not root_str:
+            return
+        root = Path(root_str)
+        groups = self._collect_3d_dose_case_groups(root)
+        found = sum(len(dose_files) for _case_folder, dose_files in groups)
+        geo_default = _analysis_preferred_geo_file(root)
+        label_config = self._prompt_3d_dose_geo_label_config(
+            default_geo=geo_default,
+            title="Batch Analysis Geometry Labels",
+        )
+        if label_config is None:
+            return
+        target_center = tuple(label_config.get("target_center") or (4.0, 3.0, -2.2))
+        label_specs = list(label_config.get("label_specs") or [])
+        geo_path = str(label_config.get("geo_path") or "")
+        out_path = self._default_browser_3d_dose_script_path(root)
+        try:
+            script_text = self._build_matlab_batch_analysis_script(target_center, label_specs)
+        except Exception as exc:
+            QMessageBox.warning(self, "3D Dose", f"Could not load the batch analysis MATLAB template:\n{exc}")
+            return
+        out_path.write_text(script_text, encoding="utf-8")
+        self._log_analysis(
+            f"Batch analysis MATLAB script written: {out_path} (found {found} 3d-dose file(s) under {root}); target center={target_center}; geometry labels={len(label_specs)} from {geo_path or 'manual selection'}",
+            "ok",
+        )
+        self.summary.setPlainText(
+            f"Batch analysis MATLAB script saved:\n{out_path}\n\n"
             f"Root:\n{root}\n\n"
-            f"Prepared 3d-dose files: {stripped}\n"
-            "Run the script in MATLAB to choose a root folder, scan its subfolders recursively, and save PNG plots beside each 3d-dose.dat."
+            f"Found 3d-dose files: {found}\n"
+            f"Target center: ({target_center[0]:g}, {target_center[1]:g}, {target_center[2]:g})\n"
+            f"Geometry label source:\n{geo_path or '(none)'}\n"
+            f"Selected labels: {len(label_specs)}\n"
+            "Run the script in MATLAB to choose recursive Excel and 3D-dose analysis modes for the selected batch/case root."
         )
         QMessageBox.information(
             self,
             "3D Dose",
-            f"3D dose browser script saved:\n{out_path}\n\n"
-            f"Prepared {stripped} 3d-dose file(s) under:\n{root}",
+            f"Batch analysis MATLAB script saved:\n{out_path}\n\n"
+            f"Found {found} 3d-dose file(s) under:\n{root}\n\n"
+            f"Target center: ({target_center[0]:g}, {target_center[1]:g}, {target_center[2]:g})\n"
+            f"Selected geometry labels: {len(label_specs)}",
         )
 
     def _create_matlab_3d_dose_case_script(self):
@@ -31754,20 +33440,19 @@ class AnalysisTab(QWidget):
         if not paths:
             QMessageBox.information(self, "3D Dose", f"No 3d-dose*.dat files were found in:\n{folder}")
             return
-        prepared = [self._strip_3d_dose_headers_in_place(path) for path in paths]
         out_path = self._default_case_3d_dose_script_path(folder)
-        script_text = self._build_matlab_3d_dose_script(prepared, out_path.parent)
+        script_text = self._build_matlab_3d_dose_script(paths, out_path.parent)
         out_path.write_text(script_text, encoding="utf-8")
         self._log_analysis(f"Case 3D dose script written: {out_path}", "ok")
         self.summary.setPlainText(
             f"Case 3D dose script saved:\n{out_path}\n\n"
-            "Prepared files:\n"
-            + "\n".join(str(path) for path in prepared)
+            "Referenced files:\n"
+            + "\n".join(str(path) for path in paths)
         )
         QMessageBox.information(
             self,
             "3D Dose",
-            f"Case 3D dose script saved:\n{out_path}\n\nPrepared {len(prepared)} 3d-dose file(s).",
+            f"Case 3D dose script saved:\n{out_path}\n\nReferenced {len(paths)} 3d-dose file(s).",
         )
 
     def _export_matlab_3d_dose_script(self):
@@ -31777,8 +33462,9 @@ class AnalysisTab(QWidget):
         mode_box = QMessageBox(self)
         mode_box.setWindowTitle("3D Dose")
         mode_box.setText("Choose which MATLAB 3D dose helper to create.")
-        btn_browser = mode_box.addButton("Create Dose Browser", QMessageBox.ButtonRole.AcceptRole)
+        btn_browser = mode_box.addButton("Create Batch Analysis", QMessageBox.ButtonRole.AcceptRole)
         btn_case = mode_box.addButton("Create Case Script", QMessageBox.ButtonRole.ActionRole)
+        btn_group = mode_box.addButton("Group 3D Dose", QMessageBox.ButtonRole.ActionRole)
         btn_cancel = mode_box.addButton(QMessageBox.StandardButton.Cancel)
         mode_box.setDefaultButton(btn_browser)
         mode_box.exec()
@@ -31788,6 +33474,9 @@ class AnalysisTab(QWidget):
             return
         if clicked is btn_case:
             self._create_matlab_3d_dose_case_script()
+            return
+        if clicked is btn_group:
+            self._create_grouped_3d_dose_bundle()
 
     def _load_material_densities(self, folder):
         """Load material densities from *folder*, falling back to ancestor
@@ -32439,14 +34128,7 @@ class AnalysisTab(QWidget):
             self.lbl_dose_xlsx.setText("Dose workbook: none selected")
             self.lbl_dose_xlsx.setToolTip("")
             return
-        display_path = str(self._dose_xlsx)
-        if self._project_root:
-            try:
-                root = Path(self._project_root).resolve()
-                rel = str(Path(self._dose_xlsx).resolve().relative_to(root)).replace("/", "\\")
-                display_path = f"{root.name}\\{rel}" if rel else root.name
-            except Exception:
-                display_path = str(self._dose_xlsx)
+        display_path = self._compact_analysis_path_text(self._dose_xlsx, max_parts=5, max_leaf_chars=58)
         summary = self._dose_workbook_config_summary()
         if summary:
             self.lbl_dose_xlsx.setText(f"Dose workbook: {display_path} ({state_text}; {summary})")
@@ -32843,20 +34525,23 @@ class AnalysisTab(QWidget):
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "Dose")).strip("._-")
         return stem or "Dose"
 
-    def _multi_append_workbook_path(self, root):
+    def _multi_append_workbook_path(self, root, mode="full"):
         root = Path(root)
         root_name = self._safe_filename_stem(root.name or "root")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return root / f"{root_name}_{stamp}_Dose.xlsx"
+        suffix = "Dose_filtered" if str(mode or "").lower() == "filtered" else "Dose"
+        return root / f"{root_name}_{stamp}_{suffix}.xlsx"
 
     def _archive_previous_multi_appends(self, root, new_path):
         root = Path(root)
         old_dir = root / "old appends"
         moved = 0
-        for path in root.glob("*_Dose.xlsx"):
-            if path.resolve() == Path(new_path).resolve():
-                continue
+        for path in root.iterdir():
             if not path.is_file():
+                continue
+            if not (path.name.endswith("_Dose.xlsx") or path.name.endswith("_Dose_filtered.xlsx")):
+                continue
+            if path.resolve() == Path(new_path).resolve():
                 continue
             try:
                 old_dir.mkdir(parents=True, exist_ok=True)
@@ -32880,6 +34565,106 @@ class AnalysisTab(QWidget):
     def _total_rows_only(self, rows):
         idx = self._dose_body_column_index()
         return [row for row in rows if len(row) > idx and str(row[idx]).upper() == "TOTAL"]
+
+    def _case_total_row_from_body_rows(self, case, body_rows):
+        idx = self._dose_body_column_index()
+        rows = [list(row) for row in body_rows if len(row) > idx and str(row[idx]).upper() != "TOTAL"]
+        if not rows:
+            return None
+        total_edep = 0.0
+        total_dedep_sq = 0.0
+        total_mass = 0.0
+        missing_mass = False
+        for row in rows:
+            try:
+                total_edep += float(row[3] or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                dedep = float(row[4] or 0.0)
+                total_dedep_sq += dedep ** 2
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_mass += float(row[5])
+            except (TypeError, ValueError):
+                missing_mass = True
+        total_dedep = total_dedep_sq ** 0.5
+        total_error = abs(total_dedep / total_edep * 100.0) if total_edep else ""
+        total_mass_value = ""
+        total_dose, total_ddose = ("", "")
+        total_dose_ev_g, total_ddose_ev_g = ("", "")
+        if not missing_mass and total_mass > 0:
+            total_mass_value = total_mass
+            total_dose, total_ddose = self._dose_values(total_edep, total_dedep, total_mass)
+            total_dose_ev_g, total_ddose_ev_g = self._dose_values_ev_per_g(total_edep, total_dedep, total_mass)
+        sample = rows[0]
+        n_ref = sample[13] if len(sample) > 13 else ""
+        t_ref = sample[14] if len(sample) > 14 else ""
+        target_err = sample[15] if len(sample) > 15 else f"{self._target_error_value():g}"
+        n_target = ""
+        t_target = ""
+        try:
+            target_err_value = float(target_err)
+            n_ref_value = float(n_ref)
+            t_ref_value = float(t_ref)
+            if (
+                total_error not in ("", None)
+                and target_err_value > 0
+                and n_ref_value > 0
+                and t_ref_value > 0
+                and abs(total_edep) > 1e-20
+            ):
+                scale = (float(total_error) / target_err_value) ** 2
+                n_target = n_ref_value * scale
+                t_target = t_ref_value * scale
+        except (TypeError, ValueError, ZeroDivisionError):
+            n_target = ""
+            t_target = ""
+        total_edep_j = total_edep * self.EV_TO_J
+        total_dedep_j = total_dedep * self.EV_TO_J
+        quality = self._risk_quality_label(total_error, near_zero=abs(total_edep) <= 1e-20)
+        return [
+            case,
+            "TOTAL",
+            "",
+            total_edep,
+            total_dedep,
+            total_mass_value,
+            total_dose_ev_g,
+            total_ddose_ev_g,
+            total_edep_j,
+            total_dedep_j,
+            total_error,
+            total_dose,
+            total_ddose,
+            n_ref,
+            t_ref,
+            target_err,
+            n_target,
+            t_target,
+            quality,
+            "Total",
+        ]
+
+    def _component_filtered_rows(self, rows, selected_components):
+        wanted = {
+            str(name or "").strip().lower()
+            for name in (selected_components or [])
+            if str(name or "").strip()
+        }
+        if not wanted:
+            return []
+        body_rows = self._body_rows_only(rows)
+        filtered = [
+            list(row) for row in body_rows
+            if len(row) > 2 and str(row[2] or "").strip().lower() in wanted
+        ]
+        if not filtered:
+            return []
+        case = str(filtered[0][0] or "")
+        total_row = self._case_total_row_from_body_rows(case, filtered)
+        return filtered + ([total_row] if total_row else [])
 
     def _sync_totals_sheet(self, wb, rows):
         ws = wb["TOTALS"] if "TOTALS" in wb.sheetnames else wb.create_sheet("TOTALS")
@@ -32914,6 +34699,46 @@ class AnalysisTab(QWidget):
             ws = wb.create_sheet(self._safe_sheet_title(sheet_title, wb.sheetnames))
         self._normalize_dose_sheet_headers(ws)
         return ws
+
+    def _component_names_for_folder(self, folder):
+        folder = Path(folder)
+        res_path = folder / "penmain-res.dat"
+        if not res_path.exists():
+            return []
+        try:
+            self._load_geo_context(folder)
+        except Exception:
+            pass
+        try:
+            text = _decode_text_bytes(res_path.read_bytes())
+        except Exception:
+            return []
+        body_re = re.compile(
+            r"^\s*Body\s+(\d+)\s+\.+\s+([+\-]?\d+\.\d+E[+\-]\d+)\s+\+-\s+([+\-]?\d+\.\d+E[+\-]\d+)\s+eV\s+\(effic\.\s*=\s*([+\-]?\d+\.\d+E[+\-]\d+)\)",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        names = []
+        seen = set()
+        for match in body_re.finditer(text):
+            body_id = int(match.group(1))
+            geo_body = self._geo_body_for_result_id(body_id)
+            label = (geo_body.get("label", "").strip() if geo_body else "") or f"Body {body_id}"
+            key = label.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                names.append(label)
+        return names
+
+    def _available_components_for_workspaces(self, workspaces):
+        ordered = []
+        seen = set()
+        for folder in workspaces:
+            for name in self._component_names_for_folder(folder):
+                key = str(name or "").strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    ordered.append(name)
+        return ordered
 
     def _multi_append_options_dialog(self, workspaces):
         dlg = QDialog(self)
@@ -33000,6 +34825,112 @@ class AnalysisTab(QWidget):
                     title = sheet.text().strip() or "_".join(keywords)
                     specs.append({"keywords": keywords, "sheet": title})
         return normal_chk.isChecked(), splits_chk.isChecked(), specs
+
+    def _batch_dose_export_options_dialog(self, workspaces):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Batch Dose Export")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(760)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        component_names = self._available_components_for_workspaces(workspaces)
+        hint = QLabel(
+            f"Detected {len(workspaces)} case(s). Choose a full workbook with all components, or a filtered workbook "
+            "that keeps only selected components and recalculates TOTALS from those rows."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"]))
+        lay.addWidget(hint)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Export mode:"))
+        mode_combo = QComboBox()
+        mode_combo.addItem("Full workbook (all components)", "full")
+        mode_combo.addItem("Filtered workbook (selected components + totals)", "filtered")
+        mode_combo.setStyleSheet(combo_css())
+        mode_row.addWidget(mode_combo, 1)
+        lay.addLayout(mode_row)
+
+        splits_chk = QCheckBox("Include individual split runs (folders with split_run_manifest.json)")
+        splits_chk.setChecked(False)
+        splits_chk.setToolTip(
+            "When unchecked, individual split-run folders are skipped - only regular cases and "
+            "manually-combined grouped results are appended. Check this to include every split run as its own row."
+        )
+        splits_chk.setStyleSheet(checkbox_css())
+        lay.addWidget(splits_chk)
+
+        comp_box = QGroupBox("Components For Filtered Workbook")
+        comp_box.setStyleSheet(
+            f"QGroupBox {{ color:{P['accent']}; border:1px solid {P['border']}; border-radius:4px; margin-top:8px; padding:8px; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin; left:8px; padding:0 4px; }}"
+        )
+        comp_lay = QVBoxLayout(comp_box)
+        comp_note = QLabel(
+            "Choose the body/component labels to keep. The workbook main sheet will include only those rows, and TOTALS will be recalculated from them."
+        )
+        comp_note.setWordWrap(True)
+        comp_note.setStyleSheet(label_css(P["fg2"]))
+        comp_lay.addWidget(comp_note)
+        comp_list = QListWidget()
+        comp_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        comp_list.setStyleSheet(
+            f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{P['sel']}; color:{P['fg']}; }}"
+        )
+        for name in component_names:
+            comp_list.addItem(QListWidgetItem(name))
+        comp_lay.addWidget(comp_list, 1)
+        comp_btns = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_all.setStyleSheet(btn_css())
+        btn_clear = QPushButton("Clear")
+        btn_clear.setStyleSheet(btn_css())
+        comp_btns.addWidget(btn_all)
+        comp_btns.addWidget(btn_clear)
+        comp_btns.addStretch(1)
+        comp_lay.addLayout(comp_btns)
+        lay.addWidget(comp_box, 1)
+
+        def _select_all_components():
+            for i in range(comp_list.count()):
+                comp_list.item(i).setSelected(True)
+
+        def _clear_components():
+            comp_list.clearSelection()
+
+        btn_all.clicked.connect(_select_all_components)
+        btn_clear.clicked.connect(_clear_components)
+        if component_names:
+            _select_all_components()
+
+        def _refresh_component_box():
+            filtered = mode_combo.currentData() == "filtered"
+            comp_box.setVisible(filtered)
+            comp_box.setEnabled(filtered)
+
+        mode_combo.currentIndexChanged.connect(_refresh_component_box)
+        _refresh_component_box()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        mode = str(mode_combo.currentData() or "full")
+        selected_components = []
+        if mode == "filtered":
+            selected_components = [item.text().strip() for item in comp_list.selectedItems() if item.text().strip()]
+            if not selected_components:
+                QMessageBox.warning(dlg, "No components selected", "Select at least one component for the filtered workbook.")
+                return None
+        return {
+            "mode": mode,
+            "include_splits": splits_chk.isChecked(),
+            "components": selected_components,
+        }
 
     def _mass_lookup_from_workbook(self):
         if not self._dose_xlsx or not self._dose_xlsx.exists():
@@ -34905,11 +36836,13 @@ class AnalysisTab(QWidget):
                 f"No completed case {mode} with penmain-res.dat were found in the selected case root.",
             )
             return
-        options = self._multi_append_options_dialog(workspaces)
+        options = self._batch_dose_export_options_dialog(workspaces)
         if options is None:
             self._log_analysis("Multi Append canceled in options dialog.", "warn")
             return
-        normal_append, include_splits, group_specs = options
+        export_mode = str(options.get("mode") or "full")
+        include_splits = bool(options.get("include_splits"))
+        selected_components = list(options.get("components") or [])
         if not include_splits:
             before = len(workspaces)
             workspaces = [
@@ -34925,10 +36858,10 @@ class AnalysisTab(QWidget):
                 )
         self._log_analysis(
             f"Multi Append started: case_root={root}; {len(workspaces)} case(s) after split filter; "
-            f"normal={normal_append}; include_splits={include_splits}; groups={len(group_specs)}.",
+            f"mode={export_mode}; include_splits={include_splits}; selected_components={len(selected_components)}.",
             "info",
         )
-        xlsx_path = self._multi_append_workbook_path(root)
+        xlsx_path = self._multi_append_workbook_path(root, export_mode)
         archived = self._archive_previous_multi_appends(root, xlsx_path)
         if archived:
             self._log_analysis(f"Archived {archived} previous multi append workbook(s) to 'old appends'.", "info")
@@ -34951,8 +36884,6 @@ class AnalysisTab(QWidget):
         self._update_dose_xlsx_label("multi append")
         processed = 0
         replaced_rows = 0
-        grouped_rows = 0
-        group_sheets = set()
         skipped = []
         try:
             for folder in workspaces:
@@ -34969,24 +36900,21 @@ class AnalysisTab(QWidget):
                     continue
                 self._refresh_dose_columns()
                 case, rows = self._dose_rows_for_current_results()
-                body_rows = self._body_rows_only(rows)
+                rows_for_export = rows
+                body_rows = self._body_rows_only(rows_for_export)
+                if export_mode == "filtered":
+                    rows_for_export = self._component_filtered_rows(rows, selected_components)
+                    body_rows = self._body_rows_only(rows_for_export)
+                    if not body_rows:
+                        self._log_analysis(f"[{folder.name}] skipped (no matching selected components).", "warn")
+                        skipped.append(folder.name)
+                        continue
                 removed = 0
-                if normal_append:
-                    removed = self._remove_case_rows(ws, case)
-                    replaced_rows += removed
-                    self._remove_total_rows_from_sheet(ws)
-                    self._append_rows_to_sheet(ws, body_rows)
-                self._sync_totals_sheet(wb, rows)
-                folder_key = folder.name.lower()
-                for spec in group_specs:
-                    keywords = [str(k).lower() for k in spec.get("keywords", []) if str(k).strip()]
-                    if keywords and all(keyword in folder_key for keyword in keywords):
-                        group_ws = self._ensure_dose_sheet(wb, spec.get("sheet") or "_".join(keywords))
-                        self._remove_case_rows(group_ws, case)
-                        self._remove_total_rows_from_sheet(group_ws)
-                        self._append_rows_to_sheet(group_ws, body_rows)
-                        group_sheets.add(group_ws.title)
-                        grouped_rows += len(body_rows)
+                removed = self._remove_case_rows(ws, case)
+                replaced_rows += removed
+                self._remove_total_rows_from_sheet(ws)
+                self._append_rows_to_sheet(ws, body_rows)
+                self._sync_totals_sheet(wb, rows_for_export)
                 self._log_analysis(
                     f"[{folder.name}] case '{case}': removed {removed} old main row(s), appended {len(body_rows)} body row(s); total synced.",
                     "ok",
@@ -34994,10 +36922,6 @@ class AnalysisTab(QWidget):
                 processed += 1
             self._set_dose_column_widths(ws)
             self._apply_dose_quality_and_formatting(ws)
-            for sheet_name in group_sheets:
-                group_ws = wb[sheet_name]
-                self._set_dose_column_widths(group_ws)
-                self._apply_dose_quality_and_formatting(group_ws)
             wb.save(xlsx_path)
         except PermissionError:
             self._log_analysis(f"Multi Append failed: workbook is open -> {xlsx_path}", "err")
@@ -35011,16 +36935,15 @@ class AnalysisTab(QWidget):
             self._dose_xlsx_user_selected = True
             self._update_dose_xlsx_label("locked")
         msg = f"Updated {processed} case(s) in:\n{xlsx_path}\n\nReplaced {replaced_rows} existing main-sheet row(s)."
-        if group_sheets:
-            msg += "\n\nGrouped sheets:\n" + "\n".join(sorted(group_sheets))
-            msg += f"\nGrouped body rows written: {grouped_rows}"
+        if export_mode == "filtered" and selected_components:
+            msg += "\n\nFiltered components:\n" + "\n".join(selected_components)
         if skipped:
-            msg += "\n\nSkipped without body results:\n" + "\n".join(skipped[:12])
+            msg += "\n\nSkipped cases:\n" + "\n".join(skipped[:12])
             if len(skipped) > 12:
                 msg += f"\n...and {len(skipped) - 12} more"
         self.status_message.emit(f"Multi append complete: {processed} case(s)")
         self._log_analysis(
-            f"Multi Append complete: processed {processed}, replaced {replaced_rows}, grouped rows {grouped_rows}, skipped {len(skipped)}.",
+            f"Multi Append complete: processed {processed}, replaced {replaced_rows}, mode={export_mode}, skipped {len(skipped)}.",
             "ok",
         )
         QMessageBox.information(self, "Multi Append complete", msg)
