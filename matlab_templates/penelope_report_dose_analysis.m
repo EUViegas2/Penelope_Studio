@@ -155,6 +155,7 @@ end
 
 validMask = ~isnan(ALPHA);
 caseNames = doseData.case_names(validMask);
+sourceTypes = doseData.source_types(validMask);
 componentNames = doseData.component_names(validMask);
 edepEv = doseData.edep_ev(validMask);
 dEdepEv = doseData.dedep_ev(validMask);
@@ -166,9 +167,11 @@ THETA = THETA(validMask);
 PHI = PHI(validMask);
 ALPHA = ALPHA(validMask);
 CASEID = CASEID(validMask);
+sourceTypes = fill_empty_labels_r2015(sourceTypes, 'Unknown source');
 
 alphas = unique(ALPHA);
 
+totalSourceType = {};
 totalAlpha = [];
 totalComponent = {};
 totalNFields = [];
@@ -183,32 +186,37 @@ totaldDoseGy = [];
 row = 0;
 for a = 1:numel(alphas)
     alphaMask = (ALPHA == alphas(a));
-    comps = unique(componentNames(alphaMask));
-    for c = 1:numel(comps)
-        compMask = alphaMask & strcmp(componentNames, comps{c});
-        row = row + 1;
-        totalAlpha(row, 1) = alphas(a); %#ok<AGROW>
-        totalComponent{row, 1} = comps{c}; %#ok<AGROW>
-        totalNFields(row, 1) = sum(compMask); %#ok<AGROW>
-        totalEdepEv(row, 1) = sum(edepEv(compMask)); %#ok<AGROW>
-        totaldEdepEv(row, 1) = sqrt(sum(dEdepEv(compMask).^2)); %#ok<AGROW>
-        totalDoseEvg(row, 1) = sum(doseEvg(compMask)); %#ok<AGROW>
-        totaldDoseEvg(row, 1) = sqrt(sum(dDoseEvg(compMask).^2)); %#ok<AGROW>
-        if totalDoseEvg(row, 1) ~= 0
-            totalErrPct(row, 1) = 100 * totaldDoseEvg(row, 1) / totalDoseEvg(row, 1); %#ok<AGROW>
-        else
-            totalErrPct(row, 1) = NaN; %#ok<AGROW>
+    sourceList = unique(sourceTypes(alphaMask));
+    for s = 1:numel(sourceList)
+        sourceMask = alphaMask & strcmp(sourceTypes, sourceList{s});
+        comps = unique(componentNames(sourceMask));
+        for c = 1:numel(comps)
+            compMask = sourceMask & strcmp(componentNames, comps{c});
+            row = row + 1;
+            totalSourceType{row, 1} = sourceList{s}; %#ok<AGROW>
+            totalAlpha(row, 1) = alphas(a); %#ok<AGROW>
+            totalComponent{row, 1} = comps{c}; %#ok<AGROW>
+            totalNFields(row, 1) = sum(compMask); %#ok<AGROW>
+            totalEdepEv(row, 1) = sum(edepEv(compMask)); %#ok<AGROW>
+            totaldEdepEv(row, 1) = sqrt(sum(dEdepEv(compMask).^2)); %#ok<AGROW>
+            totalDoseEvg(row, 1) = sum(doseEvg(compMask)); %#ok<AGROW>
+            totaldDoseEvg(row, 1) = sqrt(sum(dDoseEvg(compMask).^2)); %#ok<AGROW>
+            if totalDoseEvg(row, 1) ~= 0
+                totalErrPct(row, 1) = 100 * totaldDoseEvg(row, 1) / totalDoseEvg(row, 1); %#ok<AGROW>
+            else
+                totalErrPct(row, 1) = NaN; %#ok<AGROW>
+            end
+            totalDoseGy(row, 1) = sum(doseGy(compMask)); %#ok<AGROW>
+            totaldDoseGy(row, 1) = sqrt(sum(dDoseGy(compMask).^2)); %#ok<AGROW>
         end
-        totalDoseGy(row, 1) = sum(doseGy(compMask)); %#ok<AGROW>
-        totaldDoseGy(row, 1) = sqrt(sum(dDoseGy(compMask).^2)); %#ok<AGROW>
     end
 end
 
 Totals = table( ...
-    totalAlpha, totalComponent, totalNFields, totalEdepEv, totaldEdepEv, ...
+    totalSourceType, totalAlpha, totalComponent, totalNFields, totalEdepEv, totaldEdepEv, ...
     totalDoseEvg, totaldDoseEvg, totalErrPct, totalDoseGy, totaldDoseGy, ...
     'VariableNames', { ...
-        'Alpha', 'Component', 'NFields', 'Edep_eV', 'dEdep_eV', ...
+        'SourceType', 'Alpha', 'Component', 'NFields', 'Edep_eV', 'dEdep_eV', ...
         'Dose_eVg', 'dDose_eVg', 'Error_pct', 'Dose_Gy', 'dDose_Gy' ...
     });
 writetable(Totals, fullfile(outDir, 'body_totals_by_alpha.csv'));
@@ -221,21 +229,25 @@ fig = figure('Color', 'w');
 hold on;
 legendLabels = {};
 for a = 1:numel(alphas)
-    Ka = K(K.Alpha == alphas(a), :);
-    orderedIdx = zeros(numel(keyNames), 1);
-    for j = 1:numel(keyNames)
-        matchIdx = find(strcmp(Ka.Component, keyNames{j}), 1, 'first');
-        if ~isempty(matchIdx)
-            orderedIdx(j) = matchIdx;
+    alphaMask = (K.Alpha == alphas(a));
+    sourceList = unique(K.SourceType(alphaMask));
+    for s = 1:numel(sourceList)
+        Ka = K(alphaMask & strcmp(K.SourceType, sourceList{s}), :);
+        orderedIdx = zeros(numel(keyNames), 1);
+        for j = 1:numel(keyNames)
+            matchIdx = find(strcmp(Ka.Component, keyNames{j}), 1, 'first');
+            if ~isempty(matchIdx)
+                orderedIdx(j) = matchIdx;
+            end
         end
+        orderedIdx = orderedIdx(orderedIdx > 0);
+        if isempty(orderedIdx)
+            continue;
+        end
+        Ka = Ka(orderedIdx, :);
+        errorbar(1:height(Ka), Ka.Dose_eVg, Ka.dDose_eVg, 'o-');
+        legendLabels{end + 1} = sprintf('%s | alpha = %.4g%c', display_source_type_r2015(sourceList{s}), alphas(a), grau); %#ok<AGROW>
     end
-    orderedIdx = orderedIdx(orderedIdx > 0);
-    if isempty(orderedIdx)
-        continue;
-    end
-    Ka = Ka(orderedIdx, :);
-    errorbar(1:height(Ka), Ka.Dose_eVg, Ka.dDose_eVg, 'o-');
-    legendLabels{end + 1} = sprintf('alpha = %.4g%c', alphas(a), grau); %#ok<AGROW>
 end
 set(gca, 'YScale', 'log', 'XTick', 1:3, 'XTickLabel', keyNames);
 ylabel('Dose total (eV/g)');
@@ -249,6 +261,7 @@ close(fig);
 
 cases = unique(caseNames);
 rankCase = {};
+rankSourceType = {};
 rankCaseID = [];
 rankAlpha = [];
 rankTheta = [];
@@ -271,6 +284,7 @@ for i = 1:numel(cases)
     if ~isempty(tumorIdx) && ~isempty(odIdx) && ~isempty(oeIdx)
         r = r + 1;
         rankCase{r, 1} = cases{i}; %#ok<AGROW>
+        rankSourceType{r, 1} = sourceTypes{tumorIdx}; %#ok<AGROW>
         rankCaseID(r, 1) = CASEID(tumorIdx); %#ok<AGROW>
         rankAlpha(r, 1) = ALPHA(tumorIdx); %#ok<AGROW>
         rankTheta(r, 1) = THETA(tumorIdx); %#ok<AGROW>
@@ -284,39 +298,54 @@ for i = 1:numel(cases)
 end
 
 R = table( ...
-    rankCase, rankCaseID, rankAlpha, rankTheta, rankPhi, ...
+    rankCase, rankSourceType, rankCaseID, rankAlpha, rankTheta, rankPhi, ...
     rankTumorDose, rankRightEyeDose, rankLeftEyeDose, rankBothPct, rankMaxPct, ...
     'VariableNames', { ...
-        'Case', 'CaseID', 'Alpha', 'THETA', 'PHI', ...
+        'Case', 'SourceType', 'CaseID', 'Alpha', 'THETA', 'PHI', ...
         'TumorDose_eVg', 'RightEyeDose_eVg', 'LeftEyeDose_eVg', ...
         'BothEyes_Tumor_pct', 'MaxEye_Tumor_pct' ...
     });
 if ~isempty(R)
-    R = sortrows(R, {'Alpha', 'BothEyes_Tumor_pct'});
+    R = sortrows(R, {'Alpha', 'SourceType', 'BothEyes_Tumor_pct'});
 end
 writetable(R, fullfile(outDir, 'angle_ranking_by_alpha.csv'));
 
 for a = 1:numel(alphas)
-    Ra = R(R.Alpha == alphas(a), :);
-    if isempty(Ra)
-        continue;
+    sourceList = unique(R.SourceType(R.Alpha == alphas(a)));
+    multiSource = numel(sourceList) > 1;
+    for s = 1:numel(sourceList)
+        Ra = R(R.Alpha == alphas(a) & strcmp(R.SourceType, sourceList{s}), :);
+        if isempty(Ra)
+            continue;
+        end
+        labels = cell(height(Ra), 1);
+        for j = 1:height(Ra)
+            labels{j} = sprintf('T%.0f P%.0f', Ra.THETA(j), Ra.PHI(j));
+        end
+        tickIdx = 1:height(Ra);
+        if height(Ra) > 16
+            step = max(1, ceil(height(Ra) / 16));
+            tickIdx = unique([1:step:height(Ra), height(Ra)]);
+        end
+        figWidth = max(960, 52 * height(Ra));
+        fig = figure('Color', 'w', 'Position', [100, 100, figWidth, 520]);
+        bar(Ra.BothEyes_Tumor_pct);
+        set(gca, 'XTick', tickIdx, 'XTickLabel', labels(tickIdx));
+        try
+            set(gca, 'XTickLabelRotation', 45);
+        catch
+        end
+        ylabel('(Dose OD + OE)/Dose no tumor (%)');
+        title(sprintf(['Ordena' ced 'o angular, alfa = %.4g%c, fonte = %s'], alphas(a), grau, display_source_type_r2015(sourceList{s})));
+        grid on;
+        if multiSource
+            outName = ['angle_ranking_alpha_', strrep(num2str(alphas(a)), '.', 'p'), '_', safe_file_token_r2015(sourceList{s}), '.png'];
+        else
+            outName = ['angle_ranking_alpha_', strrep(num2str(alphas(a)), '.', 'p'), '.png'];
+        end
+        saveas(fig, fullfile(outDir, outName));
+        close(fig);
     end
-    labels = cell(height(Ra), 1);
-    for j = 1:height(Ra)
-        labels{j} = sprintf('T%.0f_P%.0f', Ra.THETA(j), Ra.PHI(j));
-    end
-    fig = figure('Color', 'w');
-    bar(Ra.BothEyes_Tumor_pct);
-    set(gca, 'XTick', 1:height(Ra), 'XTickLabel', labels);
-    try
-        set(gca, 'XTickLabelRotation', 60);
-    catch
-    end
-    ylabel('(Dose OD + OE)/Dose no tumor (%)');
-    title(sprintf(['Ordena' ced 'o angular, alfa = %.4g%c'], alphas(a), grau));
-    grid on;
-    saveas(fig, fullfile(outDir, ['angle_ranking_alpha_', strrep(num2str(alphas(a)), '.', 'p'), '.png']));
-    close(fig);
 end
 end
 
@@ -393,6 +422,7 @@ headers = raw(1, :);
 rows = raw(2:end, :);
 
 caseIdx = find_header_index(headers, {'Case'});
+sourceTypeIdx = find_optional_header_index(headers, {'Spectrum Type', 'Source Type', 'SourceType'});
 componentIdx = find_header_index(headers, {'Component'});
 edepIdx = find_header_index(headers, {'Edep (eV)', 'Edep_eV'});
 dedepIdx = find_header_index(headers, {'dE (eV)', 'dE_eV'});
@@ -402,6 +432,11 @@ doseGyIdx = find_header_index(headers, {'Dose (Gy)', 'Dose_Gy'});
 ddoseGyIdx = find_header_index(headers, {'dDose (Gy)', 'dDose_Gy'});
 
 data.case_names = cell_column_to_strings(rows(:, caseIdx));
+if ~isnan(sourceTypeIdx)
+    data.source_types = cell_column_to_strings(rows(:, sourceTypeIdx));
+else
+    data.source_types = repmat({''}, size(rows, 1), 1);
+end
 data.component_names = cell_column_to_strings(rows(:, componentIdx));
 data.edep_ev = cell_column_to_numeric(rows(:, edepIdx));
 data.dedep_ev = cell_column_to_numeric(rows(:, dedepIdx));
@@ -412,6 +447,7 @@ data.ddose_gy = cell_column_to_numeric(rows(:, ddoseGyIdx));
 
 keep = ~cellfun(@isempty, data.case_names) & ~cellfun(@isempty, data.component_names);
 data.case_names = data.case_names(keep);
+data.source_types = data.source_types(keep);
 data.component_names = data.component_names(keep);
 data.edep_ev = data.edep_ev(keep);
 data.dedep_ev = data.dedep_ev(keep);
@@ -433,6 +469,19 @@ for i = 1:numel(headers)
     end
 end
 error('Could not find expected Excel column header.');
+end
+
+function idx = find_optional_header_index(headers, candidates)
+idx = NaN;
+for i = 1:numel(headers)
+    current = normalize_header_name(headers{i});
+    for j = 1:numel(candidates)
+        if strcmp(current, normalize_header_name(candidates{j}))
+            idx = i;
+            return;
+        end
+    end
+end
 end
 
 function out = normalize_header_name(value)
@@ -477,6 +526,35 @@ for i = 1:numel(col)
             values(i) = temp;
         end
     end
+end
+end
+
+function labels = fill_empty_labels_r2015(labels, fallbackLabel)
+labels = labels(:);
+for i = 1:numel(labels)
+    current = '';
+    if ischar(labels{i})
+        current = strtrim(labels{i});
+    end
+    if isempty(current)
+        labels{i} = fallbackLabel;
+    end
+end
+end
+
+function out = display_source_type_r2015(label)
+out = strtrim(char(label));
+if isempty(out)
+    out = 'Unknown source';
+end
+end
+
+function token = safe_file_token_r2015(label)
+token = lower(regexprep(display_source_type_r2015(label), '[^a-z0-9]+', '_'));
+token = regexprep(token, '_+', '_');
+token = regexprep(token, '^_|_$', '');
+if isempty(token)
+    token = 'unknown_source';
 end
 end
 

@@ -1172,6 +1172,9 @@ def entry_css():
         f"QLineEdit:focus {{ border-color:{P['accent']}; }}"
     )
 
+def edit_css():
+    return entry_css()
+
 def combo_css():
     return (
         f"QComboBox {{ background:{P['bg2']}; color:{P['fg']};"
@@ -1209,6 +1212,13 @@ def label_css(color=None, bold=False, size=10):
     c = color or P["fg"]
     b = "font-weight:bold;" if bold else ""
     return f"color:{c}; font-size:{size}pt; {b}"
+
+def tabs_css():
+    return (
+        f"QTabWidget::pane {{ border:1px solid {P['border']}; background:{P['bg2']}; }}"
+        f"QTabBar::tab {{ background:{P['bg2']}; color:{P['fg2']}; padding:6px 12px; }}"
+        f"QTabBar::tab:selected {{ color:{P['accent']}; border-bottom:2px solid {P['accent']}; }}"
+    )
 
 def checkbox_css(color=None):
     c = color or P["fg"]
@@ -17635,11 +17645,179 @@ class SimulationTab(QWidget):
         except Exception:
             return str(target)
 
+    def _normalize_spectrum_type_label(self, value):
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:120]
+
+    def _spectrum_type_metadata_path(self, path_like):
+        if not path_like:
+            return None
+        try:
+            base = Path(path_like)
+        except Exception:
+            return None
+        folder = base if base.is_dir() else base.parent
+        return folder / "penelope_studio_case_metadata.json"
+
+    def _read_spectrum_type_metadata_file(self, path_like):
+        meta_path = self._spectrum_type_metadata_path(path_like)
+        if not meta_path or not meta_path.exists():
+            return ""
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        return self._normalize_spectrum_type_label(payload.get("spectrum_type"))
+
+    def _write_spectrum_type_metadata_file(self, path_like, spectrum_type, input_name=""):
+        meta_path = self._spectrum_type_metadata_path(path_like)
+        if not meta_path:
+            return ""
+        label = self._normalize_spectrum_type_label(spectrum_type)
+        if not label:
+            try:
+                if meta_path.exists():
+                    meta_path.unlink()
+            except Exception:
+                pass
+            return ""
+        payload = {
+            "spectrum_type": label,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if input_name not in (None, ""):
+            payload["input_file"] = Path(str(input_name)).name
+        try:
+            meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            return ""
+        return label
+
+    def _strip_spectrum_type_metadata(self, text):
+        return re.sub(
+            r"^\s*C\s+STUDIO_SPECTRUM_TYPE\s*:.*(?:\r?\n)?",
+            "",
+            str(text or ""),
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+    def _guess_spectrum_type_label(self, in_path=None, geo_path=None, text=""):
+        joined = " ".join(
+            str(part or "")
+            for part in (
+                Path(in_path).name if in_path else "",
+                Path(in_path).parent.name if in_path else "",
+                Path(geo_path).name if geo_path else "",
+                Path(geo_path).parent.name if geo_path else "",
+                text or "",
+            )
+        ).lower()
+        if any(token in joined for token in ("cobalt", "co-60", "co60", "cobalt-60")):
+            return "Cobalt-60 source"
+        if "linac" in joined and "6mev" in joined:
+            return "LINAC 6MeV"
+        if "6mev" in joined:
+            return "LINAC 6MeV"
+        return ""
+
+    def _prompt_spectrum_type_label(self, title="Spectrum Type", default_label="", in_path=None, geo_path=None, text="", free_text_only=False):
+        default_label = self._normalize_spectrum_type_label(default_label)
+        if not default_label:
+            default_label = self._guess_spectrum_type_label(in_path=in_path, geo_path=geo_path, text=text)
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        hint = QLabel(
+            "Choose the spectrum/source type for this case or batch. "
+            "This is saved into the case metadata and exported to dose workbooks and MATLAB batch analysis."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(hint)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        combo = None
+        preset_labels = ["LINAC 6MeV", "Cobalt-60 source", "Other"]
+        other_edit = QLineEdit()
+        other_edit.setStyleSheet(entry_css())
+        other_edit.setPlaceholderText("Describe the source type")
+        if free_text_only:
+            form.addRow("Spectrum type:", other_edit)
+        else:
+            combo = QComboBox()
+            combo.setStyleSheet(combo_css())
+            for label in preset_labels:
+                combo.addItem(label)
+            form.addRow("Spectrum type:", combo)
+            form.addRow("Other:", other_edit)
+        lay.addLayout(form)
+
+        if free_text_only:
+            other_edit.setText(default_label)
+        else:
+            if default_label and default_label in preset_labels[:-1]:
+                combo.setCurrentText(default_label)
+                other_edit.setText("")
+            else:
+                combo.setCurrentText("Other")
+                other_edit.setText(default_label)
+
+            def _refresh_other():
+                is_other = combo.currentText() == "Other"
+                other_edit.setEnabled(is_other)
+                if not is_other:
+                    other_edit.setPlaceholderText("")
+                else:
+                    other_edit.setPlaceholderText("Describe the source type")
+
+            combo.currentTextChanged.connect(lambda _txt: _refresh_other())
+            _refresh_other()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.setStyleSheet(btn_css(P["bg2"]))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if free_text_only:
+            value = self._normalize_spectrum_type_label(other_edit.text())
+        elif combo.currentText() == "Other":
+            value = self._normalize_spectrum_type_label(other_edit.text())
+        else:
+            value = self._normalize_spectrum_type_label(combo.currentText())
+        if not value:
+            QMessageBox.warning(self, title, "Write a spectrum/source type.")
+            return None
+        return value
+
+    def _parse_spectrum_type_metadata(self, text="", source_path=None):
+        label = self._read_spectrum_type_metadata_file(source_path)
+        if label:
+            return label
+        match = re.search(
+            r"^\s*C\s+STUDIO_SPECTRUM_TYPE\s*:\s*(.*?)\s*$",
+            str(text or ""),
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if not match:
+            return ""
+        return self._normalize_spectrum_type_label(match.group(1))
+
+    def _replace_spectrum_type_metadata(self, text, spectrum_type):
+        return self._strip_spectrum_type_metadata(text)
+
     def _serialize_case_variant_spec(self, spec):
         if not isinstance(spec, dict):
             return {}
         data = {}
-        for key in ("case_name", "in_filename", "senerg_kev", "spectr_file", "spectr_db_label"):
+        for key in ("case_name", "in_filename", "senerg_kev", "spectr_file", "spectr_db_label", "spectrum_type"):
             value = spec.get(key, "")
             if str(value or "").strip():
                 data[key] = value
@@ -17944,8 +18122,11 @@ class SimulationTab(QWidget):
         create_workspace_btn.clicked.connect(self._create_case_workspace)
         workspace_row.addWidget(create_workspace_btn)
         edit_case_btn = QToolButton()
-        edit_case_btn.setText("Edit")
-        edit_case_btn.setToolTip("Edit a previously created case or batch by PENELOPE input blocks, either in place or as a duplicated copy with changes.")
+        edit_case_btn.setText("Batch / Copy")
+        edit_case_btn.setToolTip(
+            "Duplicate an existing case, edit a whole batch in place, or duplicate a batch with changes.\n"
+            "Direct in-place case edits are done by opening and editing the .in file itself."
+        )
         edit_case_btn.setStyleSheet(
             f"QToolButton {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; padding:6px 12px; }}"
             f"QToolButton:hover {{ background:{P['bg3']}; border-color:{P['accent']}; }}"
@@ -17956,8 +18137,9 @@ class SimulationTab(QWidget):
             f"QMenu {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; }}"
             f"QMenu::item:selected {{ background:{P['sel']}; }}"
         )
-        edit_case_menu.addAction("Edit Case...", self._edit_case_workspace)
+        edit_case_menu.addAction("Duplicate Case...", self._duplicate_case_workspace)
         edit_case_menu.addAction("Edit Batch...", self._edit_batch_workspace)
+        edit_case_menu.addAction("Duplicate Batch...", self._duplicate_batch_workspace)
         edit_case_btn.setMenu(edit_case_menu)
         workspace_row.addWidget(edit_case_btn)
         split_runs_btn = QPushButton("Split Runs...")
@@ -21243,6 +21425,10 @@ class SimulationTab(QWidget):
             final_spec["sposit"] = [str(v) for v in list(spec.get("sposit") or [])[:3]]
         if spec.get("scone") and len(list(spec.get("scone") or [])) == 3:
             final_spec["scone"] = [str(v) for v in list(spec.get("scone") or [])[:3]]
+        spectrum_type = self._normalize_spectrum_type_label(spec.get("spectrum_type") or self._parse_spectrum_type_metadata(base_text))
+        if spectrum_type:
+            final_spec["spectrum_type"] = spectrum_type
+            final_text = self._replace_spectrum_type_metadata(final_text, spectrum_type)
         calc_values = self._sync_source_target_calc_to_direct(spec.get("source_target_calc"), final_spec.get("scone"))
         if calc_values:
             final_spec["source_target_calc"] = dict(calc_values)
@@ -21543,6 +21729,51 @@ class SimulationTab(QWidget):
 
         result = dlg.exec()
         if result == 2:
+            return {"mode": "batch"}
+        if result != QDialog.DialogCode.Accepted:
+            return None
+        base_name = self._workspace_safe_token(e_name.text(), "")
+        if not base_name:
+            QMessageBox.warning(self, "Create Case", "Case Name cannot be empty.")
+            return None
+        selected = _sanitize_project_case_field_list([chk._case_field_key for chk in token_checks if chk.isChecked()])
+        return self._case_folder_name_from_input(base_name, selected, in_path, geo_path)
+
+    def _batch_sposit_scone_seed_source_dialog(self, in_path):
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle("Create Case Batch")
+        dlg.setMinimumWidth(520)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        intro = QLabel(
+            "Choose how the batch SPOSIT / SCONE rows should be prepared.\n\n"
+            "Manual keeps the normal row editor. Import reads ACTIVE rows from an XLSX file and "
+            "prefills the batch rows with SPOSIT (AB:AD) and SCONE (AE:AG) values."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(intro)
+
+        buttons = QDialogButtonBox()
+        buttons.setStyleSheet(
+            f"QPushButton {{ background:{P['bg2']}; color:{P['fg']};"
+            f" border:1px solid {P['border']}; border-radius:3px; padding:4px 16px; }}"
+            f"QPushButton:hover {{ background:{P['bg3']}; }}"
+        )
+        btn_manual = buttons.addButton("Manual", QDialogButtonBox.ButtonRole.AcceptRole)
+        btn_import = buttons.addButton("Import From XLSX...", QDialogButtonBox.ButtonRole.ActionRole)
+        btn_cancel = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        btn_manual.clicked.connect(lambda: dlg.done(2))
+        btn_import.clicked.connect(lambda: dlg.done(3))
+        btn_cancel.clicked.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        result = dlg.exec()
+        if result == 2:
             count, ok = QInputDialog.getInt(
                 self,
                 "Create Case Batch",
@@ -21554,15 +21785,107 @@ class SimulationTab(QWidget):
             )
             if not ok:
                 return None
-            return {"mode": "batch", "count": int(count)}
-        if result != QDialog.DialogCode.Accepted:
+            return {"mode": "manual", "count": int(count)}
+        if result == 3:
+            settings = QSettings("CodAI", "PenelopeStudio")
+            start_dir = settings.value("simulation/batch_sposit_scone_xlsx", str(Path(in_path).parent), type=str)
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Choose SPOSIT / SCONE workbook",
+                start_dir,
+                "Excel files (*.xlsx *.xlsm *.xltx *.xltm);;All files (*.*)",
+            )
+            if not path:
+                return None
+            try:
+                seed_specs = self._load_batch_sposit_scone_seed_specs_from_xlsx(path, base_case_stem=Path(in_path).stem)
+            except Exception as exc:
+                QMessageBox.warning(self, "Create Case Batch", f"Could not load the SPOSIT / SCONE workbook.\n\n{exc}")
+                return None
+            if not seed_specs:
+                QMessageBox.warning(
+                    self,
+                    "Create Case Batch",
+                    "No ACTIVE rows with valid SPOSIT / SCONE values were found in the selected workbook.",
+                )
+                return None
+            settings.setValue("simulation/batch_sposit_scone_xlsx", str(Path(path).parent))
+            self.console.log(
+                f"[SIM] Imported {len(seed_specs)} SPOSIT/SCONE batch row(s) from {Path(path).name}\n",
+                "info",
+            )
+            return {"mode": "imported", "count": len(seed_specs), "seed_specs": seed_specs, "source_path": path}
+        return None
+
+    def _load_batch_sposit_scone_seed_specs_from_xlsx(self, xlsx_path, base_case_stem="case"):
+        try:
+            import openpyxl
+        except Exception as exc:
+            raise RuntimeError(f"Could not import openpyxl: {exc}") from exc
+
+        path = Path(xlsx_path)
+        wb_data = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        wb_formula = openpyxl.load_workbook(path, data_only=False, read_only=True)
+        ws_data = wb_data.active
+        ws_formula = wb_formula.active
+
+        def _cell_text(ws, row, col):
+            try:
+                val = ws.cell(row=row, column=col).value
+            except Exception:
+                val = None
+            return "" if val is None else str(val).strip()
+
+        def _cell_number(ws_primary, ws_fallback, row, col):
+            for ws in (ws_primary, ws_fallback):
+                try:
+                    val = ws.cell(row=row, column=col).value
+                except Exception:
+                    val = None
+                if val in (None, ""):
+                    continue
+                try:
+                    return float(val)
+                except Exception:
+                    continue
             return None
-        base_name = self._workspace_safe_token(e_name.text(), "")
-        if not base_name:
-            QMessageBox.warning(self, "Create Case", "Case Name cannot be empty.")
-            return None
-        selected = _sanitize_project_case_field_list([chk._case_field_key for chk in token_checks if chk.isChecked()])
-        return self._case_folder_name_from_input(base_name, selected, in_path, geo_path)
+
+        def _fmt_num(value):
+            num = float(value)
+            if abs(num) < 1e-12:
+                num = 0.0
+            text = f"{num:.8f}".rstrip("0").rstrip(".")
+            return text or "0"
+
+        seed_specs = []
+        next_case_number = 1
+        for row_idx in range(1, ws_data.max_row + 1):
+            state_text = _cell_text(ws_data, row_idx, 2).upper()
+            state_formula = _cell_text(ws_formula, row_idx, 2).upper()
+            row_active = state_text == "ACTIVE"
+            if not row_active and state_text in {"", "NONE"} and state_formula.startswith("="):
+                radius_hint = _cell_text(ws_data, row_idx, 3) or _cell_text(ws_formula, row_idx, 3)
+                maybe_vals = [
+                    _cell_number(ws_data, ws_formula, row_idx, col)
+                    for col in (28, 29, 30, 31, 32, 33)
+                ]
+                row_active = bool(radius_hint) and all(val is not None for val in maybe_vals)
+            if not row_active:
+                continue
+            sposit_vals = [_cell_number(ws_data, ws_formula, row_idx, col) for col in (28, 29, 30)]
+            scone_vals = [_cell_number(ws_data, ws_formula, row_idx, col) for col in (31, 32, 33)]
+            if any(val is None for val in sposit_vals + scone_vals):
+                continue
+            seed_specs.append(
+                {
+                    "case_number": next_case_number,
+                    "case_name": f"{base_case_stem}_case{next_case_number}",
+                    "sposit": [_fmt_num(val) for val in sposit_vals],
+                    "scone": [_fmt_num(val) for val in scone_vals],
+                }
+            )
+            next_case_number += 1
+        return seed_specs
 
     def _spectr_range_from_lines(self, lines):
         energies = []
@@ -21680,7 +22003,7 @@ class SimulationTab(QWidget):
             return Path(self._project_root) / target
         return target
 
-    def _case_spec_from_in_text(self, case_name, in_filename, text, geo_override_path="", mat_folder=""):
+    def _case_spec_from_in_text(self, case_name, in_filename, text, geo_override_path="", mat_folder="", source_path=None):
         defaults = self._source_defaults_from_text(text)
         base_case_name = self._case_variant_base_name(case_name, "case")
         label_prefix, case_number = self._case_variant_label_and_number(base_case_name, Path(in_filename).stem if in_filename else "case", None)
@@ -21713,6 +22036,9 @@ class SimulationTab(QWidget):
             spec["sposit"] = list(defaults["sposit"])
         if defaults["scone"]:
             spec["scone"] = list(defaults["scone"])
+        spectrum_type = self._parse_spectrum_type_metadata(text, source_path)
+        if spectrum_type:
+            spec["spectrum_type"] = spectrum_type
         return spec
 
     def _case_variant_spec_from_log_record(self, record):
@@ -21750,6 +22076,8 @@ class SimulationTab(QWidget):
                 spec["spectr_range"] = tuple(spectr_range)
             if variant.get("spectr_last_kev") not in (None, ""):
                 spec["spectr_last_kev"] = variant.get("spectr_last_kev")
+            if str(variant.get("spectrum_type", "")).strip():
+                spec["spectrum_type"] = self._normalize_spectrum_type_label(variant.get("spectrum_type"))
             sposit = variant.get("sposit_cm")
             if isinstance(sposit, (list, tuple)) and len(sposit) == 3:
                 spec["sposit"] = [str(v) for v in sposit]
@@ -21775,7 +22103,14 @@ class SimulationTab(QWidget):
             text = _decode_text_bytes(in_path.read_bytes())
         except Exception:
             return None
-        return self._case_spec_from_in_text(case_name, in_path.name, text, geo_override_path=geo_override_path or "", mat_folder=mat_folder or "")
+        return self._case_spec_from_in_text(
+            case_name,
+            in_path.name,
+            text,
+            geo_override_path=geo_override_path or "",
+            mat_folder=mat_folder or "",
+            source_path=in_path,
+        )
 
     def _batch_spec_value_text(self, spec, key):
         if key == "senerg_kev":
@@ -22207,6 +22542,7 @@ class SimulationTab(QWidget):
         seed_batch_label="",
         dialog_title="Create Batch Cases",
         intro_text=None,
+        resource_override_scope="per_row",
     ):
         source_text = self._get_text()
         defaults = self._source_defaults_from_text(source_text)
@@ -22219,6 +22555,9 @@ class SimulationTab(QWidget):
             "Each row can override SENERG or SPECTR, SPOSIT, and SCONE. "
             "Folder names and TITLE append the active source tokens automatically."
         )
+        resource_override_scope = str(resource_override_scope or "per_row").strip().lower()
+        if resource_override_scope not in {"per_row", "shared"}:
+            resource_override_scope = "per_row"
 
         dlg = QDialog(self)
         dlg.setModal(True)
@@ -22244,6 +22583,78 @@ class SimulationTab(QWidget):
             batch_label_edit.setPlaceholderText("Optional label for the batch folder")
             batch_label_row.addWidget(batch_label_edit, 1)
             lay.addLayout(batch_label_row)
+
+        shared_geo_chk = None
+        shared_geo_edit = None
+        shared_mat_chk = None
+        shared_mat_edit = None
+        if allow_resource_overrides and resource_override_scope == "shared":
+            shared_resources_box = QGroupBox("Batch-Wide Geometry / Material Overrides")
+            shared_resources_box.setStyleSheet(group_css())
+            shared_resources_lay = QGridLayout(shared_resources_box)
+            shared_resources_lay.setContentsMargins(8, 8, 8, 8)
+            shared_resources_lay.setHorizontalSpacing(6)
+            shared_resources_lay.setVerticalSpacing(4)
+
+            shared_geo_chk = QCheckBox("Apply GEOMFN to whole batch")
+            shared_geo_chk.setStyleSheet(checkbox_css())
+            shared_geo_edit = QLineEdit(str(geo_path or ""))
+            shared_geo_edit.setStyleSheet(entry_css())
+            shared_geo_edit.setPlaceholderText("Choose one geometry file to apply to every case")
+            btn_shared_geo = QPushButton("Browse...")
+            btn_shared_geo.setStyleSheet(btn_css(P["bg2"], 82))
+
+            def choose_shared_geo():
+                start = str(Path((shared_geo_edit.text() or "").strip()).parent) if (shared_geo_edit.text() or "").strip() else str(Path(geo_path).parent if geo_path else self._in_folder())
+                path, _ = QFileDialog.getOpenFileName(
+                    dlg,
+                    "Choose geometry file",
+                    start,
+                    "Geometry files (*.geo);;All files (*.*)",
+                )
+                if path:
+                    shared_geo_edit.setText(path)
+
+            btn_shared_geo.clicked.connect(choose_shared_geo)
+
+            common_mat_folder = ""
+            for spec in seed_specs:
+                val = str(spec.get("mat_folder") or "").strip()
+                if val:
+                    common_mat_folder = val
+                    break
+            shared_mat_chk = QCheckBox("Apply materials folder to whole batch")
+            shared_mat_chk.setStyleSheet(checkbox_css())
+            shared_mat_edit = QLineEdit(common_mat_folder)
+            shared_mat_edit.setStyleSheet(entry_css())
+            shared_mat_edit.setPlaceholderText("Choose one materials folder to apply to every case")
+            btn_shared_mat = QPushButton("Browse...")
+            btn_shared_mat.setStyleSheet(btn_css(P["bg2"], 82))
+
+            def choose_shared_mat():
+                start = (shared_mat_edit.text() or "").strip() or str(self._material_list_folder() or self._in_folder())
+                folder = QFileDialog.getExistingDirectory(dlg, "Choose materials folder", start)
+                if folder:
+                    shared_mat_edit.setText(folder)
+
+            btn_shared_mat.clicked.connect(choose_shared_mat)
+
+            shared_note = QLabel(
+                "These overrides are applied to every case in this batch edit when checked. "
+                "Per-row source values still stay independent."
+            )
+            shared_note.setWordWrap(True)
+            shared_note.setStyleSheet(label_css(P["fg2"], size=8))
+
+            shared_resources_lay.addWidget(shared_geo_chk, 0, 0)
+            shared_resources_lay.addWidget(shared_geo_edit, 0, 1)
+            shared_resources_lay.addWidget(btn_shared_geo, 0, 2)
+            shared_resources_lay.addWidget(shared_mat_chk, 1, 0)
+            shared_resources_lay.addWidget(shared_mat_edit, 1, 1)
+            shared_resources_lay.addWidget(btn_shared_mat, 1, 2)
+            shared_resources_lay.addWidget(shared_note, 2, 0, 1, 3)
+            shared_resources_lay.setColumnStretch(1, 1)
+            lay.addWidget(shared_resources_box)
 
         folder_tokens_box = QGroupBox("Include In Folder Name")
         folder_tokens_box.setStyleSheet(group_css())
@@ -22938,7 +23349,7 @@ class SimulationTab(QWidget):
             details_lay.addWidget(scone_stack, 4, 3, 1, 4)
 
             resource_block = QFrame()
-            resource_block.setVisible(bool(allow_resource_overrides))
+            resource_block.setVisible(bool(allow_resource_overrides and resource_override_scope != "shared"))
             resource_block.setStyleSheet(f"QFrame {{ background:transparent; border:0; }}")
             resource_lay = QGridLayout(resource_block)
             resource_lay.setContentsMargins(0, 0, 0, 0)
@@ -22965,7 +23376,7 @@ class SimulationTab(QWidget):
             resource_lay.addWidget(btn_mat, 1, 2)
             resource_lay.addWidget(btn_mat_all, 1, 3)
             box_lay.addWidget(details)
-            if allow_resource_overrides:
+            if allow_resource_overrides and resource_override_scope != "shared":
                 box_lay.addWidget(resource_block)
             lbl_preview = QLabel("")
             lbl_preview.setWordWrap(True)
@@ -23027,7 +23438,7 @@ class SimulationTab(QWidget):
                 btn.clicked.connect(lambda _=False, edit=scone_direct_edits[idx], key_index=idx: propagate_list_index(edit, "scone_direct_edits", key_index, "scone"))
             for target_key, btn in target_all_buttons.items():
                 btn.clicked.connect(lambda _=False, edit=target_edits[target_key], name=target_key: propagate_named_value(edit, "scone_target_edits", name, "scone"))
-            if allow_resource_overrides:
+            if allow_resource_overrides and resource_override_scope != "shared":
                 btn_geo.clicked.connect(lambda _=False, r=row: choose_geo(r))
                 btn_mat.clicked.connect(lambda _=False, r=row: choose_mat_folder(r))
                 btn_geo_all.clicked.connect(lambda _=False, edit=geo_override_path: propagate_line_value(edit, "geo_override_path"))
@@ -23121,6 +23532,20 @@ class SimulationTab(QWidget):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
+
+        shared_geo_override = ""
+        shared_mat_override = ""
+        if allow_resource_overrides and resource_override_scope == "shared":
+            if shared_geo_chk is not None and shared_geo_chk.isChecked():
+                shared_geo_override = (shared_geo_edit.text() or "").strip()
+                if not shared_geo_override:
+                    QMessageBox.warning(self, dialog_title, "Choose the geometry file to apply to the whole batch.")
+                    return None
+            if shared_mat_chk is not None and shared_mat_chk.isChecked():
+                shared_mat_override = (shared_mat_edit.text() or "").strip()
+                if not shared_mat_override:
+                    QMessageBox.warning(self, dialog_title, "Choose the materials folder to apply to the whole batch.")
+                    return None
 
         specs = []
         for idx, row in enumerate(rows, start=1):
@@ -23230,12 +23655,18 @@ class SimulationTab(QWidget):
                         in_path=in_path,
                     )
             if allow_resource_overrides:
-                geo_override = (row["geo_override_path"].text() or "").strip()
-                mat_folder = (row["mat_folder"].text() or "").strip()
-                if geo_override:
-                    spec["geo_override_path"] = geo_override
-                if mat_folder:
-                    spec["mat_folder"] = mat_folder
+                if resource_override_scope == "shared":
+                    if shared_geo_override:
+                        spec["geo_override_path"] = shared_geo_override
+                    if shared_mat_override:
+                        spec["mat_folder"] = shared_mat_override
+                else:
+                    geo_override = (row["geo_override_path"].text() or "").strip()
+                    mat_folder = (row["mat_folder"].text() or "").strip()
+                    if geo_override:
+                        spec["geo_override_path"] = geo_override
+                    if mat_folder:
+                        spec["mat_folder"] = mat_folder
             spec["folder_token_keys"] = current_folder_token_keys()
             specs.append(spec)
         if not specs:
@@ -23636,21 +24067,46 @@ class SimulationTab(QWidget):
         batch_id = ""
         try:
             if isinstance(case_choice, dict) and case_choice.get("mode") == "batch":
+                batch_seed_choice = self._batch_sposit_scone_seed_source_dialog(in_path)
+                if not batch_seed_choice:
+                    return
+                batch_seed_specs = list(batch_seed_choice.get("seed_specs") or [])
+                batch_count = int(batch_seed_choice.get("count") or case_choice.get("count") or max(1, len(batch_seed_specs) or 3))
+                batch_intro = None
+                if batch_seed_choice.get("mode") == "imported":
+                    batch_intro = (
+                        "Review the imported SPOSIT / SCONE rows below before creating the batch.\n"
+                        f"Workbook: {Path(batch_seed_choice.get('source_path') or '').name}"
+                    )
                 batch_data = self._batch_case_variants_dialog(
                     in_path,
                     geo_path,
-                    case_choice.get("count") or 3,
+                    batch_count,
+                    seed_specs=batch_seed_specs,
                     include_batch_label=True,
                     seed_batch_label="",
+                    intro_text=batch_intro,
                 )
                 if not batch_data:
                     return
                 batch_specs = list(batch_data.get("specs") or [])
                 batch_label = str(batch_data.get("batch_label") or "")
+                batch_spectrum_type = self._prompt_spectrum_type_label(
+                    title="Batch Spectrum Type",
+                    default_label=self._parse_spectrum_type_metadata(base_source_text, in_path),
+                    in_path=in_path,
+                    geo_path=geo_path,
+                    text=base_source_text,
+                    free_text_only=True,
+                )
+                if batch_spectrum_type is None:
+                    return
                 batch_id = datetime.now().strftime("batch_%Y%m%d_%H%M%S_%f")
                 batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(in_path, batch_label))
                 batch_root.mkdir(parents=True, exist_ok=True)
+                self._write_spectrum_type_metadata_file(batch_root, batch_spectrum_type)
                 for spec in batch_specs:
+                    spec["spectrum_type"] = batch_spectrum_type
                     spec_geo_path = Path(spec.get("geo_override_path") or geo_path)
                     if not spec_geo_path.exists():
                         QMessageBox.warning(self, "Create Batch Cases", f"Missing geometry file for {spec.get('case_name', 'case')}:\n{spec_geo_path}")
@@ -23688,6 +24144,7 @@ class SimulationTab(QWidget):
                         mat_sources=_mat_sources(spec_geo_path, spec_mat_folder),
                         required_refs=required_refs,
                         effective_execs=effective_execs,
+                        spectrum_type=final_spec.get("spectrum_type", ""),
                     )
                     created_dirs.append((case_dir, result))
                     self._log_project_case_creation(
@@ -23760,17 +24217,28 @@ class SimulationTab(QWidget):
                     self.console.log(f"[SIM] Batch root ready: {batch_root}\n", "info")
                     self.status_message.emit(f"Batch cases created: {len(created_dirs)}")
             else:
+                case_spectrum_type = self._prompt_spectrum_type_label(
+                    title="Case Spectrum Type",
+                    default_label=self._parse_spectrum_type_metadata(workspace_text, in_path),
+                    in_path=in_path,
+                    geo_path=geo_path,
+                    text=workspace_text,
+                )
+                if case_spectrum_type is None:
+                    return
                 case_dir = self._unique_workspace_dir(target_root / str(case_choice))
+                single_case_text = self._replace_spectrum_type_metadata(workspace_text, case_spectrum_type)
                 result = self._write_case_workspace(
                     case_dir,
                     in_filename=in_path.name,
-                    in_text=self._apply_case_title(workspace_text, in_path.stem),
+                    in_text=self._apply_case_title(single_case_text, in_path.stem),
                     geo_path=geo_path,
                     workspace_geo_name=workspace_geo_name,
                     template_dir=template_dir,
                     mat_sources=mat_sources,
                     required_refs=required_refs,
                     effective_execs=effective_execs,
+                    spectrum_type=case_spectrum_type,
                 )
                 self._in_path = str(result["workspace_in_path"])
                 self._run_folder = case_dir
@@ -23918,6 +24386,7 @@ class SimulationTab(QWidget):
             mat_sources=mat_sources,
             required_refs=required_refs,
             effective_execs=effective_execs or self._effective_executable_paths(),
+            spectrum_type=self._parse_spectrum_type_metadata(updated_text, source_in_path),
         )
 
     def _choose_batch_edit_mode(self, title="Edit Batch", summary_text=""):
@@ -24030,6 +24499,7 @@ class SimulationTab(QWidget):
                     updated_case_text,
                     geo_override_path=str(fallback_geo or ""),
                     mat_folder=str(edit_result.get("mat_folder") or source_case_dir),
+                    source_path=source_in_path,
                 )
                 updated_case_text, _ = self._replace_or_insert_line_in_text(
                     updated_case_text,
@@ -24118,6 +24588,7 @@ class SimulationTab(QWidget):
                     case_text,
                     geo_override_path=str(geo_path or ""),
                     mat_folder=str(mat_folder or ""),
+                    source_path=in_path,
                 )
             )
             row_contexts.append(
@@ -24148,8 +24619,10 @@ class SimulationTab(QWidget):
             dialog_title="Edit Batch",
             intro_text=(
                 "Review the current batch rows below. Only the checked values in each row will be changed. "
-                "Use the per-field All buttons when you want to propagate just that one value across every case."
+                "Use the per-field All buttons when you want to propagate just that one source value across every case. "
+                "Geometry and materials are handled through one shared batch-wide override section."
             ),
+            resource_override_scope="shared",
         )
         if not edited_specs:
             return
@@ -24392,6 +24865,7 @@ class SimulationTab(QWidget):
                 mat_sources=[source_in_path.parent, source_case_dir, spec_mat_folder],
                 required_refs=required_refs,
                 effective_execs=effective_execs,
+                spectrum_type=final_spec.get("spectrum_type", ""),
             )
             created_dirs.append((case_dir, result))
             self._log_project_case_creation(
@@ -24452,6 +24926,7 @@ class SimulationTab(QWidget):
                     case_text,
                     geo_override_path=str(geo_path or ""),
                     mat_folder=str(mat_folder or ""),
+                    source_path=in_path,
                 )
             )
             row_contexts.append(
@@ -24506,6 +24981,14 @@ class SimulationTab(QWidget):
         batch_stem = self._batch_workspace_source_stem_from_specs(edited_specs, Path(source_in_path).stem)
         batch_root = self._unique_workspace_dir(target_root / self._batch_workspace_container_name(source_in_path, batch_label, source_stem_override=batch_stem))
         batch_root.mkdir(parents=True, exist_ok=True)
+        batch_spectrum_types = sorted(
+            {
+                self._normalize_spectrum_type_label(spec.get("spectrum_type"))
+                for spec in edited_specs
+                if self._normalize_spectrum_type_label(spec.get("spectrum_type"))
+            }
+        )
+        self._write_spectrum_type_metadata_file(batch_root, batch_spectrum_types[0] if len(batch_spectrum_types) == 1 else "")
         created_dirs = []
         batch_log_records = []
         default_mat_folder = source_in_path.parent
@@ -24548,6 +25031,7 @@ class SimulationTab(QWidget):
                 mat_sources=[context_in_path.parent, spec_mat_folder],
                 required_refs=required_refs,
                 effective_execs=effective_execs,
+                spectrum_type=final_spec.get("spectrum_type", ""),
             )
             created_dirs.append((case_dir, result))
             self._log_project_case_creation(
@@ -24588,7 +25072,7 @@ class SimulationTab(QWidget):
             self.console.log(f"[SIM] Duplicated batch created: {len(created_dirs)} case(s) under {batch_root}\n", "ok")
             self.status_message.emit(f"Duplicate batch created: {len(created_dirs)}")
 
-    def _write_case_workspace(self, case_dir, in_filename, in_text, geo_path, workspace_geo_name, template_dir, mat_sources, required_refs, effective_execs):
+    def _write_case_workspace(self, case_dir, in_filename, in_text, geo_path, workspace_geo_name, template_dir, mat_sources, required_refs, effective_execs, spectrum_type=""):
         case_dir = Path(case_dir)
         case_dir.mkdir(parents=True, exist_ok=True)
         template_dir = Path(template_dir) if template_dir else None
@@ -24598,8 +25082,13 @@ class SimulationTab(QWidget):
             if template_dir:
                 self.console.log(f"[SIM] Template folder not found, continuing without it: {template_dir}\n", "warn")
         workspace_in_path = case_dir / in_filename
-        workspace_text = str(in_text or "")
+        raw_workspace_text = str(in_text or "")
+        workspace_text = self._strip_spectrum_type_metadata(raw_workspace_text)
+        effective_spectrum_type = self._normalize_spectrum_type_label(
+            spectrum_type or self._parse_spectrum_type_metadata(raw_workspace_text)
+        )
         workspace_in_path.write_bytes(_encode_text_bytes(workspace_text))
+        self._write_spectrum_type_metadata_file(case_dir, effective_spectrum_type, input_name=in_filename)
         self._safe_copy_file(geo_path, case_dir / workspace_geo_name, overwrite=True)
         rep_count, rep_names = self._copy_linked_rep_to_folder(geo_path, case_dir, workspace_geo_name, overwrite=True)
         ref_names = self._copy_required_input_reference_sources(required_refs, case_dir, overwrite=True)
@@ -24641,6 +25130,7 @@ class SimulationTab(QWidget):
             "mat_count": mat_count,
             "missing_mats": missing_mats,
             "exe_count": exe_count,
+            "spectrum_type": effective_spectrum_type,
         }
 
     def _geo_body_options(self):
@@ -27990,7 +28480,13 @@ class SimulationTab(QWidget):
         in_path = Path(in_path)
         run_folder = Path(run_folder)
         run_folder.mkdir(parents=True, exist_ok=True)
-        source_text = self._in_file_text(in_path)
+        raw_source_text = self._in_file_text(in_path)
+        spectrum_type = self._parse_spectrum_type_metadata(raw_source_text, in_path)
+        source_text = self._strip_spectrum_type_metadata(raw_source_text)
+        if spectrum_type:
+            self._write_spectrum_type_metadata_file(in_path.parent, spectrum_type, input_name=in_path.name)
+            if run_folder != in_path.parent:
+                self._write_spectrum_type_metadata_file(run_folder, spectrum_type, input_name=in_path.name)
         if not source_text:
             raise FileNotFoundError(f"Could not read input file: {in_path}")
         issues, source_text = self._analyze_in_keywords(source_text)
@@ -31114,6 +31610,813 @@ class AnalysisLoadWorker(QObject):
             self.error.emit({"serial": self._serial, "error": traceback.format_exc()})
 
 
+class PlotImageLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap_source = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumHeight(180)
+        self.setStyleSheet(
+            f"QLabel {{ background:{P['bg']}; color:{P['fg2']}; border:1px solid {P['border']}; }}"
+        )
+        self.setText("No image loaded")
+
+    def set_source_pixmap(self, pixmap):
+        self._pixmap_source = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
+        self._refresh_scaled_pixmap()
+
+    def clear_source(self):
+        self._pixmap_source = None
+        self.clear()
+        self.setText("No image loaded")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_scaled_pixmap()
+
+    def _refresh_scaled_pixmap(self):
+        if not self._pixmap_source or self.width() <= 0 or self.height() <= 0:
+            if not self._pixmap_source:
+                self.setText("No image loaded")
+            return
+        scaled = self._pixmap_source.scaled(
+            max(1, self.width() - 8),
+            max(1, self.height() - 8),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class PlotImagePane(QFrame):
+    status_message = Signal(str)
+
+    def __init__(self, slot_index, parent=None):
+        super().__init__(parent)
+        self._slot_index = int(slot_index)
+        self._image_path = None
+        self.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:8px; }}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        title = QLabel(f"Plot {self._slot_index}")
+        title.setStyleSheet(label_css(P["accent"], bold=True))
+        lay.addWidget(title)
+
+        self.lbl_path = QLabel("Image: none")
+        self.lbl_path.setStyleSheet(label_css(P["fg2"], size=9))
+        self.lbl_path.setWordWrap(True)
+        lay.addWidget(self.lbl_path)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_open = QPushButton("Open Image...")
+        self.btn_open.setStyleSheet(btn_css(width=104))
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setStyleSheet(btn_css(P["bg2"], 72))
+        btn_row.addWidget(self.btn_open)
+        btn_row.addWidget(self.btn_clear)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        self.image_label = PlotImageLabel()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.image_label)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background:{P['bg']}; border:1px solid {P['border']}; border-radius:6px; }}"
+        )
+        lay.addWidget(scroll, 1)
+
+        self.btn_open.clicked.connect(self._choose_image)
+        self.btn_clear.clicked.connect(self.clear_image)
+
+    def _display_path(self, path):
+        path = Path(path)
+        text = str(path)
+        if len(text) <= 84:
+            return text
+        return f"{text[:40]} ... {text[-38:]}"
+
+    def _choose_image(self):
+        start_dir = str(self._image_path.parent if self._image_path else Path.cwd())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Choose plot image for slot {self._slot_index}",
+            start_dir,
+            "Images (*.png *.jpg *.jpeg);;All files (*.*)",
+        )
+        if file_path:
+            self.load_image(file_path)
+
+    def load_image(self, path):
+        image_path = Path(path)
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Plot Analysis", f"Could not open image:\n{image_path}")
+            return False
+        self._image_path = image_path
+        self.image_label.set_source_pixmap(pixmap)
+        self.lbl_path.setText(f"Image: {self._display_path(image_path)}")
+        self.lbl_path.setToolTip(str(image_path))
+        self.status_message.emit(f"Loaded comparison image {self._slot_index}: {image_path.name}")
+        return True
+
+    def clear_image(self):
+        self._image_path = None
+        self.image_label.clear_source()
+        self.lbl_path.setText("Image: none")
+        self.lbl_path.setToolTip("")
+        self.status_message.emit(f"Cleared comparison image slot {self._slot_index}.")
+
+
+class ImpactSpectraTab(QWidget):
+    status_message = Signal(str)
+
+    IMPDET_DIR_IGNORES = {"previous_runs", "dmps", "3d-dose_group", "_3d_dose_header_backup_", "__pycache__"}
+    IMPDET_SERIES = [
+        ("total", "Total spectrum", 1, 2),
+        ("electron", "Electron spectrum", 3, 4),
+        ("photon", "Photon spectrum", 5, 6),
+        ("positron", "Positron spectrum", 7, 8),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cases = []
+        self._preview_path = None
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        header = QFrame()
+        header.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        header_lay = QVBoxLayout(header)
+        header_lay.setContentsMargins(10, 10, 10, 10)
+        header_lay.setSpacing(6)
+        title = QLabel("Impact Spectra")
+        title.setStyleSheet(label_css(P["accent"], bold=True, size=11))
+        subtitle = QLabel(
+            "Read impact-detector spectra from spc-impdet-XX.dat files, create detector workbooks, "
+            "preview plots, and export PNGs for a single case or a whole batch root."
+        )
+        subtitle.setStyleSheet(label_css(P["fg2"], size=9))
+        subtitle.setWordWrap(True)
+        header_lay.addWidget(title)
+        header_lay.addWidget(subtitle)
+        root.addWidget(header)
+
+        controls = QFrame()
+        controls.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        controls_lay = QGridLayout(controls)
+        controls_lay.setContentsMargins(10, 10, 10, 10)
+        controls_lay.setHorizontalSpacing(8)
+        controls_lay.setVerticalSpacing(8)
+
+        lbl_mode = QLabel("Mode:")
+        lbl_mode.setStyleSheet(label_css(P["fg2"]))
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItem("Single case folder", "single")
+        self.cmb_mode.addItem("Batch root", "batch")
+        self.cmb_mode.setStyleSheet(combo_css())
+        self.cmb_mode.currentIndexChanged.connect(self._update_mode_hints)
+
+        lbl_root = QLabel("Root:")
+        lbl_root.setStyleSheet(label_css(P["fg2"]))
+        self.edit_root = QLineEdit()
+        self.edit_root.setStyleSheet(edit_css())
+        self.edit_root.setPlaceholderText("Choose a case folder or batch root")
+        btn_root = QPushButton("Browse...")
+        btn_root.setStyleSheet(btn_css(width=92))
+        btn_root.clicked.connect(self._browse_root)
+        btn_scan = QPushButton("Scan")
+        btn_scan.setStyleSheet(btn_css(width=80))
+        btn_scan.clicked.connect(self._scan_cases)
+
+        lbl_detector = QLabel("Detector:")
+        lbl_detector.setStyleSheet(label_css(P["fg2"]))
+        self.cmb_detector = QComboBox()
+        self.cmb_detector.setStyleSheet(combo_css())
+        self.cmb_detector.setMinimumWidth(120)
+        self.cmb_detector.addItem("Detector 01", 1)
+
+        lbl_x = QLabel("X axis:")
+        lbl_x.setStyleSheet(label_css(P["fg2"]))
+        self.cmb_xaxis = QComboBox()
+        self.cmb_xaxis.addItem("Energy (keV)", "keV")
+        self.cmb_xaxis.addItem("Energy (eV)", "eV")
+        self.cmb_xaxis.setStyleSheet(combo_css())
+
+        self.chk_total = QCheckBox("Total")
+        self.chk_total.setStyleSheet(checkbox_css())
+        self.chk_electron = QCheckBox("Electron")
+        self.chk_electron.setStyleSheet(checkbox_css())
+        self.chk_photon = QCheckBox("Photon")
+        self.chk_photon.setStyleSheet(checkbox_css())
+        self.chk_positron = QCheckBox("Positron")
+        self.chk_positron.setStyleSheet(checkbox_css())
+        self.chk_photon.setChecked(True)
+
+        btn_xlsx = QPushButton("Create XLSX")
+        btn_xlsx.setStyleSheet(btn_css(width=108))
+        btn_xlsx.clicked.connect(self._create_workbooks)
+        btn_preview = QPushButton("Preview Plot")
+        btn_preview.setStyleSheet(btn_css(width=112))
+        btn_preview.clicked.connect(self._preview_plot)
+        btn_export = QPushButton("Export PNG")
+        btn_export.setStyleSheet(btn_css(width=104))
+        btn_export.clicked.connect(self._export_png)
+
+        controls_lay.addWidget(lbl_mode, 0, 0)
+        controls_lay.addWidget(self.cmb_mode, 0, 1)
+        controls_lay.addWidget(lbl_root, 0, 2)
+        controls_lay.addWidget(self.edit_root, 0, 3, 1, 5)
+        controls_lay.addWidget(btn_root, 0, 8)
+        controls_lay.addWidget(btn_scan, 0, 9)
+
+        controls_lay.addWidget(lbl_detector, 1, 0)
+        controls_lay.addWidget(self.cmb_detector, 1, 1)
+        controls_lay.addWidget(lbl_x, 1, 2)
+        controls_lay.addWidget(self.cmb_xaxis, 1, 3)
+        controls_lay.addWidget(self.chk_total, 1, 4)
+        controls_lay.addWidget(self.chk_electron, 1, 5)
+        controls_lay.addWidget(self.chk_photon, 1, 6)
+        controls_lay.addWidget(self.chk_positron, 1, 7)
+        controls_lay.addWidget(btn_xlsx, 1, 8)
+        controls_lay.addWidget(btn_preview, 1, 9)
+        controls_lay.addWidget(btn_export, 1, 10)
+        controls_lay.setColumnStretch(3, 1)
+        root.addWidget(controls)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(8)
+
+        left = QFrame()
+        left.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(10, 10, 10, 10)
+        left_lay.setSpacing(8)
+        left_title = QLabel("Detected Cases")
+        left_title.setStyleSheet(label_css(P["accent"], bold=True))
+        self.lbl_case_summary = QLabel("No root scanned yet.")
+        self.lbl_case_summary.setStyleSheet(label_css(P["fg2"], size=9))
+        self.lst_cases = QListWidget()
+        self.lst_cases.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_cases.setStyleSheet(
+            f"QListWidget {{ background:{P['bg']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:6px; }}"
+        )
+        self.lst_cases.itemSelectionChanged.connect(self._update_case_summary)
+        left_lay.addWidget(left_title)
+        left_lay.addWidget(self.lbl_case_summary)
+        left_lay.addWidget(self.lst_cases, 1)
+
+        right = QFrame()
+        right.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 10, 10, 10)
+        right_lay.setSpacing(8)
+        right_title = QLabel("Preview")
+        right_title.setStyleSheet(label_css(P["accent"], bold=True))
+        self.lbl_preview_info = QLabel("Generate a preview to show the selected detector spectrum here.")
+        self.lbl_preview_info.setStyleSheet(label_css(P["fg2"], size=9))
+        self.lbl_preview_info.setWordWrap(True)
+        self.preview_label = PlotImageLabel()
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        preview_scroll.setWidget(self.preview_label)
+        preview_scroll.setStyleSheet(
+            f"QScrollArea {{ background:{P['bg']}; border:1px solid {P['border']}; border-radius:6px; }}"
+        )
+        right_lay.addWidget(right_title)
+        right_lay.addWidget(self.lbl_preview_info)
+        right_lay.addWidget(preview_scroll, 1)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([320, 860])
+        root.addWidget(split, 1)
+
+        self._update_mode_hints()
+
+    def _update_mode_hints(self):
+        mode = self.cmb_mode.currentData()
+        if mode == "single":
+            self.edit_root.setPlaceholderText("Choose one case folder that contains spc-impdet-XX.dat files")
+        else:
+            self.edit_root.setPlaceholderText("Choose a batch root and scan its subfolders recursively")
+
+    def _browse_root(self):
+        start_dir = self.edit_root.text().strip() or str(Path.cwd())
+        mode = self.cmb_mode.currentData()
+        title = "Choose case folder" if mode == "single" else "Choose batch root"
+        folder = QFileDialog.getExistingDirectory(self, title, start_dir)
+        if folder:
+            self.edit_root.setText(folder)
+
+    def _impdet_detector_number(self, name):
+        base = str(name or "").strip()
+        for pattern in (
+            r"(?i)^spc-impdet-(\d{1,2})\.dat$",
+            r"(?i)^impdet-(\d{1,2})\.dat$",
+            r"(?i)^spc-impdet\.dat$",
+            r"(?i)^impdet\.dat$",
+        ):
+            m = re.match(pattern, base)
+            if not m:
+                continue
+            if m.groups():
+                return max(1, min(32, int(m.group(1))))
+            return 1
+        return None
+
+    def _read_case_title(self, folder):
+        folder = Path(folder)
+        in_files = sorted(folder.glob("*.in"))
+        for in_path in in_files:
+            try:
+                for raw_line in in_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped.upper().startswith("TITLE"):
+                        continue
+                    title_val = stripped[5:].strip()
+                    if "[" in title_val:
+                        title_val = title_val.split("[", 1)[0].strip()
+                    if title_val:
+                        return title_val
+            except Exception:
+                continue
+        return folder.name
+
+    def _build_case_entry(self, folder):
+        folder = Path(folder)
+        if not folder.exists() or not folder.is_dir():
+            return None
+        detectors = {}
+        for child in sorted(folder.iterdir()):
+            if not child.is_file():
+                continue
+            det_no = self._impdet_detector_number(child.name)
+            if det_no is None:
+                continue
+            detectors.setdefault(det_no, child)
+        if not detectors:
+            return None
+        return {
+            "folder": folder,
+            "title": self._read_case_title(folder),
+            "detectors": detectors,
+        }
+
+    def _discover_batch_cases(self, root):
+        root = Path(root)
+        case_dirs = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in self.IMPDET_DIR_IGNORES]
+            folder = Path(dirpath)
+            detectors_found = False
+            for filename in filenames:
+                if self._impdet_detector_number(filename) is not None:
+                    detectors_found = True
+                    break
+            if detectors_found:
+                case_dirs.append(folder)
+        cases = []
+        for folder in sorted(case_dirs):
+            entry = self._build_case_entry(folder)
+            if entry is not None:
+                cases.append(entry)
+        return cases
+
+    def _scan_cases(self):
+        root_text = self.edit_root.text().strip()
+        if not root_text:
+            QMessageBox.information(self, "Impact Spectra", "Choose a case folder or batch root first.")
+            return
+        root_path = Path(root_text)
+        if not root_path.exists():
+            QMessageBox.warning(self, "Impact Spectra", f"Path does not exist:\n{root_path}")
+            return
+        mode = self.cmb_mode.currentData()
+        if mode == "single":
+            cases = []
+            entry = self._build_case_entry(root_path)
+            if entry is not None:
+                cases.append(entry)
+        else:
+            cases = self._discover_batch_cases(root_path)
+        self._cases = cases
+        self.lst_cases.clear()
+        detectors = set()
+        for entry in cases:
+            det_list = sorted(entry["detectors"])
+            detectors.update(det_list)
+            det_text = ", ".join(f"{n:02d}" for n in det_list)
+            item = QListWidgetItem(f"{entry['folder'].name}    [detectors: {det_text}]")
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(str(entry["folder"]))
+            self.lst_cases.addItem(item)
+        self.cmb_detector.clear()
+        for det_no in sorted(detectors) or [1]:
+            self.cmb_detector.addItem(f"Detector {det_no:02d}", det_no)
+        self._update_case_summary()
+        if cases:
+            root_kind = "case folder" if mode == "single" else "case folders"
+            self.status_message.emit(f"Found {len(cases)} {root_kind} with impact-detector spectra.")
+        else:
+            self.status_message.emit("No impact-detector spectra were found under the selected path.")
+
+    def _selected_cases(self):
+        selected = []
+        for item in self.lst_cases.selectedItems():
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if entry:
+                selected.append(entry)
+        return selected or list(self._cases)
+
+    def _update_case_summary(self):
+        total = len(self._cases)
+        selected = len(self.lst_cases.selectedItems())
+        if total <= 0:
+            self.lbl_case_summary.setText("No compatible spc-impdet-XX.dat files found.")
+            return
+        if selected > 0:
+            self.lbl_case_summary.setText(f"{selected} of {total} case folders selected.")
+        else:
+            self.lbl_case_summary.setText(f"{total} case folders found. No selection means all will be used.")
+
+    def _selected_series(self):
+        selected = []
+        for key, _label, _v_col, _u_col in self.IMPDET_SERIES:
+            box = getattr(self, f"chk_{key}", None)
+            if box is not None and box.isChecked():
+                selected.append(key)
+        return selected
+
+    def _series_label(self, key):
+        for series_key, label, _v_col, _u_col in self.IMPDET_SERIES:
+            if series_key == key:
+                return label
+        return key
+
+    def _load_impdet_data(self, path):
+        arr = np.loadtxt(str(path), comments="#")
+        if arr.ndim == 1:
+            arr = np.asarray([arr], dtype=float)
+        data = {
+            "energy_eV": arr[:, 0].astype(float),
+            "energy_keV": arr[:, 0].astype(float) / 1000.0,
+        }
+        for key, _label, value_col, stu_col in self.IMPDET_SERIES:
+            data[key] = arr[:, value_col].astype(float)
+            data[f"{key}_stu"] = arr[:, stu_col].astype(float)
+        return data
+
+    def _plot_series(self, cases, detector_no, x_axis, series_keys, out_path):
+        _ensure_matplotlib()
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        plotted = 0
+        single_case = len(cases) == 1
+        for entry in cases:
+            file_path = entry["detectors"].get(detector_no)
+            if file_path is None:
+                continue
+            try:
+                data = self._load_impdet_data(file_path)
+            except Exception as exc:
+                self.status_message.emit(f"Could not read {file_path.name}: {exc}")
+                continue
+            xvals = data["energy_keV" if x_axis == "keV" else "energy_eV"]
+            for series_key in series_keys:
+                yvals = np.asarray(data.get(series_key, []), dtype=float)
+                if yvals.size != xvals.size:
+                    continue
+                yplot = yvals.copy()
+                yplot[yplot <= 1.0e-35] = np.nan
+                if not np.isfinite(yplot).any():
+                    continue
+                if single_case:
+                    label = self._series_label(series_key)
+                elif len(series_keys) == 1:
+                    label = entry["folder"].name
+                else:
+                    label = f"{entry['folder'].name} • {self._series_label(series_key)}"
+                ax.plot(xvals, yplot, linewidth=1.4, label=label)
+                plotted += 1
+        if plotted <= 0:
+            plt.close(fig)
+            raise ValueError("No plottable spectrum rows were found for the selected detector/series.")
+        ax.set_xlabel("Energy (keV)" if x_axis == "keV" else "Energy (eV)")
+        ax.set_ylabel("Spectrum (1/(eV·particle))")
+        if single_case:
+            ttl = f"{cases[0]['title']} - Detector {detector_no:02d}"
+        else:
+            ttl = f"Impact spectra overlay - Detector {detector_no:02d}"
+        ax.set_title(ttl)
+        ax.grid(True, alpha=0.30)
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    def _preview_plot(self):
+        try:
+            preview_path = self._render_plot_to_temp()
+        except Exception as exc:
+            QMessageBox.warning(self, "Impact Spectra", f"Could not build the preview plot:\n{exc}")
+            return
+        pixmap = QPixmap(str(preview_path))
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Impact Spectra", f"Could not load preview image:\n{preview_path}")
+            return
+        self._preview_path = preview_path
+        self.preview_label.set_source_pixmap(pixmap)
+        self.lbl_preview_info.setText(f"Preview: {preview_path.name}")
+        self.lbl_preview_info.setToolTip(str(preview_path))
+        self.status_message.emit(f"Previewed impact-detector plot for detector {self.cmb_detector.currentData():02d}.")
+
+    def _render_plot_to_temp(self):
+        if not self._cases:
+            raise ValueError("Scan a case folder or batch root first.")
+        cases = self._selected_cases()
+        if not cases:
+            raise ValueError("No case folders are selected.")
+        detector_no = int(self.cmb_detector.currentData() or 1)
+        series_keys = self._selected_series()
+        if not series_keys:
+            raise ValueError("Select at least one spectrum series to plot.")
+        x_axis = str(self.cmb_xaxis.currentData() or "keV")
+        temp_dir = Path(tempfile.gettempdir()) / "penelope_studio_impdet_preview"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        preview_name = f"impdet_preview_det{detector_no:02d}_{int(time.time() * 1000)}.png"
+        return self._plot_series(cases, detector_no, x_axis, series_keys, temp_dir / preview_name)
+
+    def _export_png(self):
+        if not self._cases:
+            QMessageBox.information(self, "Impact Spectra", "Scan a case folder or batch root first.")
+            return
+        detector_no = int(self.cmb_detector.currentData() or 1)
+        default_root = Path(self.edit_root.text().strip() or str(Path.cwd()))
+        default_name = f"impact_detector_{detector_no:02d}.png"
+        start_path = str(default_root / default_name)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export impact-detector plot",
+            start_path,
+            "PNG image (*.png)",
+        )
+        if not out_path:
+            return
+        try:
+            saved = self._plot_series(
+                self._selected_cases(),
+                detector_no,
+                str(self.cmb_xaxis.currentData() or "keV"),
+                self._selected_series(),
+                out_path,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Impact Spectra", f"Could not export PNG:\n{exc}")
+            return
+        self.status_message.emit(f"Exported impact-detector plot: {saved.name}")
+        QMessageBox.information(self, "Impact Spectra", f"PNG written to:\n{saved}")
+
+    def _load_openpyxl(self):
+        try:
+            import openpyxl
+        except Exception as exc:
+            QMessageBox.warning(self, "Impact Spectra", f"Could not import openpyxl:\n{exc}")
+            return None
+        return openpyxl
+
+    def _case_workbook_columns(self):
+        cols = [("Energy (eV)", "energy_eV"), ("Energy (keV)", "energy_keV")]
+        for key, label, _v_col, _u_col in self.IMPDET_SERIES:
+            cols.append((label, key))
+            cols.append((label.replace("spectrum", "STU (3 sigma)"), f"{key}_stu"))
+        return cols
+
+    def _safe_sheet_name(self, text, used=None):
+        used = used if used is not None else set()
+        name = re.sub(r'[:\\/?*\[\]]+', "_", str(text or "").strip()) or "Sheet"
+        name = name[:31]
+        base = name
+        counter = 2
+        while name in used:
+            suffix = f"_{counter}"
+            name = f"{base[:max(1, 31 - len(suffix))]}{suffix}"
+            counter += 1
+        used.add(name)
+        return name
+
+    def _insert_plot_sheet_image(self, workbook, plot_png_path, sheet_name="Plot"):
+        try:
+            from openpyxl.drawing.image import Image as XLImage
+        except Exception:
+            return
+        try:
+            plot_ws = workbook.create_sheet(title=sheet_name)
+            img = XLImage(str(plot_png_path))
+            img.anchor = "A1"
+            plot_ws.add_image(img)
+        except Exception:
+            pass
+
+    def _write_case_workbook(self, openpyxl, case_entry, detector_no, x_axis, series_keys):
+        file_path = case_entry["detectors"].get(detector_no)
+        if file_path is None:
+            return None
+        data = self._load_impdet_data(file_path)
+        out_path = case_entry["folder"] / f"{case_entry['folder'].name}_det{detector_no:02d}.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        ws["A1"] = case_entry["title"]
+        ws["A2"] = f"Detector {detector_no:02d}"
+        headers = [label for label, _key in self._case_workbook_columns()]
+        for col_idx, header in enumerate(headers, start=1):
+            ws.cell(4, col_idx).value = header
+        row_count = len(data["energy_eV"])
+        columns = self._case_workbook_columns()
+        for row_idx in range(row_count):
+            excel_row = 5 + row_idx
+            for col_idx, (_label, key) in enumerate(columns, start=1):
+                val = data[key][row_idx]
+                ws.cell(excel_row, col_idx).value = float(val)
+        for idx, header in enumerate(headers, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = max(15, len(header) + 2)
+        temp_dir = Path(tempfile.gettempdir()) / "penelope_studio_impdet_xlsx"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_png = temp_dir / f"{case_entry['folder'].name}_det{detector_no:02d}.png"
+        try:
+            self._plot_series([case_entry], detector_no, x_axis, series_keys, temp_png)
+            self._insert_plot_sheet_image(wb, temp_png)
+        except Exception:
+            pass
+        wb.save(out_path)
+        return out_path
+
+    def _write_batch_overlay_workbook(self, openpyxl, root_path, cases, detector_no, x_axis, series_keys):
+        matching_cases = [entry for entry in cases if detector_no in entry["detectors"]]
+        if not matching_cases:
+            return None
+        reference = self._load_impdet_data(matching_cases[0]["detectors"][detector_no])
+        ref_energy_eV = [float(v) for v in reference["energy_eV"]]
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Overlay"
+        ws["A1"] = f"ALL_SPECTRA - Detector {detector_no:02d}"
+        headers = ["Energy (eV)", "Energy (keV)"]
+        case_maps = []
+        for entry in matching_cases:
+            data = self._load_impdet_data(entry["detectors"][detector_no])
+            lookups = {}
+            for series_key in series_keys:
+                lookups[series_key] = {
+                    float(energy): float(val)
+                    for energy, val in zip(data["energy_eV"], data[series_key])
+                }
+                headers.append(f"{entry['folder'].name} - {self._series_label(series_key)}")
+            case_maps.append((entry, lookups))
+        for col_idx, header in enumerate(headers, start=1):
+            ws.cell(3, col_idx).value = header
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = max(16, min(42, len(header) + 2))
+        for row_idx, energy_eV in enumerate(ref_energy_eV, start=4):
+            ws.cell(row_idx, 1).value = float(energy_eV)
+            ws.cell(row_idx, 2).value = float(energy_eV) / 1000.0
+            col_idx = 3
+            for _entry, lookups in case_maps:
+                for series_key in series_keys:
+                    ws.cell(row_idx, col_idx).value = lookups[series_key].get(float(energy_eV))
+                    col_idx += 1
+        temp_dir = Path(tempfile.gettempdir()) / "penelope_studio_impdet_xlsx"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_png = temp_dir / f"ALL_SPECTRA_det{detector_no:02d}.png"
+        try:
+            self._plot_series(matching_cases, detector_no, x_axis, series_keys, temp_png)
+            self._insert_plot_sheet_image(wb, temp_png)
+        except Exception:
+            pass
+        out_path = Path(root_path) / f"ALL_SPECTRA_det{detector_no:02d}.xlsx"
+        wb.save(out_path)
+        return out_path
+
+    def _create_workbooks(self):
+        if not self._cases:
+            QMessageBox.information(self, "Impact Spectra", "Scan a case folder or batch root first.")
+            return
+        openpyxl = self._load_openpyxl()
+        if openpyxl is None:
+            return
+        cases = self._selected_cases()
+        series_keys = self._selected_series() or ["photon"]
+        x_axis = str(self.cmb_xaxis.currentData() or "keV")
+        detector_union = sorted({det_no for entry in cases for det_no in entry["detectors"]})
+        case_workbooks = []
+        for entry in cases:
+            for det_no in sorted(entry["detectors"]):
+                try:
+                    written = self._write_case_workbook(openpyxl, entry, det_no, x_axis, series_keys)
+                except Exception as exc:
+                    self.status_message.emit(f"Could not write detector workbook for {entry['folder'].name}: {exc}")
+                    continue
+                if written is not None:
+                    case_workbooks.append(written)
+        overlay_workbooks = []
+        if self.cmb_mode.currentData() == "batch":
+            root_path = Path(self.edit_root.text().strip())
+            for det_no in detector_union:
+                try:
+                    written = self._write_batch_overlay_workbook(openpyxl, root_path, cases, det_no, x_axis, series_keys)
+                except Exception as exc:
+                    self.status_message.emit(f"Could not write ALL_SPECTRA workbook det {det_no:02d}: {exc}")
+                    continue
+                if written is not None:
+                    overlay_workbooks.append(written)
+        msg = f"Created {len(case_workbooks)} detector workbook(s)"
+        if overlay_workbooks:
+            msg += f" and {len(overlay_workbooks)} ALL_SPECTRA workbook(s)"
+        msg += "."
+        self.status_message.emit(msg)
+        QMessageBox.information(self, "Impact Spectra", msg)
+
+
+class PlotAnalysisTab(QWidget):
+    status_message = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image_panes = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(10)
+        tabs = QTabWidget()
+        tabs.setStyleSheet(tabs_css())
+
+        compare_page = QWidget()
+        compare_lay = QVBoxLayout(compare_page)
+        compare_lay.setContentsMargins(0, 0, 0, 0)
+        compare_lay.setSpacing(10)
+
+        top = QFrame()
+        top.setStyleSheet(
+            f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:10px; }}"
+        )
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(10, 10, 10, 10)
+        top_lay.setSpacing(6)
+        title = QLabel("Image Compare")
+        title.setStyleSheet(label_css(P["accent"], bold=True, size=11))
+        top_lay.addWidget(title)
+        hint = QLabel(
+            "Compare up to 6 plot images side by side. Each slot can load a PNG or JPEG from a different folder."
+        )
+        hint.setStyleSheet(label_css(P["fg2"], size=9))
+        hint.setWordWrap(True)
+        top_lay.addWidget(hint)
+        compare_lay.addWidget(top)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        for idx in range(6):
+            pane = PlotImagePane(idx + 1)
+            pane.status_message.connect(self.status_message.emit)
+            self._image_panes.append(pane)
+            grid.addWidget(pane, idx // 3, idx % 3)
+        compare_lay.addLayout(grid, 1)
+        tabs.addTab(compare_page, "Image Compare")
+
+        self.impdet_tab = ImpactSpectraTab()
+        self.impdet_tab.status_message.connect(self.status_message.emit)
+        tabs.addTab(self.impdet_tab, "Impact Spectra")
+
+        outer.addWidget(tabs, 1)
+
+
 class AnalysisTab(QWidget):
     status_message = Signal(str)
     DOSE_HEADERS = [
@@ -31123,7 +32426,7 @@ class AnalysisTab(QWidget):
         "Edep (J)", "dE (J)", "Error (%)",
         "Dose (Gy)", "dDose (Gy)",
         "N ref", "Time ref (s)", "Target Err (%)", "NSIMSH @5%", "Time @5% (s)",
-        "Quality", "Geometry Type",
+        "Quality", "Geometry Type", "Spectrum Type",
     ]
     DOSE_CONFIG_SHEET = "__DOSE_CONFIG__"
     EV_TO_J = 1.602176634e-19
@@ -31589,7 +32892,11 @@ class AnalysisTab(QWidget):
                 str(ws.cell(1, col).value or "").strip()
                 for col in range(1, len(self.DOSE_HEADERS) + 1)
             ]
-            return headers == self.DOSE_HEADERS
+            legacy_headers = self.DOSE_HEADERS[:-1]
+            return (
+                headers[:len(self.DOSE_HEADERS)] == self.DOSE_HEADERS
+                or headers[:len(legacy_headers)] == legacy_headers
+            )
         except Exception:
             return False
 
@@ -34419,8 +35726,50 @@ class AnalysisTab(QWidget):
         ws.auto_filter.ref = f"A1:{last_col_letter}{max_row}"
         ws.freeze_panes = "A2"
 
+    def _analysis_spectrum_type_from_text(self, text):
+        return self._parse_spectrum_type_metadata(text)
+
+    def _analysis_guess_spectrum_type(self, folder, text=""):
+        folder = Path(folder) if folder else Path.cwd()
+        joined = " ".join(
+            str(part or "")
+            for part in (
+                folder.name,
+                folder.parent.name if folder.parent else "",
+                text or "",
+            )
+        ).lower()
+        if any(token in joined for token in ("cobalt", "co-60", "co60", "cobalt-60")):
+            return "Cobalt-60 source"
+        if "linac" in joined and "6mev" in joined:
+            return "LINAC 6MeV"
+        if "6mev" in joined:
+            return "LINAC 6MeV"
+        return ""
+
+    def _analysis_spectrum_type_for_workspace(self, folder):
+        folder = Path(folder) if folder else None
+        if not folder or not folder.exists():
+            return ""
+        label = self._read_spectrum_type_metadata_file(folder)
+        if label:
+            return label
+        for in_path in sorted(folder.glob("*.in")):
+            try:
+                text = _decode_text_bytes(in_path.read_bytes())
+            except Exception:
+                continue
+            label = self._parse_spectrum_type_metadata(text, in_path)
+            if label:
+                return label
+            guessed = self._analysis_guess_spectrum_type(folder, text=text)
+            if guessed:
+                return guessed
+        return self._analysis_guess_spectrum_type(folder)
+
     def _dose_rows_for_current_results(self):
         case = self._workspace.name if self._workspace else ""
+        spectrum_type = self._analysis_spectrum_type_for_workspace(self._workspace)
         total_edep = 0.0
         total_dedep_sq = 0.0
         total_mass = 0.0
@@ -34461,6 +35810,7 @@ class AnalysisTab(QWidget):
                 t_target,
                 "",
                 result.get("geometry_type", ""),
+                spectrum_type,
             ])
         total_dedep = total_dedep_sq ** 0.5
         total_error = abs(total_dedep / total_edep * 100.0) if total_edep else ""
@@ -34496,6 +35846,7 @@ class AnalysisTab(QWidget):
             t_target_total,
             "",
             "Total",
+            spectrum_type,
         ])
         return case, rows
 
@@ -34604,6 +35955,8 @@ class AnalysisTab(QWidget):
         target_err = sample[15] if len(sample) > 15 else f"{self._target_error_value():g}"
         n_target = ""
         t_target = ""
+        spectrum_type_idx = self.DOSE_HEADERS.index("Spectrum Type") if "Spectrum Type" in self.DOSE_HEADERS else -1
+        spectrum_type = sample[spectrum_type_idx] if spectrum_type_idx >= 0 and len(sample) > spectrum_type_idx else ""
         try:
             target_err_value = float(target_err)
             n_ref_value = float(n_ref)
@@ -34645,6 +35998,7 @@ class AnalysisTab(QWidget):
             t_target,
             quality,
             "Total",
+            spectrum_type,
         ]
 
     def _component_filtered_rows(self, rows, selected_components):
@@ -36248,6 +37602,9 @@ class AnalysisTab(QWidget):
                 data.setdefault("seed2", int(match.group(2)))
             if in_path:
                 data.setdefault("input", str(in_path))
+        spectrum_type = self._read_spectrum_type_metadata_file(folder)
+        if spectrum_type:
+            data.setdefault("spectrum_type", spectrum_type)
         return data
 
     def _combine_penmain_compatibility_report(self, runs):
@@ -37174,6 +38531,8 @@ class PenelopeStudio(QMainWindow):
         self.geo_tab.set_simulation_tab(self.sim_tab)
         self._startup_report("Creating Analysis tools", "Initializing result loading, append, and dose-analysis tools.")
         self.analysis_tab = AnalysisTab()
+        self._startup_report("Creating Plot Analysis tools", "Initializing side-by-side plot comparison tools.")
+        self.plot_analysis_tab = PlotAnalysisTab()
         self.geo_tab.set_material_executable(self._material_exe)
         self.sim_tab.set_global_executables({
             "gview2d": self._gview2d,
@@ -37187,10 +38546,12 @@ class PenelopeStudio(QMainWindow):
         self.tabs.addTab(self.geo_tab, "Geometry Viewer")
         self.tabs.addTab(self.sim_tab, "Simulation (.in)")
         self.tabs.addTab(self.analysis_tab, "Analysis (.dat)")
+        self.tabs.addTab(self.plot_analysis_tab, "Plot Analysis")
 
         self.geo_tab.status_message.connect(self.statusBar().showMessage)
         self.sim_tab.status_message.connect(self.statusBar().showMessage)
         self.analysis_tab.status_message.connect(self.statusBar().showMessage)
+        self.plot_analysis_tab.status_message.connect(self.statusBar().showMessage)
         self.sim_tab.risk_assessment_requested.connect(self._open_risk_assessment_from_sim)
         self._startup_report("Building project explorer", "Preparing the sidebar tree for project folders and linked files.")
         self._project_sidebar = self._build_project_sidebar()
