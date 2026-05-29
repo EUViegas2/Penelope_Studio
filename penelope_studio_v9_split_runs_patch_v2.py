@@ -17473,8 +17473,18 @@ class SimulationTab(QWidget):
             "penmain": "penmain",
             "material": "",
         }
+        self._remote_worker_shared_root = ""
+        self._remote_worker_desktop_root = ""
+        self._remote_worker_host = ""
+        self._remote_worker_user = ""
+        self._remote_worker_port = 22
+        self._remote_worker_key_path = ""
+        self._remote_worker_local_results_root = ""
+        self._remote_worker_auto_launch = False
+        self._load_remote_worker_settings()
         self._startup_followups_scheduled = False
         self._build()
+        self._update_remote_worker_widgets()
         self._refresh_workspace_root_choices()
         self._ext_poll_timer = QTimer(self)
         self._ext_poll_timer.timeout.connect(self._poll_external_sims)
@@ -18228,6 +18238,41 @@ class SimulationTab(QWidget):
         batch_wrap.addLayout(batch_row_top)
         batch_wrap.addLayout(batch_row_bottom)
         rl.addLayout(batch_wrap)
+
+        remote_hint = QLabel("Dispatch selected batch cases to a shared desktop worker folder and optionally launch them over SSH.")
+        remote_hint.setStyleSheet(label_css(P["fg"], size=9))
+        remote_hint.setWordWrap(True)
+        rl.addWidget(remote_hint)
+
+        self.lbl_remote_worker = QLabel("Remote worker: not configured")
+        self.lbl_remote_worker.setStyleSheet(label_css(P["fg2"], size=9))
+        self.lbl_remote_worker.setWordWrap(True)
+        rl.addWidget(self.lbl_remote_worker)
+
+        remote_row = QHBoxLayout()
+        remote_row.setSpacing(6)
+        remote_setup_btn = QPushButton("Remote Setup")
+        remote_setup_btn.setToolTip("Configure the shared jobs folder, optional SSH launch target, and local pull-back folder.")
+        remote_setup_btn.setStyleSheet(btn_css(width=108))
+        remote_setup_btn.clicked.connect(self._open_remote_worker_setup)
+        remote_row.addWidget(remote_setup_btn)
+        remote_dispatch_selected_btn = QPushButton("Dispatch Selected")
+        remote_dispatch_selected_btn.setToolTip("Package selected batch case folders into a remote worker job.")
+        remote_dispatch_selected_btn.setStyleSheet(btn_css(width=122))
+        remote_dispatch_selected_btn.clicked.connect(self._dispatch_selected_remote_batch)
+        remote_row.addWidget(remote_dispatch_selected_btn)
+        remote_dispatch_all_btn = QPushButton("Dispatch All")
+        remote_dispatch_all_btn.setToolTip("Package every detected batch case into one remote worker job.")
+        remote_dispatch_all_btn.setStyleSheet(btn_css(width=98))
+        remote_dispatch_all_btn.clicked.connect(self._dispatch_all_remote_batch)
+        remote_row.addWidget(remote_dispatch_all_btn)
+        remote_pull_btn = QPushButton("Pull Results")
+        remote_pull_btn.setToolTip("Copy finished remote-worker case folders back into a local results root.")
+        remote_pull_btn.setStyleSheet(btn_css(width=94))
+        remote_pull_btn.clicked.connect(self._pull_remote_worker_results)
+        remote_row.addWidget(remote_pull_btn)
+        remote_row.addStretch()
+        rl.addLayout(remote_row)
 
         rl.addWidget(self._separator_line())
 
@@ -20562,6 +20607,279 @@ class SimulationTab(QWidget):
     def _workspace_folder(self):
         return Path(self._workspace_root) if self._workspace_root else self._in_folder()
 
+    def _load_remote_worker_settings(self):
+        settings = QSettings("CodAI", "PenelopeStudio")
+        self._remote_worker_shared_root = str(settings.value("simulation/remote_worker/shared_root", self._remote_worker_shared_root) or "")
+        self._remote_worker_desktop_root = str(settings.value("simulation/remote_worker/desktop_root", self._remote_worker_desktop_root) or "")
+        self._remote_worker_host = str(settings.value("simulation/remote_worker/host", self._remote_worker_host) or "")
+        self._remote_worker_user = str(settings.value("simulation/remote_worker/user", self._remote_worker_user) or "")
+        self._remote_worker_key_path = str(settings.value("simulation/remote_worker/key_path", self._remote_worker_key_path) or "")
+        self._remote_worker_local_results_root = str(settings.value("simulation/remote_worker/local_results_root", self._remote_worker_local_results_root) or "")
+        try:
+            self._remote_worker_port = max(
+                1,
+                int(settings.value("simulation/remote_worker/port", self._remote_worker_port) or self._remote_worker_port or 22),
+            )
+        except Exception:
+            self._remote_worker_port = 22
+        self._remote_worker_auto_launch = _coerce_bool_setting(
+            settings.value("simulation/remote_worker/auto_launch", self._remote_worker_auto_launch),
+            default=self._remote_worker_auto_launch,
+        )
+
+    def _save_remote_worker_settings(self):
+        settings = QSettings("CodAI", "PenelopeStudio")
+        settings.setValue("simulation/remote_worker/shared_root", self._remote_worker_shared_root)
+        settings.setValue("simulation/remote_worker/desktop_root", self._remote_worker_desktop_root)
+        settings.setValue("simulation/remote_worker/host", self._remote_worker_host)
+        settings.setValue("simulation/remote_worker/user", self._remote_worker_user)
+        settings.setValue("simulation/remote_worker/port", int(self._remote_worker_port or 22))
+        settings.setValue("simulation/remote_worker/key_path", self._remote_worker_key_path)
+        settings.setValue("simulation/remote_worker/local_results_root", self._remote_worker_local_results_root)
+        settings.setValue("simulation/remote_worker/auto_launch", bool(self._remote_worker_auto_launch))
+        settings.sync()
+
+    def _remote_worker_config(self):
+        return {
+            "shared_root": self._remote_worker_shared_root,
+            "desktop_root": self._remote_worker_desktop_root,
+            "host": self._remote_worker_host,
+            "user": self._remote_worker_user,
+            "port": int(self._remote_worker_port or 22),
+            "key_path": self._remote_worker_key_path,
+            "local_results_root": self._remote_worker_local_results_root,
+            "auto_launch": bool(self._remote_worker_auto_launch),
+        }
+
+    def _remote_worker_shared_root_path(self):
+        text = str(self._remote_worker_shared_root or "").strip()
+        return Path(text) if text else None
+
+    def _remote_worker_results_root_path(self):
+        text = str(self._remote_worker_local_results_root or "").strip()
+        if text:
+            return Path(text)
+        return self._workspace_folder() / "remote_results"
+
+    def _remote_worker_display_path(self, path):
+        if not path:
+            return "not set"
+        try:
+            return self._project_display_path_text(path)
+        except Exception:
+            return str(path)
+
+    def _update_remote_worker_widgets(self):
+        if not hasattr(self, "lbl_remote_worker"):
+            return
+        shared_root = self._remote_worker_shared_root_path()
+        if not shared_root:
+            text = "Remote worker: not configured. Set a shared jobs folder to dispatch batch cases to another PC."
+            tooltip = text
+        else:
+            parts = [f"shared {self._remote_worker_display_path(shared_root)}"]
+            pull_root = self._remote_worker_results_root_path()
+            if pull_root:
+                parts.append(f"pull {self._remote_worker_display_path(pull_root)}")
+            if self._remote_worker_host and self._remote_worker_user:
+                launch_mode = "auto SSH launch" if self._remote_worker_auto_launch else "manual SSH launch"
+                parts.append(
+                    f"{launch_mode} {self._remote_worker_user}@{self._remote_worker_host}:{int(self._remote_worker_port or 22)}"
+                )
+            else:
+                parts.append("manual desktop launch")
+            if self._remote_worker_desktop_root:
+                parts.append(f"desktop root {self._remote_worker_desktop_root}")
+            text = "Remote worker: " + " | ".join(parts)
+            tooltip = (
+                f"Shared jobs root: {shared_root}\n"
+                f"Desktop jobs root: {self._remote_worker_desktop_root or '(not set)'}\n"
+                f"SSH target: {self._remote_worker_user or '(user)'}@{self._remote_worker_host or '(host)'}:{int(self._remote_worker_port or 22)}\n"
+                f"Auto launch: {'on' if self._remote_worker_auto_launch else 'off'}\n"
+                f"Local results root: {self._remote_worker_results_root_path()}"
+            )
+        self.lbl_remote_worker.setText(text)
+        self.lbl_remote_worker.setToolTip(tooltip)
+
+    def _open_remote_worker_setup(self):
+        dlg = RemoteWorkerSetupDialog(self._remote_worker_config(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        config = dlg.config()
+        self._remote_worker_shared_root = str(config.get("shared_root", "") or "")
+        self._remote_worker_desktop_root = str(config.get("desktop_root", "") or "")
+        self._remote_worker_host = str(config.get("host", "") or "")
+        self._remote_worker_user = str(config.get("user", "") or "")
+        self._remote_worker_key_path = str(config.get("key_path", "") or "")
+        self._remote_worker_local_results_root = str(config.get("local_results_root", "") or "")
+        try:
+            self._remote_worker_port = max(1, int(config.get("port", 22) or 22))
+        except Exception:
+            self._remote_worker_port = 22
+        self._remote_worker_auto_launch = bool(config.get("auto_launch", False))
+        self._save_remote_worker_settings()
+        self._update_remote_worker_widgets()
+        self.console.log("[SIM] Remote worker settings updated.\n", "info")
+        return True
+
+    def _ensure_remote_worker_ready(self, require_shared_root=True):
+        shared_root = self._remote_worker_shared_root_path()
+        if require_shared_root and not shared_root:
+            QMessageBox.information(
+                self,
+                "Remote Worker",
+                "Set up the Remote Worker shared jobs folder first.",
+            )
+            if not self._open_remote_worker_setup():
+                return None
+            shared_root = self._remote_worker_shared_root_path()
+        if require_shared_root and not shared_root:
+            return None
+        if shared_root:
+            try:
+                shared_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Remote Worker",
+                    f"Could not create or access the shared jobs root.\n\n{shared_root}\n\n{exc}",
+                )
+                return None
+        return shared_root
+
+    def _remote_worker_safe_name(self, text, fallback="job"):
+        raw = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
+        return raw.strip("._-") or fallback
+
+    def _remote_worker_case_relative_path(self, folder, batch_root=None):
+        folder = Path(folder)
+        base = Path(batch_root) if batch_root else self._batch_root_folder()
+        try:
+            rel = folder.resolve().relative_to(base.resolve())
+            return rel
+        except Exception:
+            return Path(folder.name)
+
+    def _remote_worker_job_folder(self, job_name):
+        shared_root = self._remote_worker_shared_root_path()
+        if not shared_root:
+            return None
+        candidate = shared_root / job_name
+        if not candidate.exists():
+            return candidate
+        for idx in range(1, 10000):
+            alt = shared_root / f"{job_name}_{idx}"
+            if not alt.exists():
+                return alt
+        return shared_root / f"{job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+    def _remote_worker_desktop_job_path(self, job_name):
+        base = str(self._remote_worker_desktop_root or "").strip()
+        if not base:
+            return ""
+        return str(Path(base) / job_name)
+
+    def _remote_worker_job_display_name(self, folders):
+        batch_root = self._batch_root_folder()
+        root_name = self._remote_worker_safe_name(batch_root.name, "cases")
+        first = folders[0].name if folders else "batch"
+        first_name = self._remote_worker_safe_name(first, "batch")
+        stamp = datetime.now().strftime("remote_%Y%m%d_%H%M%S")
+        return f"{stamp}_{root_name}_{first_name}"
+
+    def _remote_worker_case_launch_cmd_text(self, input_name):
+        return "\r\n".join([
+            "@echo off",
+            "cd /d \"%~dp0\"",
+            f"penmain.exe < \"{input_name}\"",
+            "",
+        ])
+
+    def _remote_worker_launcher_cmd_text(self):
+        return "\r\n".join([
+            "@echo off",
+            "cd /d \"%~dp0\"",
+            "start \"\" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0run_remote_job.ps1\"",
+            "exit /b 0",
+            "",
+        ])
+
+    def _remote_worker_runner_script_text(self):
+        return (
+            "$ErrorActionPreference = 'Stop'\r\n"
+            "$jobRoot = Split-Path -Parent $MyInvocation.MyCommand.Path\r\n"
+            "$manifestPath = Join-Path $jobRoot 'remote_job_manifest.json'\r\n"
+            "$statusPath = Join-Path $jobRoot 'remote_job_status.json'\r\n"
+            "if (-not (Test-Path -LiteralPath $manifestPath)) { throw \"Missing remote_job_manifest.json\" }\r\n"
+            "$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json\r\n"
+            "$maxParallel = [Math]::Max(1, [int]$manifest.max_parallel)\r\n"
+            "$runScripts = @(Get-ChildItem -LiteralPath (Join-Path $jobRoot 'cases') -Recurse -Filter 'run_penelope_remote.cmd' -File | Sort-Object FullName)\r\n"
+            "function Write-Status($state, $message, $running, $completed, $pending, $lastCase, $results) {\r\n"
+            "  $payload = [ordered]@{\r\n"
+            "    schema = 'penelope_remote_worker_status_v1'\r\n"
+            "    job_id = $manifest.job_id\r\n"
+            "    state = $state\r\n"
+            "    message = $message\r\n"
+            "    updated_at = (Get-Date).ToString('s')\r\n"
+            "    running = $running\r\n"
+            "    completed = $completed\r\n"
+            "    pending = $pending\r\n"
+            "    last_case = $lastCase\r\n"
+            "    results = $results\r\n"
+            "  }\r\n"
+            "  $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $statusPath -Encoding UTF8\r\n"
+            "}\r\n"
+            "if ($runScripts.Count -eq 0) {\r\n"
+            "  Write-Status 'failed' 'No run_penelope_remote.cmd files were found.' 0 0 0 '' @()\r\n"
+            "  throw 'No run_penelope_remote.cmd files found under cases root.'\r\n"
+            "}\r\n"
+            "$pending = New-Object System.Collections.Queue\r\n"
+            "foreach ($script in $runScripts) {\r\n"
+            "  $pending.Enqueue([pscustomobject]@{\r\n"
+            "    name = $script.Directory.Name\r\n"
+            "    directory = $script.Directory.FullName\r\n"
+            "    script = $script.FullName\r\n"
+            "  })\r\n"
+            "}\r\n"
+            "$active = New-Object System.Collections.ArrayList\r\n"
+            "$results = New-Object System.Collections.ArrayList\r\n"
+            "Write-Status 'running' 'Remote worker started.' 0 0 $pending.Count '' @()\r\n"
+            "while ($pending.Count -gt 0 -or $active.Count -gt 0) {\r\n"
+            "  while ($pending.Count -gt 0 -and $active.Count -lt $maxParallel) {\r\n"
+            "    $task = $pending.Dequeue()\r\n"
+            "    $proc = Start-Process -FilePath $task.script -WorkingDirectory $task.directory -WindowStyle Hidden -PassThru\r\n"
+            "    [void]$active.Add([pscustomobject]@{ name = $task.name; directory = $task.directory; proc = $proc })\r\n"
+            "    Write-Status 'running' ('Started ' + $task.name) $active.Count $results.Count $pending.Count $task.name @($results)\r\n"
+            "  }\r\n"
+            "  $nextActive = New-Object System.Collections.ArrayList\r\n"
+            "  foreach ($entry in @($active)) {\r\n"
+            "    if ($entry.proc.HasExited) {\r\n"
+            "      [void]$results.Add([ordered]@{\r\n"
+            "        name = $entry.name\r\n"
+            "        directory = $entry.directory\r\n"
+            "        exit_code = $entry.proc.ExitCode\r\n"
+            "        finished_at = (Get-Date).ToString('s')\r\n"
+            "      })\r\n"
+            "    } else {\r\n"
+            "      [void]$nextActive.Add($entry)\r\n"
+            "    }\r\n"
+            "  }\r\n"
+            "  $active = $nextActive\r\n"
+            "  Write-Status 'running' 'Remote worker active.' $active.Count $results.Count $pending.Count '' @($results)\r\n"
+            "  if ($pending.Count -gt 0 -or $active.Count -gt 0) { Start-Sleep -Seconds 2 }\r\n"
+            "}\r\n"
+            "Write-Status 'finished' 'Remote worker finished.' 0 $results.Count 0 '' @($results)\r\n"
+        )
+
+    def _remote_worker_launch_command_text(self, job_name):
+        desktop_job_root = self._remote_worker_desktop_job_path(job_name)
+        if desktop_job_root:
+            return str(Path(desktop_job_root) / "launch_remote_job.cmd")
+        shared_root = self._remote_worker_shared_root_path()
+        if shared_root:
+            return str(shared_root / job_name / "launch_remote_job.cmd")
+        return ""
+
     def _path_resolve_key(self, path):
         if not path:
             return ""
@@ -20579,6 +20897,7 @@ class SimulationTab(QWidget):
         if hasattr(self, "lbl_workspace_root"):
             self.lbl_workspace_root.setText(f"Case Root: {self._project_display_path_text(folder)}")
             self.lbl_workspace_root.setToolTip(folder)
+        self._update_remote_worker_widgets()
         self._refresh_workspace_root_choices(preferred=folder)
         if log_label:
             self.console.log(f"[SIM] {log_label}: {folder}\n", "info")
@@ -29092,6 +29411,393 @@ class SimulationTab(QWidget):
         run_folder = Path(run.get("run_folder", path.parent))
         self.console.log(f"[SIM] Opened queued input for checking: {path.name} from {run_folder}\n", "info")
 
+    def _copy_tree_contents(self, src_root, dst_root, overwrite=True):
+        src_root = Path(src_root)
+        dst_root = Path(dst_root)
+        if not src_root.exists() or not src_root.is_dir():
+            raise FileNotFoundError(f"Source folder not found: {src_root}")
+        dst_root.mkdir(parents=True, exist_ok=True)
+        for dirpath_str, dirnames, filenames in os.walk(str(src_root)):
+            dirpath = Path(dirpath_str)
+            rel = dirpath.relative_to(src_root)
+            target_dir = dst_root if str(rel) == "." else (dst_root / rel)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dirnames[:] = sorted(dirnames)
+            for filename in sorted(filenames):
+                self._safe_copy_file(dirpath / filename, target_dir / filename, overwrite=overwrite)
+
+    def _unique_target_folder(self, base_folder, name):
+        base_folder = Path(base_folder)
+        base_folder.mkdir(parents=True, exist_ok=True)
+        target = base_folder / name
+        if not target.exists():
+            return target
+        safe = self._remote_worker_safe_name(name, "job")
+        for idx in range(1, 10000):
+            candidate = base_folder / f"{safe}_{idx}"
+            if not candidate.exists():
+                return candidate
+        return base_folder / f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+    def _launch_remote_worker_job(self, job_name):
+        if not (self._remote_worker_host and self._remote_worker_user and self._remote_worker_desktop_root):
+            return False, "SSH launch is not configured."
+        remote_launch = str(Path(self._remote_worker_desktop_root) / job_name / "launch_remote_job.cmd")
+        escaped_launch = remote_launch.replace("'", "''")
+        remote_cmd = (
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+            f"\"& '{escaped_launch}'\""
+        )
+        args = ["ssh", "-p", str(int(self._remote_worker_port or 22))]
+        if self._remote_worker_key_path:
+            args.extend(["-i", self._remote_worker_key_path])
+        args.append(f"{self._remote_worker_user}@{self._remote_worker_host}")
+        args.append(remote_cmd)
+        try:
+            completed = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                **_hidden_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip() or f"ssh exited with {completed.returncode}"
+            return False, detail
+        return True, (completed.stdout or "SSH launch requested.").strip()
+
+    def _scan_remote_worker_jobs(self):
+        shared_root = self._remote_worker_shared_root_path()
+        jobs = []
+        if not shared_root or not shared_root.exists() or not shared_root.is_dir():
+            return jobs
+        try:
+            candidates = sorted(
+                [p for p in shared_root.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            candidates = []
+        for folder in candidates:
+            manifest_path = folder / "remote_job_manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            status_path = folder / "remote_job_status.json"
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+            except Exception:
+                status = {}
+            jobs.append({
+                "path": folder,
+                "job_id": str(manifest.get("job_id", folder.name) or folder.name),
+                "created_at": str(manifest.get("created_at", "") or ""),
+                "case_count": int(manifest.get("case_count", 0) or 0),
+                "max_parallel": int(manifest.get("max_parallel", 0) or 0),
+                "state": str(status.get("state", manifest.get("state", "dispatched")) or "dispatched"),
+                "message": str(status.get("message", "") or ""),
+                "completed": int(status.get("completed", 0) or 0),
+                "pending": int(status.get("pending", 0) or 0),
+                "running": int(status.get("running", 0) or 0),
+            })
+        return jobs
+
+    def _choose_remote_worker_job(self, title, hint_text):
+        jobs = self._scan_remote_worker_jobs()
+        if not jobs:
+            QMessageBox.information(
+                self,
+                title,
+                "No remote worker jobs were found under the configured shared jobs root.",
+            )
+            return None
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setModal(True)
+        dlg.setMinimumWidth(760)
+        dlg.setMinimumHeight(440)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(hint_text)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(label_css(P["fg2"], size=9))
+        lay.addWidget(hint)
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        lst.setStyleSheet(
+            f"QListWidget {{ background:{P['bg2']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item {{ padding:4px; }}"
+        )
+        for idx, job in enumerate(jobs):
+            label = (
+                f"{job['job_id']} | state={job['state']} | cases={job['case_count']} | "
+                f"running={job['running']} | completed={job['completed']} | pending={job['pending']}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            item.setToolTip(
+                f"Folder: {job['path']}\n"
+                f"Created: {job['created_at'] or '?'}\n"
+                f"Message: {job['message'] or '(none)'}"
+            )
+            lst.addItem(item)
+        if lst.count():
+            lst.setCurrentRow(0)
+        lst.itemDoubleClicked.connect(lambda *_: dlg.accept())
+        lay.addWidget(lst, stretch=1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted or lst.currentItem() is None:
+            return None
+        return jobs[int(lst.currentItem().data(Qt.ItemDataRole.UserRole))]
+
+    def _dispatch_selected_remote_batch(self):
+        selected_folders = self._select_batch_folders_dialog(
+            "Remote Worker - Dispatch Selected",
+            "Select the complete case folders to package for the remote desktop worker.",
+        )
+        if selected_folders is None:
+            return
+        if not selected_folders:
+            QMessageBox.information(self, "Remote Worker", "No cases were selected.")
+            return
+        self._dispatch_remote_batch_folders(selected_folders, "Selected remote dispatch")
+
+    def _dispatch_all_remote_batch(self):
+        folders = self._batch_workspace_folders()
+        if not folders:
+            QMessageBox.warning(
+                self,
+                "Remote Worker",
+                "No complete case folders were found under the selected Case Root.\n\nA batch case must contain .in, .geo, and .mat files.",
+            )
+            return
+        self._dispatch_remote_batch_folders(folders, "Remote dispatch")
+
+    def _dispatch_remote_batch_folders(self, folders, label):
+        shared_root = self._ensure_remote_worker_ready(require_shared_root=True)
+        if not shared_root:
+            return
+        folders = [Path(folder) for folder in folders if Path(folder).exists()]
+        if not folders:
+            QMessageBox.warning(self, "Remote Worker", "None of the selected case folders still exist.")
+            return
+        batch_root = self._batch_root_folder()
+        job_name = self._remote_worker_job_display_name(folders)
+        job_root = self._remote_worker_job_folder(job_name)
+        if not job_root:
+            QMessageBox.warning(self, "Remote Worker", "Could not resolve the remote shared jobs root.")
+            return
+        cases_root = job_root / "cases"
+        manifest_cases = []
+        copied_case_count = 0
+        staged_errors = []
+        job_root.mkdir(parents=True, exist_ok=True)
+        try:
+            for folder in folders:
+                in_files = [path for path in sorted(folder.glob("*.in")) if path.is_file()]
+                if not in_files:
+                    continue
+                rel_case_dir = self._remote_worker_case_relative_path(folder, batch_root=batch_root)
+                multi_input = len(in_files) > 1
+                for in_path in in_files:
+                    staged_case_dir = cases_root / rel_case_dir
+                    if multi_input:
+                        staged_case_dir = staged_case_dir / in_path.stem
+                    local_in_path, copied_counts, copied_execs = self._prepare_runtime_case_files(
+                        in_path,
+                        staged_case_dir,
+                        batch=True,
+                    )
+                    launch_cmd = staged_case_dir / "run_penelope_remote.cmd"
+                    launch_cmd.write_text(
+                        self._remote_worker_case_launch_cmd_text(local_in_path.name),
+                        encoding="utf-8",
+                        newline="\r\n",
+                    )
+                    meta_path = self._spectrum_type_metadata_path(in_path.parent)
+                    if meta_path.exists():
+                        self._safe_copy_file(meta_path, staged_case_dir / meta_path.name, overwrite=True)
+                    manifest_cases.append({
+                        "source_folder": str(folder),
+                        "relative_folder": str(rel_case_dir),
+                        "staged_folder": str(staged_case_dir.relative_to(job_root)),
+                        "input_file": local_in_path.name,
+                        "nsimsh": self._in_file_nsimsh(in_path),
+                        "geometry_file": self._in_file_geom_filename(in_path),
+                        "source_summary": self._in_file_source_summary(in_path),
+                        "spectrum_type": self._parse_spectrum_type_metadata(self._in_file_text(in_path), in_path),
+                        "copied_counts": dict(copied_counts or {}),
+                        "copied_execs": list(copied_execs or []),
+                    })
+                    copied_case_count += 1
+        except Exception as exc:
+            staged_errors.append(str(exc))
+
+        if staged_errors or copied_case_count == 0:
+            QMessageBox.warning(
+                self,
+                "Remote Worker",
+                "Remote job packaging did not complete successfully.\n\n"
+                + "\n".join(staged_errors or ["No case folders could be packaged."]),
+            )
+            return
+
+        manifest = {
+            "schema": "penelope_remote_worker_job_v1",
+            "job_id": job_root.name,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_case_root": str(batch_root),
+            "project_root": str(self._project_root or ""),
+            "shared_job_root": str(job_root),
+            "desktop_job_root": self._remote_worker_desktop_job_path(job_root.name),
+            "case_count": copied_case_count,
+            "max_parallel": int(self._batch_thread_limit()),
+            "state": "dispatched",
+            "cases": manifest_cases,
+        }
+        status = {
+            "schema": "penelope_remote_worker_status_v1",
+            "job_id": job_root.name,
+            "state": "dispatched",
+            "message": "Job package prepared by Penelope Studio.",
+            "created_at": manifest["created_at"],
+            "updated_at": manifest["created_at"],
+            "running": 0,
+            "completed": 0,
+            "pending": copied_case_count,
+            "results": [],
+        }
+        (job_root / "remote_job_manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (job_root / "remote_job_status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (job_root / "run_remote_job.ps1").write_text(
+            self._remote_worker_runner_script_text(),
+            encoding="utf-8",
+            newline="\r\n",
+        )
+        (job_root / "launch_remote_job.cmd").write_text(
+            self._remote_worker_launcher_cmd_text(),
+            encoding="utf-8",
+            newline="\r\n",
+        )
+
+        launch_note = ""
+        if self._remote_worker_auto_launch and self._remote_worker_host and self._remote_worker_user and self._remote_worker_desktop_root:
+            launched, detail = self._launch_remote_worker_job(job_root.name)
+            if launched:
+                launch_note = f"Remote launch requested over SSH.\n\n{detail or 'The worker accepted the launch request.'}"
+                self.console.log(f"[SIM] Remote worker SSH launch requested: {job_root.name}\n", "ok")
+            else:
+                launch_note = (
+                    "The job was copied successfully, but the SSH launch request failed.\n\n"
+                    f"{detail}\n\n"
+                    "You can still start it manually on the desktop using:\n"
+                    f"{self._remote_worker_launch_command_text(job_root.name)}"
+                )
+                self.console.log(f"[SIM] Remote worker SSH launch failed for {job_root.name}: {detail}\n", "warn")
+        else:
+            launch_note = (
+                "Start it manually on the desktop with:\n"
+                f"{self._remote_worker_launch_command_text(job_root.name)}"
+            )
+
+        self.console.log(
+            f"[SIM] {label}: packaged {copied_case_count} case(s) into remote job {job_root}\n",
+            "info",
+        )
+        self.status_message.emit(f"Remote worker job ready: {job_root.name}")
+        QMessageBox.information(
+            self,
+            "Remote Worker",
+            f"Remote job created.\n\n"
+            f"Job folder: {job_root}\n"
+            f"Cases packaged: {copied_case_count}\n"
+            f"Max parallel on worker: {int(self._batch_thread_limit())}\n\n"
+            f"{launch_note}",
+        )
+
+    def _pull_remote_worker_results(self):
+        shared_root = self._ensure_remote_worker_ready(require_shared_root=True)
+        if not shared_root:
+            return
+        job = self._choose_remote_worker_job(
+            "Pull Remote Results",
+            "Choose a remote worker job to copy back into a local results folder. The full packaged case folders are copied, including any generated .dat outputs.",
+        )
+        if not job:
+            return
+        state = str(job.get("state", "") or "").strip().lower()
+        if state and state not in {"finished", "completed", "done"}:
+            reply = QMessageBox.question(
+                self,
+                "Pull Remote Results",
+                "This job does not report a finished state yet.\n\n"
+                f"Current state: {job.get('state', '?')}\n"
+                f"Message: {job.get('message', '(none)')}\n\n"
+                "Copy the current partial results anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        results_root = self._remote_worker_results_root_path()
+        try:
+            results_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Pull Remote Results",
+                f"Could not create the local results root.\n\n{results_root}\n\n{exc}",
+            )
+            return
+        target_root = self._unique_target_folder(results_root, job["job_id"])
+        cases_root = Path(job["path"]) / "cases"
+        if not cases_root.exists():
+            QMessageBox.warning(
+                self,
+                "Pull Remote Results",
+                f"The selected job does not contain a cases folder.\n\n{cases_root}",
+            )
+            return
+        try:
+            self._copy_tree_contents(cases_root, target_root, overwrite=True)
+            for name in ("remote_job_manifest.json", "remote_job_status.json", "run_remote_job.ps1", "launch_remote_job.cmd"):
+                meta = Path(job["path"]) / name
+                if meta.exists():
+                    self._safe_copy_file(meta, target_root / name, overwrite=True)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Pull Remote Results",
+                f"Could not copy the remote results locally.\n\n{exc}",
+            )
+            return
+        self.console.log(
+            f"[SIM] Remote worker results pulled: {job['job_id']} -> {target_root}\n",
+            "info",
+        )
+        self.status_message.emit(f"Remote results pulled: {job['job_id']}")
+        QMessageBox.information(
+            self,
+            "Pull Remote Results",
+            f"Remote worker results copied to:\n{target_root}",
+        )
+
     def _run_batch_sims(self):
         self._queue_batch_files(self._batch_in_files(), "Batch run")
 
@@ -31336,6 +32042,148 @@ class SettingsDialog(QDialog):
     def material_exe(self): return self._em.text()
     @property
     def spectrum_db(self): return self._es.text()
+
+
+class RemoteWorkerSetupDialog(QDialog):
+    def __init__(self, config=None, parent=None):
+        super().__init__(parent)
+        config = dict(config or {})
+        self.setWindowTitle("Remote Worker Setup")
+        self.setModal(True)
+        self.setMinimumWidth(680)
+        self.setStyleSheet(
+            f"QDialog {{ background:{P['bg']}; }}"
+            f"QLabel {{ color:{P['fg']}; }}"
+        )
+
+        estr = entry_css()
+        bstr = (
+            f"QPushButton {{ background:{P['bg2']}; color:{P['fg']};"
+            f" border:1px solid {P['border']}; border-radius:3px;"
+            f" padding:3px 12px; }}"
+            f"QPushButton:hover {{ background:{P['bg3']}; }}"
+        )
+
+        self._shared_root = QLineEdit(str(config.get("shared_root", "") or ""))
+        self._shared_root.setStyleSheet(estr)
+        self._desktop_root = QLineEdit(str(config.get("desktop_root", "") or ""))
+        self._desktop_root.setStyleSheet(estr)
+        self._host = QLineEdit(str(config.get("host", "") or ""))
+        self._host.setStyleSheet(estr)
+        self._user = QLineEdit(str(config.get("user", "") or ""))
+        self._user.setStyleSheet(estr)
+        self._port = QLineEdit(str(config.get("port", 22) or 22))
+        self._port.setStyleSheet(estr)
+        self._port.setMaximumWidth(96)
+        self._key_path = QLineEdit(str(config.get("key_path", "") or ""))
+        self._key_path.setStyleSheet(estr)
+        self._local_results_root = QLineEdit(str(config.get("local_results_root", "") or ""))
+        self._local_results_root.setStyleSheet(estr)
+        self._auto_launch = QCheckBox("Start the remote job over SSH right after dispatch")
+        self._auto_launch.setStyleSheet(checkbox_css())
+        self._auto_launch.setChecked(bool(config.get("auto_launch", False)))
+
+        intro = QLabel(
+            "Remote Worker packages selected batch cases into a shared jobs folder that the desktop can access.\n\n"
+            "Shared jobs root: path this laptop can write to, such as a network share or synced folder.\n"
+            "Desktop jobs root: matching path as seen by the worker desktop when Studio triggers the job over SSH.\n"
+            "SSH is optional. If host/user are left blank, Studio will only prepare the job folder and show the desktop launch path."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(label_css(P["fg2"], size=9))
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(6)
+
+        def _browse_folder(field):
+            start_dir = field.text().strip() or str(Path.home())
+            folder = QFileDialog.getExistingDirectory(self, "Choose folder", start_dir)
+            if folder:
+                field.setText(folder)
+
+        def _folder_row(field, browse_title="Browse"):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            row.addWidget(field, 1)
+            btn = QPushButton(browse_title)
+            btn.setStyleSheet(bstr)
+            btn.clicked.connect(lambda checked=False, f=field: _browse_folder(f))
+            row.addWidget(btn)
+            return row
+
+        shared_row = _folder_row(self._shared_root)
+        form.addRow("Shared jobs root:", shared_row)
+
+        desktop_row = _folder_row(self._desktop_root)
+        form.addRow("Desktop jobs root:", desktop_row)
+
+        ssh_row = QHBoxLayout()
+        ssh_row.setContentsMargins(0, 0, 0, 0)
+        ssh_row.setSpacing(6)
+        ssh_row.addWidget(self._user, 1)
+        ssh_row.addWidget(QLabel("@"))
+        ssh_row.addWidget(self._host, 2)
+        ssh_row.addWidget(QLabel("Port"))
+        ssh_row.addWidget(self._port, 0)
+        form.addRow("SSH target:", ssh_row)
+
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(6)
+        key_row.addWidget(self._key_path, 1)
+        key_btn = QPushButton("Browse")
+        key_btn.setStyleSheet(bstr)
+        key_btn.clicked.connect(
+            lambda checked=False: self._browse_key_file(self._key_path)
+        )
+        key_row.addWidget(key_btn)
+        form.addRow("SSH key (optional):", key_row)
+
+        results_row = _folder_row(self._local_results_root)
+        form.addRow("Local results root:", results_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.setStyleSheet(bstr)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(intro)
+        lay.addLayout(form)
+        lay.addWidget(self._auto_launch)
+        lay.addWidget(buttons)
+
+    def _browse_key_file(self, field):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose SSH private key",
+            field.text().strip() or str(Path.home()),
+            "Key files (*.pem *.ppk *.key);;All files (*.*)",
+        )
+        if path:
+            field.setText(path)
+
+    def config(self):
+        port_text = self._port.text().strip()
+        try:
+            port = max(1, int(port_text or "22"))
+        except Exception:
+            port = 22
+        return {
+            "shared_root": self._shared_root.text().strip(),
+            "desktop_root": self._desktop_root.text().strip(),
+            "host": self._host.text().strip(),
+            "user": self._user.text().strip(),
+            "port": port,
+            "key_path": self._key_path.text().strip(),
+            "local_results_root": self._local_results_root.text().strip(),
+            "auto_launch": bool(self._auto_launch.isChecked()),
+        }
 
 
 ANALYSIS_SUMMARY_FIELDS = (
@@ -35725,6 +36573,44 @@ class AnalysisTab(QWidget):
 
         ws.auto_filter.ref = f"A1:{last_col_letter}{max_row}"
         ws.freeze_panes = "A2"
+
+    def _normalize_spectrum_type_label(self, value):
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:120]
+
+    def _spectrum_type_metadata_path(self, path_like):
+        if not path_like:
+            return None
+        try:
+            base = Path(path_like)
+        except Exception:
+            return None
+        folder = base if base.is_dir() else base.parent
+        return folder / "penelope_studio_case_metadata.json"
+
+    def _read_spectrum_type_metadata_file(self, path_like):
+        meta_path = self._spectrum_type_metadata_path(path_like)
+        if not meta_path or not meta_path.exists():
+            return ""
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        return self._normalize_spectrum_type_label(payload.get("spectrum_type"))
+
+    def _parse_spectrum_type_metadata(self, text="", source_path=None):
+        label = self._read_spectrum_type_metadata_file(source_path)
+        if label:
+            return label
+        match = re.search(
+            r"^\s*C\s+STUDIO_SPECTRUM_TYPE\s*:\s*(.*?)\s*$",
+            str(text or ""),
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if not match:
+            return ""
+        return self._normalize_spectrum_type_label(match.group(1))
 
     def _analysis_spectrum_type_from_text(self, text):
         return self._parse_spectrum_type_metadata(text)
