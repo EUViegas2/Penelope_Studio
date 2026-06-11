@@ -1,4 +1,6 @@
-# PENELOPE Studio V9 Updates
+# PENELOPE Studio V9 Historical Updates
+
+These notes are kept as a historical summary for the V9 line. The current active runtime and launcher are documented in `v10_release.md`.
 
 ## Geometry labels
 

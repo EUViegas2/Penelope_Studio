@@ -4,11 +4,14 @@ Desktop editor, runner, and analysis workspace for PENELOPE geometry (`.geo`), s
 
 ## Current Runtime
 
-- Active app: `penelope_studio_v9_split_runs_patch_v2.py`
-- No-console launcher: `Start_Penelope_Studio_V9_NoConsole.pyw`
+- Active app: `penelope_studio_v10.py`
+- No-console launcher: `Start_Penelope_Studio_V10_NoConsole.pyw`
 - Desktop shortcut helper: `Create_Desktop_Shortcut.ps1`
+- Compatibility entrypoints kept for older shortcuts:
+  - `penelope_studio_v9_split_runs_patch_v2.py`
+  - `Start_Penelope_Studio_V9_NoConsole.pyw`
 
-This repository is the working CodAI folder used to develop and run the current Studio build. It is now prepared to be moved between computers with Git while keeping local runtime clutter out of version control.
+This repository is the working CodAI folder used to develop and run the current Studio build. The current master-targeted runtime is now the V10 release line.
 
 ## What This Repo Contains
 
@@ -45,13 +48,13 @@ py -m pip install -r requirements.txt
 Run the Studio:
 
 ```powershell
-py penelope_studio_v9_split_runs_patch_v2.py
+py penelope_studio_v10.py
 ```
 
 Or use the no-console launcher:
 
 ```powershell
-pyw .\Start_Penelope_Studio_V9_NoConsole.pyw
+pyw .\Start_Penelope_Studio_V10_NoConsole.pyw
 ```
 
 Create a desktop shortcut from the repo root:
@@ -63,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\Create_Desktop_Shortcut.ps1
 Optional direct-open usage:
 
 ```powershell
-py penelope_studio_v9_split_runs_patch_v2.py path\to\file.geo path\to\file.in
+py penelope_studio_v10.py path\to\file.geo path\to\file.in
 ```
 
 ## First-Run Notes On Another Computer
@@ -79,7 +82,7 @@ The app now falls back more gracefully to repo-local defaults when older saved a
 
 All root launch scripts are intended to be path-agnostic:
 
-- `Start_Penelope_Studio_V9_NoConsole.pyw` runs from its own folder
+- `Start_Penelope_Studio_V10_NoConsole.pyw` runs from its own folder
 - `Create_Desktop_Shortcut.ps1` resolves the launcher relative to itself
 
 So the repo should be moved, cloned, or pulled without needing to edit hardcoded user paths in those entrypoints.
@@ -112,7 +115,7 @@ git clone https://github.com/EUViegas2/Penelope_Studio.git
 For the active runtime:
 
 ```powershell
-python -m py_compile .\penelope_studio_v9_split_runs_patch_v2.py
+python -m py_compile .\penelope_studio_v10.py
 ```
 
 For repo state:
@@ -123,13 +126,13 @@ git status --short
 
 ## Repo Map
 
-- `penelope_studio_v9_split_runs_patch_v2.py`: current active Studio runtime
-- `Start_Penelope_Studio_V9_NoConsole.pyw`: launcher used for normal desktop runs
+- `penelope_studio_v10.py`: current active Studio runtime
+- `Start_Penelope_Studio_V10_NoConsole.pyw`: launcher used for normal desktop runs
 - `Create_Desktop_Shortcut.ps1`: creates a desktop shortcut to the launcher
 - `template/`: template runtime files used for case creation and local runs
 - `fortran/`: source/build workspace for native gview work
-- `v9_updates.md`: compact summary of V9-facing feature changes
-- `v10_prep.md`: notes about what is intentionally still kept under the V9 identity
+- `v10_release.md`: compact V10 release and cutover notes
+- `v9_updates.md`: historical V9-facing change summary
 
 For a fuller folder map, see [REPO_LAYOUT.md](REPO_LAYOUT.md).
 
@@ -137,8 +140,8 @@ For a fuller folder map, see [REPO_LAYOUT.md](REPO_LAYOUT.md).
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [REPO_LAYOUT.md](REPO_LAYOUT.md)
+- [v10_release.md](v10_release.md)
 - [v9_updates.md](v9_updates.md)
-- [v10_prep.md](v10_prep.md)
 - [fortran/README.md](fortran/README.md)
 
 ## Notes

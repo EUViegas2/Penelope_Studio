@@ -1,5 +1,5 @@
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$target = Join-Path $projectDir "Start_Penelope_Studio_V9_NoConsole.pyw"
+$target = Join-Path $projectDir "Start_Penelope_Studio_V10_NoConsole.pyw"
 
 if (-not (Test-Path $target)) {
     Write-Error "Launcher not found: $target"
@@ -7,7 +7,7 @@ if (-not (Test-Path $target)) {
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")
-$shortcutPath = Join-Path $desktop "PENELOPE Studio V9.lnk"
+$shortcutPath = Join-Path $desktop "PENELOPE Studio V10.lnk"
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)

@@ -6,11 +6,11 @@ This repository is used as a live development workspace for the current PENELOPE
 
 Good files to commit:
 
-- `penelope_studio_v9_split_runs_patch_v2.py`
+- `penelope_studio_v10.py`
 - launcher scripts
 - `template/` updates
 - `fortran/` source and build docs
-- root documentation such as `README.md`, `v9_updates.md`, and `v10_prep.md`
+- root documentation such as `README.md`, `v10_release.md`, and `v9_updates.md`
 
 Do not commit generated local clutter:
 
@@ -35,7 +35,7 @@ git pull
 Before committing:
 
 ```powershell
-python -m py_compile .\penelope_studio_v9_split_runs_patch_v2.py
+python -m py_compile .\penelope_studio_v10.py
 git status --short
 ```
 

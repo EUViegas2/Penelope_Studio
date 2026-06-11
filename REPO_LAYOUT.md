@@ -4,9 +4,9 @@ This file describes the root structure that is meant to stay Git-friendly.
 
 ## Root Runtime Files
 
-- `penelope_studio_v9_split_runs_patch_v2.py`
+- `penelope_studio_v10.py`
   - current active Studio runtime
-- `Start_Penelope_Studio_V9_NoConsole.pyw`
+- `Start_Penelope_Studio_V10_NoConsole.pyw`
   - normal no-console launcher
 - `Create_Desktop_Shortcut.ps1`
   - helper to create a desktop shortcut
@@ -18,10 +18,17 @@ This file describes the root structure that is meant to stay Git-friendly.
   - commit and workflow notes
 - `REPO_LAYOUT.md`
   - this file
+- `v10_release.md`
+  - current V10 release notes
 - `v9_updates.md`
-  - compact change summary
-- `v10_prep.md`
-  - current V10 preparation notes
+  - historical V9 summary
+
+## Compatibility Entry Files
+
+- `penelope_studio_v9_split_runs_patch_v2.py`
+  - legacy compatibility shim that forwards to V10
+- `Start_Penelope_Studio_V9_NoConsole.pyw`
+  - legacy no-console launcher shim for older shortcuts
 
 ## Native Runtime Assets
 
