@@ -40,6 +40,7 @@ import sys
 import os
 import re
 import io
+import csv
 import json
 import math
 import time
@@ -1339,7 +1340,8 @@ def make_help_label(text, hint="", style=None, return_label=False):
     if style:
         label.setStyleSheet(style)
     label.setMinimumWidth(0)
-    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+    label.setWordWrap(False)
     hint = str(hint or "").strip()
     if not hint:
         return (label, label) if return_label else label
@@ -1348,7 +1350,7 @@ def make_help_label(text, hint="", style=None, return_label=False):
     info.setFixedWidth(12)
     box = QWidget()
     box.setMinimumWidth(0)
-    box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+    box.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
     lay = QHBoxLayout(box)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(4)
@@ -34510,7 +34512,15 @@ class AnalysisTab(QWidget):
         "Dose (eV/g)", "dDose (eV/g)",
         "Edep (J)", "dE (J)", "Error (%)",
         "Dose (Gy)", "dDose (Gy)",
+        "N fields", "Source Type", "Alpha",
     ]
+    GLOBAL_REPORT_COMPONENT_TOTALS_REQUIRED_HEADERS = (
+        "Case", "Component",
+        "Edep (eV)", "dE (eV)",
+        "Dose (eV/g)", "dDose (eV/g)",
+        "Error (%)", "Dose (Gy)", "dDose (Gy)",
+        "N fields", "Source Type", "Alpha",
+    )
     DOSE_CONFIG_SHEET = "__DOSE_CONFIG__"
     DOSE_COMPONENT_TOTALS_SHEET = "COMPONENT_TOTALS"
     EV_TO_J = 1.602176634e-19
@@ -34846,11 +34856,19 @@ class AnalysisTab(QWidget):
             "or a reusable browser script in a chosen cases/root folder."
         )
         btn_3d_dose.clicked.connect(self._export_matlab_3d_dose_script)
+        self.btn_global_report = QPushButton("Global Report...")
+        self.btn_global_report.setStyleSheet(btn_css(width=108))
+        self.btn_global_report.setToolTip(
+            "Prepare one or more Studio-guided Global Report folders from the active project's CASES tree."
+        )
+        self.btn_global_report.setEnabled(False)
+        self.btn_global_report.clicked.connect(self._open_global_report_wizard)
         top_row_lay.addWidget(self.cmb_analysis_workspace, stretch=1)
         top_row_lay.addWidget(btn_workspace)
         top_row_lay.addWidget(btn_browse_workspace)
         top_row_lay.addWidget(btn_reload)
         top_row_lay.addWidget(btn_3d_dose)
+        top_row_lay.addWidget(self.btn_global_report)
         case_lay.addWidget(top_row)
 
         target_row = QWidget()
@@ -35062,6 +35080,337 @@ class AnalysisTab(QWidget):
             if path and path.exists():
                 return path
         return Path.cwd()
+
+    def _analysis_cases_root_folder(self):
+        if not self._project_root:
+            return None
+        root = Path(self._project_root)
+        folder_name = self._project_folders.get("cases", PROJECT_DIR_CASES)
+        candidate = root / folder_name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        return None
+
+    def _global_report_is_batch_folder(self, path_or_name):
+        try:
+            name = Path(path_or_name).name
+        except Exception:
+            name = str(path_or_name or "")
+        return "batch" in name.strip().lower()
+
+    def _global_report_child_dirs(self, folder):
+        folder = Path(folder)
+        children = []
+        ignore_names = {str(name).strip().lower() for name in self.ANALYSIS_DIR_IGNORES}
+        try:
+            for child in folder.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name.strip().lower() in ignore_names:
+                    continue
+                children.append(child)
+        except Exception:
+            return []
+        return sorted(children, key=lambda path: path.name.lower())
+
+    def _global_report_preferred_batch_workbook(self, batch_root):
+        batch_root = Path(batch_root)
+        workbooks = self._direct_dose_workbooks_in_folder(batch_root)
+        if not workbooks:
+            return None
+        def _sort_key(path):
+            try:
+                stamp = path.stat().st_mtime
+            except Exception:
+                stamp = 0
+            return (stamp, path.name.lower())
+        return sorted(workbooks, key=_sort_key)[-1]
+
+    def _global_report_default_context_label(self, context_root, cases_root=None):
+        context_root = Path(context_root)
+        cases_root = Path(cases_root) if cases_root else self._analysis_cases_root_folder()
+        if cases_root is not None:
+            try:
+                rel = context_root.resolve().relative_to(cases_root.resolve())
+                parts = [part for part in rel.parts if part]
+                if parts:
+                    return " / ".join(parts)
+            except Exception:
+                pass
+        return context_root.name or str(context_root)
+
+    def _global_report_detect_context_geometry_names(self, context_root):
+        context_root = Path(context_root)
+        names = []
+        seen = set()
+        batch_dirs = []
+        for entry in self._global_report_direct_batch_entries(context_root):
+            batch_dirs.append(entry["batch_root"])
+        for batch_dir in batch_dirs:
+            geo_files = []
+            try:
+                geo_files = sorted(path for path in batch_dir.rglob("*.geo") if path.is_file())
+            except Exception:
+                geo_files = []
+            for geo_path in geo_files[:8]:
+                key = geo_path.name.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(geo_path.name)
+        return names
+
+    def _global_report_relative_path_text(self, path, base_root):
+        path = Path(path)
+        base_root = Path(base_root)
+        try:
+            rel = path.resolve().relative_to(base_root.resolve())
+            if not rel.parts:
+                return base_root.name
+            return str(rel).replace("/", "\\")
+        except Exception:
+            return str(path)
+
+    def _global_report_read_batch_totals_rows(self, workbook_path):
+        workbook_path = Path(workbook_path) if workbook_path else None
+        if workbook_path is None or not workbook_path.exists() or not workbook_path.is_file():
+            return []
+        openpyxl = self._load_openpyxl()
+        if openpyxl is None:
+            return []
+        wb = None
+        rows = []
+        try:
+            wb = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+            if self.DOSE_COMPONENT_TOTALS_SHEET not in wb.sheetnames:
+                return []
+            ws = wb[self.DOSE_COMPONENT_TOTALS_SHEET]
+            row_iter = ws.iter_rows(values_only=True)
+            headers_row = next(row_iter, None)
+            headers = [str(value or "").strip() for value in (headers_row or ())]
+            header_map = {header: idx for idx, header in enumerate(headers) if header}
+            if any(header not in header_map for header in self.GLOBAL_REPORT_COMPONENT_TOTALS_REQUIRED_HEADERS):
+                return []
+            case_idx = header_map["Case"]
+            component_idx = header_map["Component"]
+            for values in row_iter:
+                if not values:
+                    continue
+                case_value = str(values[case_idx] if case_idx < len(values) else "" or "").strip()
+                if case_value.casefold() != "batch total":
+                    continue
+                component = str(values[component_idx] if component_idx < len(values) else "" or "").strip()
+                if not component:
+                    continue
+                raw_row = {}
+                for header, idx in header_map.items():
+                    raw_row[header] = values[idx] if idx < len(values) else ""
+                rows.append(raw_row)
+        except Exception:
+            return []
+        finally:
+            try:
+                if wb is not None and hasattr(wb, "close"):
+                    wb.close()
+            except Exception:
+                pass
+        return rows
+
+    def _global_report_direct_batch_entries(self, folder):
+        folder = Path(folder)
+        batch_roots = []
+        if self._global_report_is_batch_folder(folder.name):
+            batch_roots.append(folder)
+        else:
+            for child in self._global_report_child_dirs(folder):
+                if self._global_report_is_batch_folder(child.name):
+                    batch_roots.append(child)
+        entries = []
+        for batch_root in batch_roots:
+            workbook_path = self._global_report_preferred_batch_workbook(batch_root)
+            rows = self._global_report_read_batch_totals_rows(workbook_path)
+            entries.append(
+                {
+                    "batch_root": batch_root,
+                    "workbook_path": workbook_path,
+                    "rows": rows,
+                    "ready": bool(rows),
+                }
+            )
+        return entries
+
+    def _global_report_component_key(self, value):
+        text = unicodedata.normalize("NFKD", str(value or ""))
+        ascii_text = text.encode("ascii", "ignore").decode("ascii").lower()
+        return re.sub(r"[^a-z0-9]+", "", ascii_text)
+
+    def _global_report_collect_component_rows(self, contexts):
+        rows = []
+        seen = set()
+        for context in contexts or []:
+            context_label = str(context.get("display_label") or context.get("default_label") or context.get("relative_path") or "").strip()
+            geo_label = ", ".join(context.get("geo_names") or []) or "(geometry not detected)"
+            for batch_entry in context.get("batch_entries") or []:
+                for raw_row in batch_entry.get("rows") or []:
+                    component = str(raw_row.get("Component") or "").strip()
+                    if not component:
+                        continue
+                    key = (
+                        str(context.get("context_key") or ""),
+                        self._global_report_component_key(component),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(
+                        {
+                            "context_key": str(context.get("context_key") or ""),
+                            "context_label": context_label,
+                            "geometry_label": geo_label,
+                            "component": component,
+                            "override_label": "",
+                            "checked": True,
+                        }
+                    )
+        rows.sort(key=lambda entry: (entry["context_label"].casefold(), entry["component"].casefold()))
+        return rows
+
+    def _global_report_discover_contexts(self, selected_roots, cases_root):
+        cases_root = Path(cases_root)
+        contexts = []
+        seen_contexts = set()
+
+        def _walk(folder):
+            folder = Path(folder)
+            direct_batch_entries = self._global_report_direct_batch_entries(folder)
+            if direct_batch_entries:
+                context_key = str(folder.resolve())
+                if context_key not in seen_contexts:
+                    seen_contexts.add(context_key)
+                    contexts.append(
+                        {
+                            "context_key": context_key,
+                            "root": folder,
+                            "relative_path": self._global_report_relative_path_text(folder, cases_root),
+                            "default_label": self._global_report_default_context_label(folder, cases_root),
+                            "display_label": self._global_report_default_context_label(folder, cases_root),
+                            "batch_entries": direct_batch_entries,
+                            "geo_names": self._global_report_detect_context_geometry_names(folder),
+                            "enabled": True,
+                        }
+                    )
+                if self._global_report_is_batch_folder(folder.name):
+                    return
+            for child in self._global_report_child_dirs(folder):
+                if self._global_report_is_batch_folder(child.name):
+                    continue
+                _walk(child)
+
+        for root in selected_roots or []:
+            try:
+                path = Path(root)
+            except Exception:
+                continue
+            if path.exists() and path.is_dir():
+                _walk(path)
+
+        contexts.sort(key=lambda entry: str(entry.get("relative_path") or entry.get("default_label") or "").casefold())
+        return contexts
+
+    def _global_report_missing_batch_entries(self, contexts):
+        missing = []
+        seen = set()
+        for context in contexts or []:
+            for batch_entry in context.get("batch_entries") or []:
+                if bool(batch_entry.get("ready")):
+                    continue
+                batch_root = Path(batch_entry.get("batch_root"))
+                key = str(batch_root).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                missing.append(batch_entry)
+        return missing
+
+    def _compress_global_report_root_paths(self, paths):
+        unique_paths = []
+        seen = set()
+        for raw_path in paths or []:
+            try:
+                path = Path(raw_path).resolve()
+            except Exception:
+                continue
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+        unique_paths.sort(key=lambda path: (len(path.parts), str(path).casefold()))
+        out = []
+        for path in unique_paths:
+            if any(parent == path or parent in path.parents for parent in out):
+                continue
+            out.append(path)
+        return out
+
+    def _next_global_report_output_dir(self, cases_root):
+        cases_root = Path(cases_root)
+        index = 1
+        while True:
+            candidate = cases_root / f"Global_Report_{index}"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def _write_global_report_alias_csv(self, path, alias_rows):
+        path = Path(path)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["ContextGroup", "DetectedComponent", "OverrideLabel"])
+            for row in alias_rows or []:
+                override = str(row.get("override_label") or "").strip()
+                if not override:
+                    continue
+                writer.writerow([
+                    str(row.get("context_label") or "").strip(),
+                    str(row.get("component") or "").strip(),
+                    override,
+                ])
+
+    def _build_matlab_global_report_selected_body_block(self, selected_body_names=None, target_body_name=None, comparison_body_names=None):
+        selected_body_names = [str(name or "").strip() for name in (selected_body_names or []) if str(name or "").strip()]
+        comparison_body_names = [str(name or "").strip() for name in (comparison_body_names or []) if str(name or "").strip()]
+        target_body_name = str(target_body_name or "").strip()
+        lines = [
+            "%__STUDIO_SELECTED_LABELS_BEGIN__",
+            "selectedLabelSpecs = {};",
+            "targetSurfaceLabel = '';",
+            f"targetBodyName = {self._matlab_char_vector_expr(target_body_name)};",
+        ]
+        if selected_body_names:
+            lines.append("selectedBodyNames = {")
+            for label in selected_body_names:
+                lines.append(f"    {self._matlab_char_vector_expr(label)};")
+            lines.append("};")
+        else:
+            lines.append("selectedBodyNames = {};")
+        if comparison_body_names:
+            lines.append("comparisonBodyNames = {")
+            for label in comparison_body_names:
+                lines.append(f"    {self._matlab_char_vector_expr(label)};")
+            lines.append("};")
+        else:
+            lines.append("comparisonBodyNames = {};")
+        lines.extend(
+            [
+                "targetIdx = [];",
+                "xT = 0; %#ok<NASGU>",
+                "yT = 0; %#ok<NASGU>",
+                "zT = 0; %#ok<NASGU>",
+                "%__STUDIO_SELECTED_LABELS_END__",
+            ]
+        )
+        return "\n".join(lines)
 
     def _navigator_child_folders(self, folder):
         folder = Path(folder)
@@ -35605,6 +35954,18 @@ class AnalysisTab(QWidget):
         scone_col = "_".join(scone) if scone else ""
         parts = [p for p in [sposit_col, scone_col] if p]
         source_col = "_".join(parts) if parts else ""
+        def _numeric_triplet(values):
+            if len(values) < 3:
+                return []
+            out = []
+            for token in values[:3]:
+                try:
+                    out.append(float(str(token).replace(",", ".")))
+                except (TypeError, ValueError):
+                    return []
+            return out
+        sposit_values = _numeric_triplet(sposit)
+        scone_values = _numeric_triplet(scone)
         if re.search(r"^\s*SPECTR\b", text, re.IGNORECASE | re.MULTILINE):
             energy_mode = "SPECTR"
             m = re.search(r"^\s*SPECTR\s+(.+?)(?:\s*\[|$)", text, re.IGNORECASE | re.MULTILINE)
@@ -35622,6 +35983,37 @@ class AnalysisTab(QWidget):
             "source_col": source_col,
             "energy_mode": energy_mode,
             "energy_info": energy_info,
+            "sposit_values": sposit_values,
+            "scone_values": scone_values,
+            "theta_deg": scone_values[0] if len(scone_values) >= 1 else "",
+            "phi_deg": scone_values[1] if len(scone_values) >= 2 else "",
+            "alpha_deg": scone_values[2] if len(scone_values) >= 3 else "",
+        }
+
+    def _source_alpha_from_case_name(self, value):
+        text = str(value or "")
+        match = re.search(
+            r"SCONE[-_]\s*([+\-]?\d+(?:[.,]\d+)?)_([+\-]?\d+(?:[.,]\d+)?)_([+\-]?\d+(?:[.,]\d+)?)",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        try:
+            return float(match.group(3).replace(",", "."))
+        except (TypeError, ValueError):
+            return ""
+
+    def _component_totals_case_metadata(self, folder):
+        folder = Path(folder)
+        source_info = self._extract_source_info_from_in(folder)
+        alpha = source_info.get("alpha_deg", "")
+        if alpha in ("", None):
+            alpha = self._source_alpha_from_case_name(folder.name)
+        source_type = self._analysis_spectrum_type_for_workspace(folder)
+        return {
+            "source_type": str(source_type or "").strip(),
+            "alpha": alpha,
         }
 
     def _scan_split_groups_validated(self, root_folder):
@@ -36030,6 +36422,8 @@ class AnalysisTab(QWidget):
                 self._dose_workbook_config = None
                 if hasattr(self, "lbl_dose_xlsx"):
                     self._update_dose_xlsx_label("project default")
+        if hasattr(self, "btn_global_report"):
+            self.btn_global_report.setEnabled(bool(self._analysis_cases_root_folder()))
         self._refresh_analysis_workspace_candidates()
         self._log_analysis(f"Project context applied: {root}", "info")
 
@@ -37324,6 +37718,9 @@ class AnalysisTab(QWidget):
     def _matlab_batch_analysis_template_path(self):
         return Path(__file__).resolve().parent / "matlab_templates" / "penelope_report_dose_analysis.m"
 
+    def _matlab_global_report_template_path(self):
+        return Path(__file__).resolve().parent / "matlab_templates" / "Global_Report.m"
+
     def _matlab_analysis_local_functions_text(self):
         text = self._matlab_batch_analysis_template_path().read_text(encoding="utf-8")
         match = re.search(r"(?ms)^function process_excel_dose_workbook_r2015\(.*\Z", text)
@@ -37352,6 +37749,41 @@ class AnalysisTab(QWidget):
         )
         return text
 
+    def _build_matlab_global_report_script(self, target_center=None, label_specs=None, geo_path=None, selected_body_names=None, target_body_name=None, comparison_body_names=None, enable_alias_review=None):
+        template_path = self._matlab_global_report_template_path()
+        text = template_path.read_text(encoding="utf-8")
+        if selected_body_names is not None or target_body_name is not None or comparison_body_names is not None:
+            label_block = self._build_matlab_global_report_selected_body_block(
+                selected_body_names=selected_body_names,
+                target_body_name=target_body_name,
+                comparison_body_names=comparison_body_names,
+            )
+        else:
+            label_block = self._build_matlab_selected_label_block(target_center, label_specs)
+        geometry_block = self._build_matlab_geometry_slice_block(geo_path=geo_path, target_center=target_center)
+        text = re.sub(
+            r"%__STUDIO_SELECTED_LABELS_BEGIN__.*?%__STUDIO_SELECTED_LABELS_END__",
+            label_block,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        text = re.sub(
+            r"%__STUDIO_GEOMETRY_SLICES_BEGIN__.*?%__STUDIO_GEOMETRY_SLICES_END__",
+            geometry_block,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if enable_alias_review is not None:
+            text = re.sub(
+                r"(?m)^enableAliasReview\s*=\s*(true|false)\s*;",
+                f"enableAliasReview = {'true' if enable_alias_review else 'false'};",
+                text,
+                count=1,
+            )
+        return text
+
     def _case_3d_dose_files(self, folder, selected_path=None):
         folder = Path(folder)
         selected = Path(selected_path) if selected_path else None
@@ -37366,6 +37798,10 @@ class AnalysisTab(QWidget):
     def _default_browser_3d_dose_script_path(self, root):
         root = Path(root)
         return root / "penelope_report_dose_analysis.m"
+
+    def _default_global_report_script_path(self, root):
+        root = Path(root)
+        return root / "Global_Report.m"
 
     def _default_group_3d_dose_script_path(self, root):
         root = Path(root)
@@ -37930,6 +38366,679 @@ class AnalysisTab(QWidget):
             return
         if clicked is btn_group:
             self._create_grouped_3d_dose_bundle()
+
+    def _write_global_report_prepared_totals_csv(self, path, rows):
+        path = Path(path)
+        headers = [
+            "ContextLabel", "SourceType", "Alpha", "Component", "NFields",
+            "Edep_eV", "dEdep_eV", "Dose_eVg", "dDose_eVg", "Error_pct", "Dose_Gy", "dDose_Gy",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers)
+            writer.writeheader()
+            for row in rows or []:
+                writer.writerow({key: row.get(key, "") for key in headers})
+
+    def _write_global_report_contexts_csv(self, path, rows):
+        path = Path(path)
+        headers = ["ContextLabel", "RelativePath", "SourceRoot", "BatchCount", "GeometryFiles"]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers)
+            writer.writeheader()
+            for row in rows or []:
+                writer.writerow({key: row.get(key, "") for key in headers})
+
+    def _prepare_global_report_output(self, output_dir, report_entry, cases_root):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        context_map = {str(entry.get("context_key") or ""): entry for entry in report_entry.get("contexts") or []}
+        component_map = {}
+        selected_body_names = []
+        selected_keys = set()
+        alias_rows = []
+
+        for row in report_entry.get("component_rows") or []:
+            context_key = str(row.get("context_key") or "")
+            context_entry = context_map.get(context_key)
+            if context_entry is None or not bool(context_entry.get("enabled", True)):
+                continue
+            if not bool(row.get("checked", True)):
+                continue
+            component = str(row.get("component") or "").strip()
+            if not component:
+                continue
+            override_label = str(row.get("override_label") or "").strip()
+            final_label = override_label or component
+            final_key = self._global_report_component_key(final_label)
+            if final_key and final_key not in selected_keys:
+                selected_keys.add(final_key)
+                selected_body_names.append(final_label)
+            component_map[(context_key, self._global_report_component_key(component))] = {
+                "component": component,
+                "override_label": override_label,
+                "final_label": final_label,
+            }
+            if override_label:
+                alias_rows.append(
+                    {
+                        "context_label": str(context_entry.get("display_label") or context_entry.get("default_label") or "").strip(),
+                        "component": component,
+                        "override_label": override_label,
+                    }
+                )
+
+        def _csv_text(value):
+            if value in (None, ""):
+                return ""
+            return str(value).strip()
+
+        prepared_rows = []
+        context_rows = []
+        for context_entry in report_entry.get("contexts") or []:
+            if not bool(context_entry.get("enabled", True)):
+                continue
+            context_key = str(context_entry.get("context_key") or "")
+            context_label = str(context_entry.get("display_label") or context_entry.get("default_label") or "").strip()
+            context_rows.append(
+                {
+                    "ContextLabel": context_label,
+                    "RelativePath": str(context_entry.get("relative_path") or ""),
+                    "SourceRoot": str(context_entry.get("root") or ""),
+                    "BatchCount": len(context_entry.get("batch_entries") or []),
+                    "GeometryFiles": "; ".join(context_entry.get("geo_names") or []),
+                }
+            )
+            for batch_entry in context_entry.get("batch_entries") or []:
+                for raw_row in batch_entry.get("rows") or []:
+                    component = str(raw_row.get("Component") or "").strip()
+                    if not component:
+                        continue
+                    rule = component_map.get((context_key, self._global_report_component_key(component)))
+                    if rule is None:
+                        continue
+                    prepared_rows.append(
+                        {
+                            "ContextLabel": context_label,
+                            "SourceType": _csv_text(raw_row.get("Source Type") or raw_row.get("SourceType") or ""),
+                            "Alpha": _csv_text(raw_row.get("Alpha") or ""),
+                            "Component": component,
+                            "NFields": _csv_text(raw_row.get("N fields") or raw_row.get("NFields") or ""),
+                            "Edep_eV": _csv_text(raw_row.get("Edep (eV)") or raw_row.get("Edep_eV") or ""),
+                            "dEdep_eV": _csv_text(raw_row.get("dE (eV)") or raw_row.get("dEdep_eV") or ""),
+                            "Dose_eVg": _csv_text(raw_row.get("Dose (eV/g)") or raw_row.get("Dose_eVg") or ""),
+                            "dDose_eVg": _csv_text(raw_row.get("dDose (eV/g)") or raw_row.get("dDose_eVg") or ""),
+                            "Error_pct": _csv_text(raw_row.get("Error (%)") or raw_row.get("Error_pct") or ""),
+                            "Dose_Gy": _csv_text(raw_row.get("Dose (Gy)") or raw_row.get("Dose_Gy") or ""),
+                            "dDose_Gy": _csv_text(raw_row.get("dDose (Gy)") or raw_row.get("dDose_Gy") or ""),
+                        }
+                    )
+
+        if not prepared_rows:
+            raise RuntimeError("No selected batch component totals were available to prepare this Global Report.")
+
+        prepared_totals_path = output_dir / "Global_Report_prepared_totals.csv"
+        prepared_contexts_path = output_dir / "Global_Report_studio_contexts.csv"
+        alias_path = output_dir / "Global_Report_component_aliases.csv"
+        self._write_global_report_prepared_totals_csv(prepared_totals_path, prepared_rows)
+        self._write_global_report_contexts_csv(prepared_contexts_path, context_rows)
+        self._write_global_report_alias_csv(alias_path, alias_rows)
+
+        target_body_name = next((name for name in selected_body_names if "tumor" in self._global_report_component_key(name)), "")
+        if not target_body_name and selected_body_names:
+            target_body_name = selected_body_names[0]
+        script_text = self._build_matlab_global_report_script(
+            selected_body_names=selected_body_names,
+            target_body_name=target_body_name,
+            comparison_body_names=[],
+            enable_alias_review=False,
+        )
+        script_path = output_dir / "Global_Report.m"
+        script_path.write_text(script_text, encoding="utf-8")
+        return {
+            "folder": output_dir,
+            "script_path": script_path,
+            "prepared_totals_path": prepared_totals_path,
+            "prepared_contexts_path": prepared_contexts_path,
+            "alias_path": alias_path,
+            "selected_body_names": selected_body_names,
+        }
+
+    def _open_global_report_wizard(self):
+        cases_root = self._analysis_cases_root_folder()
+        if cases_root is None or not cases_root.exists():
+            QMessageBox.information(
+                self,
+                "Global Report",
+                "Open a project first. Global Report is only available when an active project exposes a CASES folder.",
+            )
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Global Report Wizard")
+        dlg.setModal(True)
+        dlg.setMinimumSize(1180, 760)
+        dlg.setStyleSheet(f"QDialog {{ background:{P['bg']}; }} QLabel {{ color:{P['fg']}; }}")
+        root_lay = QVBoxLayout(dlg)
+        root_lay.setContentsMargins(10, 10, 10, 10)
+        root_lay.setSpacing(8)
+
+        title = QLabel("Global Report Wizard")
+        title.setStyleSheet(label_css(P["accent"], bold=True, size=12))
+        root_lay.addWidget(title)
+
+        page_hint = QLabel("")
+        page_hint.setWordWrap(True)
+        page_hint.setStyleSheet(label_css(P["fg2"], size=9))
+        root_lay.addWidget(page_hint)
+
+        stack = QStackedWidget()
+        root_lay.addWidget(stack, 1)
+
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
+        btn_back = QPushButton("Back")
+        btn_back.setStyleSheet(btn_css(width=84))
+        btn_next = QPushButton("Next")
+        btn_next.setStyleSheet(btn_css(width=104))
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(btn_css(width=90))
+        nav_row.addStretch(1)
+        nav_row.addWidget(btn_back)
+        nav_row.addWidget(btn_next)
+        nav_row.addWidget(btn_cancel)
+        root_lay.addLayout(nav_row)
+
+        page_select = QWidget()
+        select_lay = QHBoxLayout(page_select)
+        select_lay.setContentsMargins(0, 0, 0, 0)
+        select_lay.setSpacing(10)
+
+        tree_frame = QFrame()
+        tree_frame.setStyleSheet(f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:6px; }}")
+        tree_lay = QVBoxLayout(tree_frame)
+        tree_lay.setContentsMargins(8, 8, 8, 8)
+        tree_lay.setSpacing(6)
+        tree_title = QLabel("Select folders from CASES")
+        tree_title.setStyleSheet(label_css(P["fg"], bold=True))
+        tree_info = QLabel(
+            "Check one or more folders. If you check a higher-level folder, the wizard will include all matching batch contexts found inside it."
+        )
+        tree_info.setWordWrap(True)
+        tree_info.setStyleSheet(label_css(P["fg2"], size=9))
+        tree_lay.addWidget(tree_title)
+        tree_lay.addWidget(tree_info)
+        folder_tree = QTreeWidget()
+        folder_tree.setHeaderHidden(True)
+        folder_tree.setStyleSheet(
+            f"QTreeWidget {{ background:{P['bg']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QTreeWidget::item:selected {{ background:{P['sel']}; color:{P['fg']}; }}"
+        )
+        tree_lay.addWidget(folder_tree, 1)
+        select_lay.addWidget(tree_frame, 7)
+
+        group_frame = QFrame()
+        group_frame.setStyleSheet(f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:6px; }}")
+        group_lay = QVBoxLayout(group_frame)
+        group_lay.setContentsMargins(8, 8, 8, 8)
+        group_lay.setSpacing(6)
+        group_title = QLabel("Prepared report groups")
+        group_title.setStyleSheet(label_css(P["fg"], bold=True))
+        group_info = QLabel(
+            "Press Add to capture the currently checked folder selection as a new Global_Report_N definition."
+        )
+        group_info.setWordWrap(True)
+        group_info.setStyleSheet(label_css(P["fg2"], size=9))
+        group_lay.addWidget(group_title)
+        group_lay.addWidget(group_info)
+        lst_groups = QListWidget()
+        lst_groups.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lst_groups.setStyleSheet(
+            f"QListWidget {{ background:{P['bg']}; color:{P['fg']}; border:1px solid {P['border']}; border-radius:4px; }}"
+            f"QListWidget::item {{ padding:4px; }}"
+            f"QListWidget::item:selected {{ background:{P['sel']}; color:{P['fg']}; }}"
+        )
+        group_lay.addWidget(lst_groups, 1)
+        group_btn_row = QHBoxLayout()
+        group_btn_row.setSpacing(6)
+        btn_add_group = QPushButton("Add")
+        btn_remove_group = QPushButton("Remove")
+        btn_add_group.setStyleSheet(btn_css(width=84))
+        btn_remove_group.setStyleSheet(btn_css(width=84))
+        group_btn_row.addWidget(btn_add_group)
+        group_btn_row.addWidget(btn_remove_group)
+        group_btn_row.addStretch(1)
+        group_lay.addLayout(group_btn_row)
+        group_summary = QLabel("")
+        group_summary.setWordWrap(True)
+        group_summary.setStyleSheet(label_css(P["fg2"], size=9))
+        group_lay.addWidget(group_summary)
+        select_lay.addWidget(group_frame, 5)
+        stack.addWidget(page_select)
+
+        page_config = QWidget()
+        config_lay = QVBoxLayout(page_config)
+        config_lay.setContentsMargins(0, 0, 0, 0)
+        config_lay.setSpacing(8)
+        config_header = QHBoxLayout()
+        config_header.setSpacing(8)
+        config_header.addWidget(QLabel("Report group:"))
+        cmb_group = QComboBox()
+        cmb_group.setStyleSheet(combo_dropdown_css())
+        config_header.addWidget(cmb_group, 1)
+        config_lay.addLayout(config_header)
+
+        contexts_frame = QFrame()
+        contexts_frame.setStyleSheet(f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:6px; }}")
+        contexts_lay = QVBoxLayout(contexts_frame)
+        contexts_lay.setContentsMargins(8, 8, 8, 8)
+        contexts_lay.setSpacing(6)
+        contexts_title = QLabel("Contexts / legend labels")
+        contexts_title.setStyleSheet(label_css(P["fg"], bold=True))
+        contexts_hint = QLabel(
+            "Each context corresponds to one folder level that directly groups batch folders. The wizard reads each batch *_Dose.xlsx workbook and uses its COMPONENT_TOTALS sheet."
+        )
+        contexts_hint.setWordWrap(True)
+        contexts_hint.setStyleSheet(label_css(P["fg2"], size=9))
+        contexts_lay.addWidget(contexts_title)
+        contexts_lay.addWidget(contexts_hint)
+        tbl_contexts = QTableWidget(0, 5)
+        tbl_contexts.setHorizontalHeaderLabels(["Use", "Context root", "Display label", "Batches", "Geometries"])
+        tbl_contexts.setStyleSheet(table_css())
+        tbl_contexts.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        tbl_contexts.verticalHeader().setVisible(False)
+        header = tbl_contexts.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        contexts_lay.addWidget(tbl_contexts, 1)
+        config_lay.addWidget(contexts_frame, 4)
+
+        components_frame = QFrame()
+        components_frame.setStyleSheet(f"QFrame {{ background:{P['bg2']}; border:1px solid {P['border']}; border-radius:6px; }}")
+        components_lay = QVBoxLayout(components_frame)
+        components_lay.setContentsMargins(8, 8, 8, 8)
+        components_lay.setSpacing(6)
+        components_title = QLabel("Components / override labels")
+        components_title.setStyleSheet(label_css(P["fg"], bold=True))
+        components_hint = QLabel(
+            "Select which BODY/component totals should be plotted. Override label is optional: leave it blank to keep the original component name for that context."
+        )
+        components_hint.setWordWrap(True)
+        components_hint.setStyleSheet(label_css(P["fg2"], size=9))
+        components_lay.addWidget(components_title)
+        components_lay.addWidget(components_hint)
+        tbl_components = QTableWidget(0, 5)
+        tbl_components.setHorizontalHeaderLabels(["Use", "Context", "Geometry", "Detected component", "Override label"])
+        tbl_components.setStyleSheet(table_css())
+        tbl_components.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        tbl_components.verticalHeader().setVisible(False)
+        comp_header = tbl_components.horizontalHeader()
+        comp_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        comp_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        comp_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        comp_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        comp_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        components_lay.addWidget(tbl_components, 1)
+        config_lay.addWidget(components_frame, 6)
+        stack.addWidget(page_config)
+
+        state = {
+            "groups": [],
+            "loading_group_tables": False,
+            "current_group_index": -1,
+        }
+
+        def _update_page_state():
+            page_index = stack.currentIndex()
+            btn_back.setEnabled(page_index > 0)
+            if page_index == 0:
+                page_hint.setText(
+                    f"Step 1 of 2. Choose folders from the active CASES root and capture each comparison set as Global_Report_N.\n\nCASES root: {cases_root}"
+                )
+                btn_next.setText("Next")
+                btn_next.setEnabled(bool(state["groups"]))
+            else:
+                page_hint.setText(
+                    "Step 2 of 2. Review the detected contexts, edit the context labels used in legends, and choose which component totals should be plotted."
+                )
+                btn_next.setText("Create Reports")
+                btn_next.setEnabled(bool(state["groups"]))
+
+        def _refresh_group_list():
+            lst_groups.clear()
+            cmb_group.blockSignals(True)
+            cmb_group.clear()
+            for idx, group in enumerate(state["groups"], start=1):
+                roots_text = ", ".join(group.get("root_labels") or [])
+                label = f"{group['name']}  -  {roots_text}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, idx - 1)
+                item.setToolTip("\n".join(str(path) for path in group.get("selected_roots") or []))
+                lst_groups.addItem(item)
+                cmb_group.addItem(group["name"], idx - 1)
+            cmb_group.blockSignals(False)
+            group_summary.setText(f"Prepared report groups: {len(state['groups'])}")
+            if state["groups"]:
+                if cmb_group.currentIndex() < 0:
+                    cmb_group.setCurrentIndex(0)
+            else:
+                tbl_contexts.setRowCount(0)
+                tbl_components.setRowCount(0)
+            _update_page_state()
+
+        def _populate_folder_tree():
+            folder_tree.blockSignals(True)
+            folder_tree.clear()
+
+            def _make_item(path):
+                item = QTreeWidgetItem([path.name])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+                item.setToolTip(0, str(path))
+                for child in self._global_report_child_dirs(path):
+                    item.addChild(_make_item(child))
+                return item
+
+            root_item = QTreeWidgetItem([cases_root.name])
+            root_item.setFlags(root_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            root_item.setCheckState(0, Qt.CheckState.Unchecked)
+            root_item.setData(0, Qt.ItemDataRole.UserRole, str(cases_root))
+            root_item.setToolTip(0, str(cases_root))
+            for child in self._global_report_child_dirs(cases_root):
+                root_item.addChild(_make_item(child))
+            folder_tree.addTopLevelItem(root_item)
+            root_item.setExpanded(True)
+            folder_tree.blockSignals(False)
+
+        def _set_descendants_check_state(item, state_value):
+            for idx in range(item.childCount()):
+                child = item.child(idx)
+                child.setCheckState(0, state_value)
+                _set_descendants_check_state(child, state_value)
+
+        def _on_tree_item_changed(item, _column):
+            if state.get("loading_group_tables"):
+                return
+            folder_tree.blockSignals(True)
+            _set_descendants_check_state(item, item.checkState(0))
+            folder_tree.blockSignals(False)
+
+        def _checked_tree_paths():
+            paths = []
+
+            def _walk(item):
+                if item is None:
+                    return
+                raw = item.data(0, Qt.ItemDataRole.UserRole)
+                if raw and item.checkState(0) == Qt.CheckState.Checked:
+                    path = Path(raw)
+                    paths.append(path)
+                for idx in range(item.childCount()):
+                    _walk(item.child(idx))
+
+            for top_index in range(folder_tree.topLevelItemCount()):
+                _walk(folder_tree.topLevelItem(top_index))
+            return self._compress_global_report_root_paths(paths)
+
+        def _load_group_tables(group_index):
+            if group_index < 0 or group_index >= len(state["groups"]):
+                tbl_contexts.setRowCount(0)
+                tbl_components.setRowCount(0)
+                state["current_group_index"] = -1
+                return
+            group = state["groups"][group_index]
+            state["loading_group_tables"] = True
+            state["current_group_index"] = group_index
+            tbl_contexts.blockSignals(True)
+            tbl_components.blockSignals(True)
+            tbl_contexts.setRowCount(len(group.get("contexts") or []))
+            for row_idx, entry in enumerate(group.get("contexts") or []):
+                chk = QTableWidgetItem("")
+                chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                chk.setCheckState(Qt.CheckState.Checked if bool(entry.get("enabled", True)) else Qt.CheckState.Unchecked)
+                tbl_contexts.setItem(row_idx, 0, chk)
+                root_item = QTableWidgetItem(str(entry.get("relative_path") or entry.get("root") or ""))
+                root_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                root_item.setToolTip(str(entry.get("root") or ""))
+                tbl_contexts.setItem(row_idx, 1, root_item)
+                display_item = QTableWidgetItem(str(entry.get("display_label") or entry.get("default_label") or ""))
+                tbl_contexts.setItem(row_idx, 2, display_item)
+                batch_item = QTableWidgetItem(str(len(entry.get("batch_entries") or [])))
+                batch_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                tbl_contexts.setItem(row_idx, 3, batch_item)
+                geo_item = QTableWidgetItem(", ".join(entry.get("geo_names") or []))
+                geo_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                tbl_contexts.setItem(row_idx, 4, geo_item)
+
+            tbl_components.setRowCount(len(group.get("component_rows") or []))
+            for row_idx, entry in enumerate(group.get("component_rows") or []):
+                chk = QTableWidgetItem("")
+                chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                chk.setCheckState(Qt.CheckState.Checked if bool(entry.get("checked", True)) else Qt.CheckState.Unchecked)
+                tbl_components.setItem(row_idx, 0, chk)
+                context_label = str(entry.get("context_label") or "")
+                context_item = QTableWidgetItem(context_label)
+                context_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                tbl_components.setItem(row_idx, 1, context_item)
+                geo_item = QTableWidgetItem(str(entry.get("geometry_label") or ""))
+                geo_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                tbl_components.setItem(row_idx, 2, geo_item)
+                comp_item = QTableWidgetItem(str(entry.get("component") or ""))
+                comp_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                tbl_components.setItem(row_idx, 3, comp_item)
+                override_item = QTableWidgetItem(str(entry.get("override_label") or ""))
+                tbl_components.setItem(row_idx, 4, override_item)
+            tbl_contexts.blockSignals(False)
+            tbl_components.blockSignals(False)
+            state["loading_group_tables"] = False
+
+        def _save_current_group_tables():
+            group_index = state.get("current_group_index", -1)
+            if group_index < 0 or group_index >= len(state["groups"]):
+                return
+            group = state["groups"][group_index]
+            for row_idx, entry in enumerate(group.get("contexts") or []):
+                chk_item = tbl_contexts.item(row_idx, 0)
+                display_item = tbl_contexts.item(row_idx, 2)
+                entry["enabled"] = bool(chk_item and chk_item.checkState() == Qt.CheckState.Checked)
+                entry["display_label"] = str(display_item.text() if display_item else entry.get("display_label") or "").strip() or entry.get("default_label") or entry.get("relative_path") or ""
+            context_labels = {str(entry.get("context_key") or ""): str(entry.get("display_label") or "") for entry in group.get("contexts") or []}
+            for row_idx, entry in enumerate(group.get("component_rows") or []):
+                chk_item = tbl_components.item(row_idx, 0)
+                override_item = tbl_components.item(row_idx, 4)
+                entry["checked"] = bool(chk_item and chk_item.checkState() == Qt.CheckState.Checked)
+                entry["override_label"] = str(override_item.text() if override_item else entry.get("override_label") or "").strip()
+                entry["context_label"] = context_labels.get(str(entry.get("context_key") or ""), entry.get("context_label") or "")
+
+        def _refresh_visible_component_context_labels():
+            group_index = state.get("current_group_index", -1)
+            if group_index < 0 or group_index >= len(state["groups"]):
+                return
+            group = state["groups"][group_index]
+            context_labels = {str(entry.get("context_key") or ""): str(entry.get("display_label") or "") for entry in group.get("contexts") or []}
+            tbl_components.blockSignals(True)
+            for row_idx, entry in enumerate(group.get("component_rows") or []):
+                updated_label = context_labels.get(str(entry.get("context_key") or ""), entry.get("context_label") or "")
+                entry["context_label"] = updated_label
+                item = tbl_components.item(row_idx, 1)
+                if item is not None:
+                    item.setText(updated_label)
+            tbl_components.blockSignals(False)
+
+        def _on_group_combo_changed(_index):
+            _save_current_group_tables()
+            next_index = int(cmb_group.currentData()) if cmb_group.currentData() is not None else -1
+            _load_group_tables(next_index)
+
+        def _describe_missing_batch_entries(missing_entries):
+            labels = []
+            for entry in missing_entries or []:
+                batch_root = Path(entry.get("batch_root"))
+                workbook_path = entry.get("workbook_path")
+                if workbook_path:
+                    labels.append(f"{batch_root.name}  ->  update workbook / COMPONENT_TOTALS")
+                else:
+                    labels.append(f"{batch_root.name}  ->  create workbook")
+            return labels
+
+        def _add_group():
+            selected_roots = _checked_tree_paths()
+            if not selected_roots:
+                QMessageBox.information(dlg, "Global Report", "Check at least one folder from the CASES tree before pressing Add.")
+                return
+            contexts = self._global_report_discover_contexts(selected_roots, cases_root)
+            if not contexts:
+                QMessageBox.warning(
+                    dlg,
+                    "Global Report",
+                    "No batch folders were found inside the selected folders.",
+                )
+                return
+            missing_entries = self._global_report_missing_batch_entries(contexts)
+            if missing_entries:
+                preview = _describe_missing_batch_entries(missing_entries)
+                message = [
+                    "Some selected batch folders do not yet have a usable *_Dose.xlsx workbook with a valid COMPONENT_TOTALS sheet.",
+                    "",
+                    "Global Report can generate or refresh those batch workbooks now using Multi Append.",
+                    "",
+                    "Affected batch folders:",
+                ] + preview[:10]
+                if len(preview) > 10:
+                    message.append(f"...and {len(preview) - 10} more.")
+                message.append("")
+                message.append("Generate or update them now?")
+                answer = QMessageBox.question(
+                    dlg,
+                    "Prepare batch workbooks",
+                    "\n".join(message),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    for entry in missing_entries:
+                        batch_root = Path(entry.get("batch_root"))
+                        self._multi_append_dose_rows_for_root(batch_root, options={"include_splits": False}, quiet=True)
+                        QApplication.processEvents()
+                finally:
+                    QApplication.restoreOverrideCursor()
+                contexts = self._global_report_discover_contexts(selected_roots, cases_root)
+                missing_entries = self._global_report_missing_batch_entries(contexts)
+                if missing_entries:
+                    preview = _describe_missing_batch_entries(missing_entries)
+                    QMessageBox.warning(
+                        dlg,
+                        "Global Report",
+                        "Some batch folders are still missing a usable COMPONENT_TOTALS sheet after the update attempt.\n\n"
+                        + "\n".join(preview[:12]),
+                    )
+                    return
+            group_name = f"Global_Report_{len(state['groups']) + 1}"
+            group_entry = {
+                "name": group_name,
+                "selected_roots": [str(path) for path in selected_roots],
+                "root_labels": [self._global_report_relative_path_text(path, cases_root) for path in selected_roots],
+                "contexts": contexts,
+                "component_rows": self._global_report_collect_component_rows(contexts),
+            }
+            state["groups"].append(group_entry)
+            _refresh_group_list()
+            if cmb_group.count():
+                cmb_group.setCurrentIndex(cmb_group.count() - 1)
+
+        def _remove_groups():
+            rows = sorted({lst_groups.row(item) for item in lst_groups.selectedItems()}, reverse=True)
+            if not rows:
+                return
+            _save_current_group_tables()
+            for row in rows:
+                if 0 <= row < len(state["groups"]):
+                    del state["groups"][row]
+            for idx, group in enumerate(state["groups"], start=1):
+                group["name"] = f"Global_Report_{idx}"
+            _refresh_group_list()
+            if cmb_group.count():
+                cmb_group.setCurrentIndex(0)
+
+        def _finish():
+            _save_current_group_tables()
+            created = []
+            errors = []
+            for group in state["groups"]:
+                try:
+                    out_dir = self._next_global_report_output_dir(cases_root)
+                    created_info = self._prepare_global_report_output(out_dir, group, cases_root)
+                    created.append(created_info)
+                except Exception as exc:
+                    errors.append(f"{group.get('name', 'Global_Report')}: {exc}")
+            if created:
+                self._log_analysis(
+                    "Created Global Report folder(s): " + "; ".join(str(entry["folder"]) for entry in created),
+                    "ok",
+                )
+            if errors:
+                self._log_analysis("Global Report warnings: " + " | ".join(errors), "warn")
+            if not created:
+                QMessageBox.warning(
+                    dlg,
+                    "Global Report",
+                    "No Global Report folder could be created.\n\n" + "\n".join(errors[:8]),
+                )
+                return
+            lines = ["Created Global Report folder(s):"]
+            for entry in created:
+                lines.append(str(entry["folder"]))
+            if errors:
+                lines.extend(["", "Warnings:"] + errors[:8])
+            QMessageBox.information(dlg, "Global Report", "\n".join(lines))
+            dlg.accept()
+
+        def _go_next():
+            if stack.currentIndex() == 0:
+                if not state["groups"]:
+                    QMessageBox.information(dlg, "Global Report", "Add at least one Global_Report_N group before continuing.")
+                    return
+                if cmb_group.count() and cmb_group.currentIndex() < 0:
+                    cmb_group.setCurrentIndex(0)
+                _load_group_tables(int(cmb_group.currentData()) if cmb_group.currentData() is not None else 0)
+                stack.setCurrentIndex(1)
+                _update_page_state()
+                return
+            _finish()
+
+        btn_add_group.clicked.connect(_add_group)
+        btn_remove_group.clicked.connect(_remove_groups)
+        folder_tree.itemChanged.connect(_on_tree_item_changed)
+        cmb_group.currentIndexChanged.connect(_on_group_combo_changed)
+        def _on_context_table_changed(*_args):
+            if state.get("loading_group_tables"):
+                return
+            _save_current_group_tables()
+            _refresh_visible_component_context_labels()
+
+        tbl_contexts.itemChanged.connect(_on_context_table_changed)
+        tbl_components.itemChanged.connect(lambda *_args: None if state.get("loading_group_tables") else _save_current_group_tables())
+        btn_cancel.clicked.connect(dlg.reject)
+
+        def _go_back():
+            if stack.currentIndex() > 0:
+                _save_current_group_tables()
+                stack.setCurrentIndex(stack.currentIndex() - 1)
+                _update_page_state()
+
+        btn_back.clicked.connect(_go_back)
+        btn_next.clicked.connect(_go_next)
+
+        _populate_folder_tree()
+        _refresh_group_list()
+        _update_page_state()
+        dlg.exec()
 
     def _load_material_densities(self, folder):
         """Load material densities from *folder*, falling back to ancestor
@@ -39237,7 +40346,8 @@ class AnalysisTab(QWidget):
             return "", True
         return ref, False
 
-    def _component_totals_rows_from_body_rows(self, body_rows):
+    def _component_totals_rows_from_body_rows(self, body_rows, case_metadata=None):
+        case_metadata = case_metadata or {}
         grouped = {}
         for row in body_rows:
             if len(row) < 3:
@@ -39254,8 +40364,9 @@ class AnalysisTab(QWidget):
             component = bundle["component"]
             total_edep = 0.0
             total_dedep_sq = 0.0
-            spectrum_labels = []
-            spectrum_seen = set()
+            source_labels = []
+            source_seen = set()
+            alpha_values = []
             for row in rows:
                 try:
                     total_edep += float(row[3] or 0.0)
@@ -39266,10 +40377,23 @@ class AnalysisTab(QWidget):
                     total_dedep_sq += dedep ** 2
                 except (TypeError, ValueError, IndexError):
                     pass
-                spectrum = str(row[self.DOSE_HEADERS.index("Spectrum Type")] or "").strip() if len(row) > self.DOSE_HEADERS.index("Spectrum Type") else ""
-                if spectrum and spectrum.lower() not in spectrum_seen:
-                    spectrum_seen.add(spectrum.lower())
-                    spectrum_labels.append(spectrum)
+                case_name = str(row[0] or "").strip() if len(row) >= 1 else ""
+                meta = case_metadata.get(case_name, {}) if case_name else {}
+                source_type = str(meta.get("source_type") or "").strip()
+                if not source_type:
+                    spectrum_idx = self.DOSE_HEADERS.index("Spectrum Type")
+                    source_type = str(row[spectrum_idx] or "").strip() if len(row) > spectrum_idx else ""
+                source_key = source_type.casefold()
+                if source_type and source_key not in source_seen:
+                    source_seen.add(source_key)
+                    source_labels.append(source_type)
+                alpha_value = meta.get("alpha", "")
+                try:
+                    alpha_value = float(alpha_value)
+                except (TypeError, ValueError):
+                    alpha_value = ""
+                if alpha_value not in ("", None) and math.isfinite(alpha_value):
+                    alpha_values.append(alpha_value)
             total_dedep = total_dedep_sq ** 0.5
             total_error = abs(total_dedep / total_edep * 100.0) if total_edep else ""
             mass_value, mass_mismatch = self._component_total_mass_value(rows)
@@ -39285,6 +40409,15 @@ class AnalysisTab(QWidget):
             body_label = "COMPONENT TOTAL"
             if mass_mismatch:
                 body_label += " (mass mismatch)"
+            source_value = source_labels[0] if len(source_labels) == 1 else ("Mixed" if source_labels else "")
+            alpha_value = ""
+            if alpha_values:
+                unique_alphas = []
+                for value in alpha_values:
+                    if not any(abs(value - existing) <= 1e-9 for existing in unique_alphas):
+                        unique_alphas.append(value)
+                if len(unique_alphas) == 1:
+                    alpha_value = unique_alphas[0]
             totals.append([
                 "BATCH TOTAL",
                 body_label,
@@ -39299,6 +40432,9 @@ class AnalysisTab(QWidget):
                 total_error,
                 total_dose,
                 total_ddose,
+                len(rows),
+                source_value,
+                alpha_value,
             ])
         return totals
 
@@ -39331,15 +40467,27 @@ class AnalysisTab(QWidget):
             from openpyxl.utils import get_column_letter
         except Exception:
             return
-        widths = {
-            "A": 16, "B": 28, "C": 28,
-            "D": 16, "E": 16, "F": 14,
-            "G": 16, "H": 16, "I": 16,
-            "J": 16, "K": 12, "L": 14, "M": 14,
+        width_by_header = {
+            "Case": 16,
+            "Body": 28,
+            "Component": 28,
+            "Edep (eV)": 16,
+            "dE (eV)": 16,
+            "Mass (kg)": 14,
+            "Dose (eV/g)": 16,
+            "dDose (eV/g)": 16,
+            "Edep (J)": 16,
+            "dE (J)": 16,
+            "Error (%)": 12,
+            "Dose (Gy)": 14,
+            "dDose (Gy)": 14,
+            "N fields": 12,
+            "Source Type": 20,
+            "Alpha": 12,
         }
         for col_idx, header in enumerate(self.DOSE_COMPONENT_TOTALS_HEADERS, start=1):
             letter = get_column_letter(col_idx)
-            ws.column_dimensions[letter].width = max(widths.get(letter, 14), len(header) + 2)
+            ws.column_dimensions[letter].width = max(width_by_header.get(header, 14), len(header) + 2)
 
     def _apply_component_totals_number_formats(self, ws):
         headers = {
@@ -39384,6 +40532,29 @@ class AnalysisTab(QWidget):
                     except ValueError:
                         continue
                 cell.number_format = "0.0000"
+        alpha_col = headers.get("Alpha")
+        if alpha_col:
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row, alpha_col)
+                if cell.value in ("", None):
+                    continue
+                if isinstance(cell.value, str):
+                    try:
+                        cell.value = float(cell.value.replace("D", "E").replace("d", "e").replace(",", "."))
+                    except ValueError:
+                        continue
+                cell.number_format = "0.####"
+        count_col = headers.get("N fields")
+        if count_col:
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row, count_col)
+                if cell.value in ("", None):
+                    continue
+                try:
+                    cell.value = int(float(cell.value))
+                except (TypeError, ValueError):
+                    continue
+                cell.number_format = "0"
 
     def _write_component_totals_formula_notes(self, ws, start_row):
         try:
@@ -39401,6 +40572,9 @@ class AnalysisTab(QWidget):
             ("Dose (Gy)", f"(Edep_total * {self.EV_TO_J:.15g}) / Mass_kg."),
             ("dDose (Gy)", f"(dE_total * {self.EV_TO_J:.15g}) / Mass_kg."),
             ("Error (%)", "ABS(dE_total / Edep_total) * 100."),
+            ("N fields", "Number of irradiation fields summed for this component total."),
+            ("Source Type", "Shared source label across the summed fields; 'Mixed' if inconsistent."),
+            ("Alpha", "Shared SCONE alpha across the summed fields; blank if inconsistent or unavailable."),
         ]
         ws.cell(start_row, 1).value = "Formulas used"
         if Font is not None:
@@ -39418,17 +40592,22 @@ class AnalysisTab(QWidget):
         ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 0, 18)
         ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 72)
 
-    def _sync_component_totals_sheet(self, wb, body_rows):
+    def _sync_component_totals_sheet(self, wb, body_rows, case_metadata=None):
         ws = wb[self.DOSE_COMPONENT_TOTALS_SHEET] if self.DOSE_COMPONENT_TOTALS_SHEET in wb.sheetnames else wb.create_sheet(self.DOSE_COMPONENT_TOTALS_SHEET)
         if ws.max_row:
             ws.delete_rows(1, ws.max_row)
         self._normalize_component_totals_headers(ws)
-        rows = self._component_totals_rows_from_body_rows(body_rows)
+        rows = self._component_totals_rows_from_body_rows(body_rows, case_metadata=case_metadata)
         for row in rows:
             ws.append(row)
         data_last_row = max(ws.max_row, 1)
         self._apply_component_totals_number_formats(ws)
-        ws.auto_filter.ref = f"A1:M{data_last_row}"
+        try:
+            from openpyxl.utils import get_column_letter
+            last_col_letter = get_column_letter(len(self.DOSE_COMPONENT_TOTALS_HEADERS))
+        except Exception:
+            last_col_letter = "M"
+        ws.auto_filter.ref = f"A1:{last_col_letter}{data_last_row}"
         ws.freeze_panes = "A2"
         self._set_component_totals_widths(ws)
         self._write_component_totals_formula_notes(ws, data_last_row + 2)
@@ -41582,6 +42761,7 @@ class AnalysisTab(QWidget):
         replaced_rows = 0
         skipped = []
         exported_body_rows = []
+        component_total_case_meta = {}
         try:
             for folder in workspaces:
                 self.status_message.emit(f"Multi append: {folder.name}")
@@ -41606,12 +42786,13 @@ class AnalysisTab(QWidget):
                 self._append_rows_to_sheet(ws, body_rows)
                 self._sync_totals_sheet(wb, rows_for_export)
                 exported_body_rows.extend(list(body_rows))
+                component_total_case_meta[str(case)] = self._component_totals_case_metadata(folder)
                 self._log_analysis(
                     f"[{folder.name}] case '{case}': removed {removed} old main row(s), appended {len(body_rows)} body row(s); total synced.",
                     "ok",
                 )
                 processed += 1
-            self._sync_component_totals_sheet(wb, exported_body_rows)
+            self._sync_component_totals_sheet(wb, exported_body_rows, case_metadata=component_total_case_meta)
             self._set_dose_column_widths(ws)
             self._apply_dose_quality_and_formatting(ws)
             wb.save(xlsx_path)

@@ -385,16 +385,131 @@ if isempty(targetNames)
     targetNames = {'tumor olho dto'};
 end
 targetName = targetNames{1};
-targetKey = normalize_body_compare_key_r2015(targetName);
 
 compareNames = normalize_body_name_list_r2015(comparisonBodyNames);
 if isempty(compareNames)
     compareNames = resolve_default_comparison_body_names_r2015(selectedBodyNames, targetName);
 end
 
+primaryCompareName = '';
+secondaryCompareName = '';
+if numel(compareNames) >= 1
+    primaryCompareName = compareNames{1};
+end
+if numel(compareNames) >= 2
+    secondaryCompareName = compareNames{2};
+end
+
+% angle_ranking_by_alpha.csv keeps the historical RightEye/LeftEye column names
+% for compatibility, but the compared BODY labels are still injected dynamically
+% by PENELOPE Studio through comparisonBodyNames.
+%
+% The ratio uncertainty has the same sigma convention as the input dDose values.
+% If dDose is 3sigma, the ratio uncertainty is also 3sigma.
+summaryCase = {};
+summarySourceType = {};
+summaryCaseID = [];
+summaryAlpha = [];
+summaryTheta = [];
+summaryPhi = [];
+summaryTargetDose = [];
+summarydTargetDose = [];
+summaryRightDose = [];
+summarydRightDose = [];
+summaryLeftDose = [];
+summarydLeftDose = [];
+summaryRightPct = [];
+summarydRightPct = [];
+summaryLeftPct = [];
+summarydLeftPct = [];
+summaryBothPct = [];
+summarydBothPct = [];
+summaryRow = 0;
+
+for i = 1:numel(cases)
+    caseMask = strcmp(caseNames, cases{i});
+    caseRows = find(caseMask);
+    if isempty(caseRows)
+        continue;
+    end
+    targetIdx = find_case_component_row_r2015(caseRows, componentNames, {targetName});
+    if isempty(targetIdx)
+        continue;
+    end
+
+    rightIdx = [];
+    leftIdx = [];
+    if ~isempty(primaryCompareName)
+        rightIdx = find_case_component_row_r2015(caseRows, componentNames, {primaryCompareName});
+    end
+    if ~isempty(secondaryCompareName)
+        leftIdx = find_case_component_row_r2015(caseRows, componentNames, {secondaryCompareName});
+    end
+
+    targetDose = doseEvg(targetIdx);
+    targetDoseUnc = dDoseEvg(targetIdx);
+    rightDose = NaN;
+    rightDoseUnc = NaN;
+    leftDose = NaN;
+    leftDoseUnc = NaN;
+    if ~isempty(rightIdx)
+        rightDose = doseEvg(rightIdx);
+        rightDoseUnc = dDoseEvg(rightIdx);
+    end
+    if ~isempty(leftIdx)
+        leftDose = doseEvg(leftIdx);
+        leftDoseUnc = dDoseEvg(leftIdx);
+    end
+
+    [rightPct, dRightPct] = safe_ratio_pct_r2015(rightDose, rightDoseUnc, targetDose, targetDoseUnc);
+    [leftPct, dLeftPct] = safe_ratio_pct_r2015(leftDose, leftDoseUnc, targetDose, targetDoseUnc);
+    [bothPct, dBothPct] = safe_combined_ratio_pct_r2015(rightDose, rightDoseUnc, leftDose, leftDoseUnc, targetDose, targetDoseUnc);
+
+    summaryRow = summaryRow + 1;
+    summaryCase{summaryRow, 1} = cases{i}; %#ok<AGROW>
+    summarySourceType{summaryRow, 1} = sourceTypes{targetIdx}; %#ok<AGROW>
+    summaryCaseID(summaryRow, 1) = CASEID(targetIdx); %#ok<AGROW>
+    summaryAlpha(summaryRow, 1) = ALPHA(targetIdx); %#ok<AGROW>
+    summaryTheta(summaryRow, 1) = THETA(targetIdx); %#ok<AGROW>
+    summaryPhi(summaryRow, 1) = PHI(targetIdx); %#ok<AGROW>
+    summaryTargetDose(summaryRow, 1) = targetDose; %#ok<AGROW>
+    summarydTargetDose(summaryRow, 1) = targetDoseUnc; %#ok<AGROW>
+    summaryRightDose(summaryRow, 1) = rightDose; %#ok<AGROW>
+    summarydRightDose(summaryRow, 1) = rightDoseUnc; %#ok<AGROW>
+    summaryLeftDose(summaryRow, 1) = leftDose; %#ok<AGROW>
+    summarydLeftDose(summaryRow, 1) = leftDoseUnc; %#ok<AGROW>
+    summaryRightPct(summaryRow, 1) = rightPct; %#ok<AGROW>
+    summarydRightPct(summaryRow, 1) = dRightPct; %#ok<AGROW>
+    summaryLeftPct(summaryRow, 1) = leftPct; %#ok<AGROW>
+    summarydLeftPct(summaryRow, 1) = dLeftPct; %#ok<AGROW>
+    summaryBothPct(summaryRow, 1) = bothPct; %#ok<AGROW>
+    summarydBothPct(summaryRow, 1) = dBothPct; %#ok<AGROW>
+end
+
+RankByAlpha = table( ...
+    summaryCase, summarySourceType, summaryCaseID, summaryAlpha, summaryTheta, summaryPhi, ...
+    summaryTargetDose, summarydTargetDose, ...
+    summaryRightDose, summarydRightDose, ...
+    summaryLeftDose, summarydLeftDose, ...
+    summaryRightPct, summarydRightPct, ...
+    summaryLeftPct, summarydLeftPct, ...
+    summaryBothPct, summarydBothPct, ...
+    'VariableNames', { ...
+        'Case', 'SourceType', 'CaseID', 'Alpha', 'THETA', 'PHI', ...
+        'TargetDose_eVg', 'dTargetDose_eVg', ...
+        'RightEyeDose_eVg', 'dRightEyeDose_eVg', ...
+        'LeftEyeDose_eVg', 'dLeftEyeDose_eVg', ...
+        'RightEye_Tumor_pct', 'dRightEye_Tumor_pct', ...
+        'LeftEye_Tumor_pct', 'dLeftEye_Tumor_pct', ...
+        'BothEyes_Tumor_pct', 'dBothEyes_Tumor_pct' ...
+    });
+if ~isempty(RankByAlpha)
+    RankByAlpha = sortrows(RankByAlpha, {'Alpha', 'SourceType', 'THETA', 'PHI'});
+end
+writetable(RankByAlpha, fullfile(outDir, 'angle_ranking_by_alpha.csv'));
+
 for cmpIdx = 1:numel(compareNames)
     compareName = compareNames{cmpIdx};
-    compareKey = normalize_body_compare_key_r2015(compareName);
     rankCase = {};
     rankSourceType = {};
     rankCaseID = [];
@@ -402,8 +517,11 @@ for cmpIdx = 1:numel(compareNames)
     rankTheta = [];
     rankPhi = [];
     rankTargetDose = [];
+    rankdTargetDose = [];
     rankCompareDose = [];
+    rankdCompareDose = [];
     rankComparePct = [];
+    rankdComparePct = [];
     r = 0;
 
     for i = 1:numel(cases)
@@ -424,8 +542,11 @@ for cmpIdx = 1:numel(compareNames)
         compareIdx = caseRows(compareLocalIdx);
         if ~isempty(targetIdx) && ~isempty(compareIdx)
             targetDose = doseEvg(targetIdx);
+            targetDoseUnc = dDoseEvg(targetIdx);
             compareDose = doseEvg(compareIdx);
-            if isnan(targetDose) || targetDose == 0 || isnan(compareDose)
+            compareDoseUnc = dDoseEvg(compareIdx);
+            [comparePct, dComparePct] = safe_ratio_pct_r2015(compareDose, compareDoseUnc, targetDose, targetDoseUnc);
+            if ~isfinite(comparePct)
                 continue;
             end
             r = r + 1;
@@ -436,17 +557,20 @@ for cmpIdx = 1:numel(compareNames)
             rankTheta(r, 1) = THETA(targetIdx); %#ok<AGROW>
             rankPhi(r, 1) = PHI(targetIdx); %#ok<AGROW>
             rankTargetDose(r, 1) = targetDose; %#ok<AGROW>
+            rankdTargetDose(r, 1) = targetDoseUnc; %#ok<AGROW>
             rankCompareDose(r, 1) = compareDose; %#ok<AGROW>
-            rankComparePct(r, 1) = 100 * compareDose / targetDose; %#ok<AGROW>
+            rankdCompareDose(r, 1) = compareDoseUnc; %#ok<AGROW>
+            rankComparePct(r, 1) = comparePct; %#ok<AGROW>
+            rankdComparePct(r, 1) = dComparePct; %#ok<AGROW>
         end
     end
 
     R = table( ...
         rankCase, rankSourceType, rankCaseID, rankAlpha, rankTheta, rankPhi, ...
-        rankTargetDose, rankCompareDose, rankComparePct, ...
+        rankTargetDose, rankdTargetDose, rankCompareDose, rankdCompareDose, rankComparePct, rankdComparePct, ...
         'VariableNames', { ...
             'Case', 'SourceType', 'CaseID', 'Alpha', 'THETA', 'PHI', ...
-            'TargetDose_eVg', 'CompareDose_eVg', 'CompareTarget_pct' ...
+            'TargetDose_eVg', 'dTargetDose_eVg', 'CompareDose_eVg', 'dCompareDose_eVg', 'CompareTarget_pct', 'dCompareTarget_pct' ...
         });
     if ~isempty(R)
         R = sortrows(R, {'Alpha', 'SourceType', 'CompareTarget_pct'});
@@ -472,7 +596,11 @@ for cmpIdx = 1:numel(compareNames)
             end
             figHeight = max(560, 24 * height(Ra));
             fig = figure('Color', 'w', 'Position', [100, 100, 860, figHeight]);
+            yPositions = (1:height(Ra))';
             barh(Ra.CompareTarget_pct);
+            hold on;
+            draw_horizontal_errorbars_r2015(Ra.CompareTarget_pct, yPositions, Ra.dCompareTarget_pct, [0 0 0]);
+            hold off;
             set(gca, 'YTick', 1:height(Ra), 'YTickLabel', labels);
             xlabel(sprintf('%s / %s (%%)', compareName, targetName));
             title(sprintf(['Ordena' ced 'o angular, alfa = %.4g%c, fonte = %s, compara' ced 'o = %s / %s'], alphaRankList(a), grau, display_source_type_r2015(sourceList{s}), compareName, targetName), 'Interpreter', 'none');
@@ -482,6 +610,106 @@ for cmpIdx = 1:numel(compareNames)
             close(fig);
         end
     end
+end
+end
+
+function idx = find_case_component_row_r2015(caseRows, componentNames, matchNames)
+idx = [];
+if isempty(caseRows) || isempty(componentNames) || isempty(matchNames)
+    return;
+end
+localComponents = componentNames(caseRows);
+localMask = build_component_match_mask_r2015(localComponents, matchNames);
+localIdx = find(localMask, 1, 'first');
+if ~isempty(localIdx)
+    idx = caseRows(localIdx);
+end
+end
+
+function [ratioPct, dRatioPct] = safe_ratio_pct_r2015(numeratorDose, dNumeratorDose, denominatorDose, dDenominatorDose)
+ratioPct = NaN;
+dRatioPct = NaN;
+if ~isfinite(numeratorDose) || ~isfinite(denominatorDose)
+    return;
+end
+if numeratorDose <= 0 || denominatorDose <= 0
+    return;
+end
+ratioPct = 100 * numeratorDose / denominatorDose;
+if ~isfinite(dNumeratorDose) || ~isfinite(dDenominatorDose)
+    return;
+end
+if dNumeratorDose < 0 || dDenominatorDose < 0
+    return;
+end
+dRatioPct = abs(ratioPct) * sqrt((dNumeratorDose / numeratorDose)^2 + (dDenominatorDose / denominatorDose)^2);
+if ~isfinite(dRatioPct)
+    dRatioPct = NaN;
+end
+end
+
+function [ratioPct, dRatioPct] = safe_combined_ratio_pct_r2015(rightDose, dRightDose, leftDose, dLeftDose, tumorDose, dTumorDose)
+ratioPct = NaN;
+dRatioPct = NaN;
+if ~isfinite(rightDose) || ~isfinite(leftDose) || ~isfinite(tumorDose)
+    return;
+end
+if rightDose <= 0 || leftDose <= 0 || tumorDose <= 0
+    return;
+end
+combinedDose = rightDose + leftDose;
+if ~isfinite(combinedDose) || combinedDose <= 0
+    return;
+end
+ratioPct = 100 * combinedDose / tumorDose;
+if ~isfinite(dRightDose) || ~isfinite(dLeftDose) || ~isfinite(dTumorDose)
+    return;
+end
+if dRightDose < 0 || dLeftDose < 0 || dTumorDose < 0
+    return;
+end
+combinedDoseUnc = sqrt(dRightDose.^2 + dLeftDose.^2);
+dRatioPct = abs(ratioPct) * sqrt((combinedDoseUnc / combinedDose)^2 + (dTumorDose / tumorDose)^2);
+if ~isfinite(dRatioPct)
+    dRatioPct = NaN;
+end
+end
+
+function draw_horizontal_errorbars_r2015(xVals, yVals, xErrs, colorValue)
+if nargin < 4 || isempty(colorValue)
+    colorValue = [0 0 0];
+end
+if isempty(xVals) || isempty(yVals) || isempty(xErrs)
+    return;
+end
+holdState = ishold;
+hold on;
+capHalfHeight = 0.18;
+innerColor = [1 1 1];
+outerWidth = 2.2;
+innerWidth = 1.0;
+for idx = 1:numel(xVals)
+    xVal = xVals(idx);
+    yVal = yVals(idx);
+    xErr = xErrs(idx);
+    if ~isfinite(xVal) || ~isfinite(yVal) || ~isfinite(xErr)
+        continue;
+    end
+    if xErr < 0
+        continue;
+    end
+    xLeft = xVal - xErr;
+    xRight = xVal + xErr;
+    line([xLeft xRight], [yVal yVal], 'Color', colorValue, 'LineWidth', outerWidth);
+    line([xLeft xLeft], [yVal - capHalfHeight yVal + capHalfHeight], 'Color', colorValue, 'LineWidth', outerWidth);
+    line([xRight xRight], [yVal - capHalfHeight yVal + capHalfHeight], 'Color', colorValue, 'LineWidth', outerWidth);
+    line([xLeft xRight], [yVal yVal], 'Color', innerColor, 'LineWidth', innerWidth);
+    line([xLeft xLeft], [yVal - capHalfHeight yVal + capHalfHeight], 'Color', innerColor, 'LineWidth', innerWidth);
+    line([xRight xRight], [yVal - capHalfHeight yVal + capHalfHeight], 'Color', innerColor, 'LineWidth', innerWidth);
+    plot(xVal, yVal, 'o', 'MarkerSize', 4.2, 'LineWidth', 0.9, 'MarkerFaceColor', innerColor, 'MarkerEdgeColor', colorValue, 'Color', colorValue);
+end
+if ~holdState
+    hold off;
 end
 end
 
@@ -1844,3 +2072,4 @@ elseif strcmp(mode, 'yz')
     bVal = zVal;
 end
 end
+
